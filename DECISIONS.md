@@ -134,7 +134,8 @@ everything else is a choice the spec left open.
   `next build` succeeds with no DB) swallowed the 42501 error, so a privilege
   failure presented as an empty-but-no-error result. This is a deliberate
   build-time-resilience tradeoff; runtime error surfacing to platform logs is a
-  reasonable follow-up.
+  reasonable follow-up (done in the launch-readiness pass below —
+  `lib/queries/log.ts`).
 - **Fix:** explicit GRANTs to `anon` (SELECT), `authenticated` (SELECT/INSERT/
   UPDATE/DELETE — RLS gates writes), and `service_role` (ALL), plus sequence/
   function grants and matching `ALTER DEFAULT PRIVILEGES` so future objects are
@@ -146,3 +147,46 @@ everything else is a choice the spec left open.
   resolves to `text` under `SELECT DISTINCT` and there is no implicit
   `text -> actor_type` cast, so the insert would fail 42804 the moment the scan
   found a contradiction to record.
+
+## Launch-readiness pass (2026-06-11)
+
+One finishing sweep before launch; everything verified against the live
+database, not by inspection alone.
+
+- **Public read paths audited live** — `scripts/audit-pages.mjs` replays every
+  public route's *exact* PostgREST select (embeds included) plus the
+  `global_search` / `suggested_confidence` RPCs through the anon client and
+  fails on any error or zero-row result. All 21 paths green against the seeded
+  live DB.
+- **Query-layer errors now logged, still safe** — `lib/queries/log.ts`
+  (`logQueryError` / `logQueryThrow`): every `if (error) return …` and `catch`
+  in `lib/queries/*` logs `[veritas:query:<fn>] [code] message` to the server
+  console (Vercel function logs) before returning the safe fallback. Builds
+  without a database still pass; a future 42501-class failure can no longer be
+  silent. Closes the follow-up from the 0002 postmortem.
+- **A11y pass** — `lib/useFocusTrap.ts` gives `Dialog` and `CommandPalette`
+  real WAI-ARIA modal behavior (Tab containment + focus restore; the palette's
+  trap ref was initially unwired — it no-opped silently). `Tabs` got the full
+  tabs keyboard pattern (roving tabindex, Arrow/Home/End,
+  `aria-controls`/`aria-labelledby`). The mobile menu closes on Escape.
+  `scripts/contrast.mjs` checks the signal palette against both surfaces in
+  both themes — all AA (≥4.5 text, ≥3 signal/UI). Deliberately *not* changed:
+  stat grids at 375px (snug but no overflow), graph legend (`flex-wrap`),
+  ledger titles (normal text wraps). **Known limitation:** the canvas Research
+  Graph is pointer-only; keyboard node navigation is V1.x work.
+- **Admin write path verified end-to-end** — `scripts/verify-admin.mjs` drives
+  the real HTTP routes (middleware → `requireAdmin` → RLS → triggers) with a
+  forged `@supabase/ssr` session cookie for a temporary service-role-provisioned
+  admin. 19/19 checks: create (draft, anon-invisible under RLS), edit,
+  link/unlink evidence (graph-edge trigger both directions), confidence change
+  rejected without/with-blank rationale and out-of-band value, accepted with
+  rationale and recorded in `confidence_history`, unauthenticated write → 401,
+  contradiction scan → 200 (inserted 0 — seed already converged).
+- **Probe hygiene on a live DB** — the probe hypothesis runs in `state='draft'`
+  (never publicly visible); the scan runs only *after* the probe is deleted so
+  it cannot pair probe data with seeded hypotheses; the service role then
+  removes the probe row and its timeline events. The append-only invariant
+  (§10-3) binds app roles — service-role cleanup of test artifacts is an ops
+  action, used for nothing else.
+- **Gates at sign-off:** `npm run build` (113 pages, SSG params resolved from
+  live data), `tsc --noEmit`, and `npm run validate:sql` all pass clean.

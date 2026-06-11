@@ -73,6 +73,11 @@ SQL into the dashboard.
 2. Paste the entire contents of [`supabase/migrations/0001_core.sql`](./supabase/migrations/0001_core.sql) and **Run**.
 3. Paste the entire contents of [`supabase/seed.sql`](./supabase/seed.sql) and **Run**.
 
+> [`supabase/migrations/0002_fix_rls.sql`](./supabase/migrations/0002_fix_rls.sql)
+> is already mirrored into 0001 — it only needs to be applied (it is idempotent)
+> to databases created before the GRANT/RLS fix. The CLI flow below applies both
+> automatically.
+
 #### Option B — Supabase CLI (local Postgres via Docker, or linked project)
 
 ```bash
@@ -152,6 +157,23 @@ npm run typecheck      # tsc --noEmit
 npm run validate:sql   # parse migration + seed against the real Postgres grammar
 ```
 
+### Verification scripts (run with `node`, need `.env.local`)
+
+```bash
+node scripts/audit-pages.mjs    # every public route's exact query against the
+                                # live DB through the anon client — fails on
+                                # any empty or erroring data path
+node scripts/diagnose-rls.mjs   # anon vs service-role comparison for
+                                # diagnosing RLS/GRANT problems
+node scripts/contrast.mjs       # WCAG AA contrast audit of the signal palette
+                                # on both themes (pure computation, no DB)
+node scripts/verify-admin.mjs   # end-to-end admin WRITE path over real HTTP:
+                                # create/edit/link/confidence/scan, auth and
+                                # epistemic-guard negative cases, full cleanup.
+                                # Needs a running server; set BASE_URL
+                                # (default http://localhost:3210)
+```
+
 ---
 
 ## How the epistemics are enforced (the §10 invariants)
@@ -204,7 +226,7 @@ types/           database + app-level domain types
 ## Notes & decisions
 
 Implementation choices and deviations from the blueprint are logged in
-[`DECISIONS.md`](./DECISIONS.md). The SQL was validated against the real
-PostgreSQL grammar (`pg_query` WASM) via `npm run validate:sql`; where the
-build machine lacked Docker, the migration and seed were verified by parser +
-review rather than live execution.
+[`DECISIONS.md`](./DECISIONS.md). The SQL is parsed against the real PostgreSQL
+grammar (`pg_query` WASM) via `npm run validate:sql`, and both the public read
+paths and the admin write path are verified against the live database by the
+verification scripts above (see the launch-readiness entry in DECISIONS.md).
