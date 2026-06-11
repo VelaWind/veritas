@@ -1,10 +1,13 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { TimelineEvent, TimelineEventType } from "@/types/domain";
+import { logQueryError, logQueryThrow } from "./log";
 
 export interface TimelinePage {
   events: TimelineEvent[];
   nextCursor: number | null;
 }
+
+const EMPTY: TimelinePage = { events: [], nextCursor: null };
 
 export async function listTimeline(
   client: SupabaseClient,
@@ -22,7 +25,7 @@ export async function listTimeline(
     if (opts.type) query = query.eq("event_type", opts.type);
 
     const { data, error } = await query;
-    if (error) return { events: [], nextCursor: null };
+    if (error) return logQueryError("listTimeline", error, EMPTY);
 
     const rows = (data ?? []) as TimelineEvent[];
     const hasMore = rows.length > limit;
@@ -31,7 +34,7 @@ export async function listTimeline(
       events,
       nextCursor: hasMore ? events[events.length - 1].id : null,
     };
-  } catch {
-    return { events: [], nextCursor: null };
+  } catch (err) {
+    return logQueryThrow("listTimeline", err, EMPTY);
   }
 }

@@ -5,6 +5,7 @@ import type {
   GraphEdge,
   GraphPayload,
 } from "@/types/domain";
+import { logQueryError, logQueryThrow } from "./log";
 
 interface HypothesisRow {
   id: string;
@@ -53,6 +54,17 @@ export async function getGraphPayload(
         client.from("evidence").select("id, slug, title, strength, domain_id"),
         client.from("graph_edges").select("*"),
       ]);
+
+    // Surface any partial failure instead of silently returning a thin graph.
+    for (const [name, res] of [
+      ["domains", domainsRes],
+      ["questions", questionsRes],
+      ["hypotheses", hypothesesRes],
+      ["evidence", evidenceRes],
+      ["graph_edges", edgesRes],
+    ] as const) {
+      if (res.error) logQueryError(`getGraphPayload:${name}`, res.error, null);
+    }
 
     const domains = (domainsRes.data ?? []) as Array<Pick<Domain, "id" | "slug" | "name">>;
     const questions = (questionsRes.data ?? []) as QuestionRow[];
@@ -158,7 +170,7 @@ export async function getGraphPayload(
     }
 
     return payload;
-  } catch {
-    return { nodes: [], edges: [] };
+  } catch (err) {
+    return logQueryThrow("getGraphPayload", err, { nodes: [], edges: [] });
   }
 }

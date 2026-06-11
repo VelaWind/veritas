@@ -1,5 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { DashboardStats } from "@/types/domain";
+import { logQueryError, logQueryThrow } from "./log";
 
 /**
  * Reads the §2.10 materialized view. Returns null when the view has never
@@ -13,9 +14,10 @@ export async function getDashboardStats(
       .from("dashboard_stats")
       .select("*")
       .maybeSingle();
-    if (error || !data) return null;
+    if (error) return logQueryError("getDashboardStats", error, null);
+    if (!data) return null;
     return data as DashboardStats;
-  } catch {
-    return null;
+  } catch (err) {
+    return logQueryThrow("getDashboardStats", err, null);
   }
 }

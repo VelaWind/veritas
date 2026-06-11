@@ -1,5 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { EvidenceFull, EvidenceListItem, SourceType } from "@/types/domain";
+import { logQueryError, logQueryThrow } from "./log";
 
 export interface EvidenceFilters {
   domainSlug?: string;
@@ -28,10 +29,10 @@ export async function listEvidence(
     const { data, error } = await query
       .order("created_at", { ascending: false })
       .limit(filters.limit ?? 200);
-    if (error) return [];
+    if (error) return logQueryError("listEvidence", error, []);
     return (data ?? []) as unknown as EvidenceListItem[];
-  } catch {
-    return [];
+  } catch (err) {
+    return logQueryThrow("listEvidence", err, []);
   }
 }
 
@@ -51,24 +52,25 @@ export async function getEvidenceBySlug(
       )
       .eq("slug", slug)
       .maybeSingle();
-    if (error || !data) return null;
+    if (error) return logQueryError("getEvidenceBySlug", error, null);
+    if (!data) return null;
     const full = data as unknown as EvidenceFull;
     // Drafts are filtered by RLS for anon readers; drop any null embeds.
     full.linked_hypotheses = (full.linked_hypotheses ?? []).filter(
       (l) => l.hypothesis !== null,
     );
     return full;
-  } catch {
-    return null;
+  } catch (err) {
+    return logQueryThrow("getEvidenceBySlug", err, null);
   }
 }
 
 export async function listEvidenceSlugs(client: SupabaseClient): Promise<string[]> {
   try {
     const { data, error } = await client.from("evidence").select("slug");
-    if (error) return [];
+    if (error) return logQueryError("listEvidenceSlugs", error, []);
     return ((data ?? []) as Array<{ slug: string }>).map((e) => e.slug);
-  } catch {
-    return [];
+  } catch (err) {
+    return logQueryThrow("listEvidenceSlugs", err, []);
   }
 }

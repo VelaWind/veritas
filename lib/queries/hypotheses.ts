@@ -4,6 +4,7 @@ import type {
   HypothesisFull,
   HypothesisListItem,
 } from "@/types/domain";
+import { logQueryError, logQueryThrow } from "./log";
 
 export interface HypothesisFilters {
   domainSlug?: string;
@@ -48,10 +49,10 @@ export async function listHypotheses(
     }
 
     const { data, error } = await query.limit(filters.limit ?? 200);
-    if (error) return [];
+    if (error) return logQueryError("listHypotheses", error, []);
     return (data ?? []) as unknown as HypothesisListItem[];
-  } catch {
-    return [];
+  } catch (err) {
+    return logQueryThrow("listHypotheses", err, []);
   }
 }
 
@@ -72,15 +73,16 @@ export async function getHypothesisBySlug(
       )
       .eq("slug", slug)
       .maybeSingle();
-    if (error || !data) return null;
+    if (error) return logQueryError("getHypothesisBySlug", error, null);
+    if (!data) return null;
     const full = data as unknown as HypothesisFull;
     full.history = [...(full.history ?? [])].sort(
       (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
     );
     full.links = [...(full.links ?? [])].sort((a, b) => b.weight - a.weight);
     return full;
-  } catch {
-    return null;
+  } catch (err) {
+    return logQueryThrow("getHypothesisBySlug", err, null);
   }
 }
 
@@ -101,14 +103,15 @@ export async function getHypothesisById(
       )
       .eq("id", id)
       .maybeSingle();
-    if (error || !data) return null;
+    if (error) return logQueryError("getHypothesisById", error, null);
+    if (!data) return null;
     const full = data as unknown as HypothesisFull;
     full.history = [...(full.history ?? [])].sort(
       (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
     );
     return full;
-  } catch {
-    return null;
+  } catch (err) {
+    return logQueryThrow("getHypothesisById", err, null);
   }
 }
 
@@ -118,10 +121,10 @@ export async function listHypothesisSlugs(client: SupabaseClient): Promise<strin
       .from("hypotheses")
       .select("slug")
       .neq("state", "draft");
-    if (error) return [];
+    if (error) return logQueryError("listHypothesisSlugs", error, []);
     return ((data ?? []) as Array<{ slug: string }>).map((h) => h.slug);
-  } catch {
-    return [];
+  } catch (err) {
+    return logQueryThrow("listHypothesisSlugs", err, []);
   }
 }
 
@@ -133,10 +136,11 @@ export async function getSuggestedConfidence(
     const { data, error } = await client.rpc("suggested_confidence", {
       h_id: hypothesisId,
     });
-    if (error || typeof data !== "number") return null;
+    if (error) return logQueryError("getSuggestedConfidence", error, null);
+    if (typeof data !== "number") return null;
     return data;
-  } catch {
-    return null;
+  } catch (err) {
+    return logQueryThrow("getSuggestedConfidence", err, null);
   }
 }
 

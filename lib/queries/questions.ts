@@ -4,6 +4,7 @@ import type {
   QuestionFull,
   QuestionWithDomain,
 } from "@/types/domain";
+import { logQueryError, logQueryThrow } from "./log";
 
 export interface QuestionFilters {
   domainSlug?: string;
@@ -31,10 +32,10 @@ export async function listQuestions(
         : query.order("importance", { ascending: false });
 
     const { data, error } = await query.limit(filters.limit ?? 200);
-    if (error) return [];
+    if (error) return logQueryError("listQuestions", error, []);
     return (data ?? []) as unknown as QuestionWithDomain[];
-  } catch {
-    return [];
+  } catch (err) {
+    return logQueryThrow("listQuestions", err, []);
   }
 }
 
@@ -52,23 +53,24 @@ export async function getQuestionBySlug(
       )
       .eq("slug", slug)
       .maybeSingle();
-    if (error || !data) return null;
+    if (error) return logQueryError("getQuestionBySlug", error, null);
+    if (!data) return null;
     const full = data as unknown as QuestionFull;
     full.hypotheses = (full.hypotheses ?? [])
       .filter((h) => h.state !== "draft")
       .sort((a, b) => b.confidence - a.confidence);
     return full;
-  } catch {
-    return null;
+  } catch (err) {
+    return logQueryThrow("getQuestionBySlug", err, null);
   }
 }
 
 export async function listQuestionSlugs(client: SupabaseClient): Promise<string[]> {
   try {
     const { data, error } = await client.from("questions").select("slug");
-    if (error) return [];
+    if (error) return logQueryError("listQuestionSlugs", error, []);
     return ((data ?? []) as Array<{ slug: string }>).map((q) => q.slug);
-  } catch {
-    return [];
+  } catch (err) {
+    return logQueryThrow("listQuestionSlugs", err, []);
   }
 }
