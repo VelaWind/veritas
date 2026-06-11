@@ -34,7 +34,8 @@ export async function generateMetadata({
   const h = await getHypothesisBySlug(publicClient, slug);
   if (!h) return { title: "Hypothesis not found" };
   const description = truncate(stripMarkdown(h.description), 160);
-  const og = `/hypotheses/${slug}/opengraph-image`;
+  // The per-slug opengraph-image.tsx is injected automatically by Next's file
+  // convention, so we don't set openGraph.images here.
   return {
     title: h.title,
     description,
@@ -43,9 +44,8 @@ export async function generateMetadata({
       description,
       type: "article",
       url: `${SITE_URL}/hypotheses/${slug}`,
-      images: [og],
     },
-    twitter: { card: "summary_large_image", images: [og] },
+    twitter: { card: "summary_large_image" },
   };
 }
 

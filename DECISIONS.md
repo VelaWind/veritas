@@ -56,3 +56,64 @@ everything else is a choice the spec left open.
 - **`dashboard_stats` is created `with no data` and refreshed in seed** —
   the matview is defined before any rows exist; the seed (and the admin
   "refresh stats" action) populate it.
+
+## Phase 1 — Knowledge core
+
+- **Cookieless `publicClient` for public reads** — public RSC pages use a
+  cookie-less anon client (`lib/supabase/public.ts`) rather than the
+  cookie-bound server client, because calling `cookies()` forces a route to be
+  dynamic and would defeat the §1.3 SSG/ISR strategy. It sees exactly what an
+  anonymous visitor sees under RLS.
+- **Query layer swallows connection errors** — every `lib/queries/*` function
+  try/catches and returns empty results, so `next build` (which prerenders ISR
+  pages) succeeds against placeholder credentials. With a real database the
+  same functions return data.
+- **Untyped runtime clients + cast in the query layer** — the Supabase clients
+  are not generic-typed against `Database`; the query layer casts PostgREST
+  results to the hand-written app types in `types/domain.ts`. This keeps
+  `database.types.ts` a non-load-bearing reference (so a `supabase gen types`
+  refresh can never break the build) while pages still get full typing.
+- **Extra API routes beyond the §6 table** — added thin CRUD routes for
+  `domains` and `notes` (and `PATCH` for simulations) because the admin area
+  needs them; the §6 table omitted them but §3 lists the admin CRUD surfaces.
+- **`POST /api/stats`** refreshes the matview (admin-only) — §2.10 says "route
+  handler calls rpc" but the §6 table only lists `GET /api/stats`.
+- **`increment_popularity` via a client `ViewTracker`** — the hypothesis view
+  counter fires from the browser, not the ISR-cached server page, so the cached
+  render stays side-effect-free.
+
+## Phase 2–4 — Public surfaces, instruments, graph & lab
+
+- **Markdown without the typography plugin** — a hand-rolled `.markdown`
+  stylesheet keeps prose on the design tokens (signal colors stay reserved).
+- **FTS snippet sanitization** — `ts_headline` wraps matches in `<b>` but does
+  not escape the surrounding admin-authored source text, which is an XSS
+  vector. `sanitizeHeadline()` escapes the whole string then re-enables only
+  the `<b>` markers, so any embedded HTML renders inert while the highlight
+  still shows. Used everywhere a snippet is rendered.
+- **Research Graph drawn to `<canvas>`** (not SVG) per §7 for node-count
+  headroom; an SVG/HTML overlay would not scale to thousands of nodes. Labels
+  are drawn on-canvas for focused/hovered nodes and all domains. Under
+  `prefers-reduced-motion` the simulation settles synchronously with no
+  animated tick.
+- **Friendly lab category slugs** — the URL uses `ecosystems|agents|
+  civilizations|universes|consciousness` (per §3) mapped to the DB category
+  enum in `lib/knowledge-engine/simulations.ts`.
+- **Metrics chart auto-detects series keys** — `simulation_runs.metrics` is
+  free-form jsonb; `parseMetrics` reads `{series:[{t, …}]}` and plots every
+  numeric key it finds, so different simulations can record different metrics.
+
+## Phase 5 — Hardening & launch
+
+- **OG images via `next/og` with literal hex colors** — `next/og` has no CSS
+  variables, so the signal palette is inlined in `opengraph-image.tsx`. The
+  per-hypothesis image renders status + confidence + rationale; Next's file
+  convention injects it automatically (so `generateMetadata` does not also set
+  `openGraph.images`).
+- **Rate limiting is best-effort in-memory** — `/api/search` uses a per-instance
+  token bucket. On serverless each instance has its own bucket; this is a soft
+  control. A KV/edge-backed limiter is the V1.x hardening if abuse appears.
+- **SQL validation in CI** — `npm run validate:sql` parses the migration and
+  seed against the real PostgreSQL grammar (`pg-query-emscripten`). A fresh
+  WASM instance is created per statement because the module corrupts its heap
+  when one instance parses many large statements.
