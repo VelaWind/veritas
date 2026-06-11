@@ -70,3 +70,23 @@ export function stripMarkdown(text: string): string {
 
 export const SITE_URL =
   process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000";
+
+/**
+ * Sanitize a Postgres ts_headline() snippet for safe rendering. ts_headline
+ * wraps matches in <b>…</b> but does NOT escape the surrounding source text,
+ * which is admin-authored markdown and could contain HTML. We escape the whole
+ * string, then re-enable ONLY the bold highlight markers — so <script>,
+ * <img onerror=…>, and event handlers are all rendered inert while the search
+ * highlight still shows. Returns a string safe for dangerouslySetInnerHTML.
+ */
+export function sanitizeHeadline(snippet: string): string {
+  const escaped = snippet
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+  return escaped
+    .replace(/&lt;b&gt;/g, "<b>")
+    .replace(/&lt;\/b&gt;/g, "</b>");
+}

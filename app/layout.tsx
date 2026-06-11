@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from "next";
 import { IBM_Plex_Mono, Inter, Spectral } from "next/font/google";
 import { SiteNav } from "@/components/layout/SiteNav";
 import { Footer } from "@/components/layout/Footer";
+import { CommandPalette } from "@/components/layout/CommandPalette";
 import { SITE_URL } from "@/lib/utils";
 import "./globals.css";
 
@@ -75,6 +76,7 @@ export default function RootLayout({
           Skip to content
         </a>
         <SiteNav />
+        <CommandPalette />
         <main id="main" className="flex-1">
           {children}
         </main>
