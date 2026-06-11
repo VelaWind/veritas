@@ -1,0 +1,7 @@
+# Normalize line endings — silence CRLF warnings, keep the repo LF-canonical.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
