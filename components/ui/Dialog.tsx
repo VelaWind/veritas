@@ -3,6 +3,7 @@
 import { ReactNode, useEffect, useRef } from "react";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useFocusTrap } from "@/lib/useFocusTrap";
 
 export function Dialog({
   open,
@@ -18,6 +19,7 @@ export function Dialog({
   className?: string;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(panelRef, open);
 
   useEffect(() => {
     if (!open) return;

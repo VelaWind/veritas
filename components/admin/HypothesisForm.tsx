@@ -284,6 +284,7 @@ export function HypothesisForm({ domains, questions, initial }: Props) {
             <label className="flex items-center gap-2 text-xs text-muted">
               <input
                 type="checkbox"
+                aria-label={`Assumption ${i + 1} justified`}
                 checked={a.justified}
                 onChange={(e) =>
                   setAssumptions(

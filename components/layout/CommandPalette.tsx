@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { Search } from "lucide-react";
 import { api } from "@/lib/client-api";
 import { sanitizeHeadline } from "@/lib/utils";
+import { useFocusTrap } from "@/lib/useFocusTrap";
 import type { NodeType, SearchResult } from "@/types/domain";
 
 const PATH: Partial<Record<NodeType, string>> = {
@@ -33,8 +34,11 @@ export function CommandPalette() {
   const [active, setActive] = useState(0);
   const [loading, setLoading] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
   const debounce = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reqId = useRef(0);
+
+  useFocusTrap(dialogRef, open);
 
   const close = useCallback(() => {
     setOpen(false);
@@ -120,6 +124,7 @@ export function CommandPalette() {
       }}
     >
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-label="Search Veritas"
