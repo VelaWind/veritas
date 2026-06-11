@@ -1,0 +1,144 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   VERITAS design tokens — §5.2 of veritas-architecture-v1.md
+   Signal hues are RESERVED for epistemic state. Decorative UI never uses
+   green/amber/orange. Unknown is grey, never red (§10 invariant 5).
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+:root,
+:root[data-theme="dark"] {
+  /* default */
+  --bg-void:        #060A12; /* page background — near-black, blue-shifted like deep sky */
+  --bg-surface:     #0C1320; /* cards, panels */
+  --bg-raised:      #131C2E; /* hover states, popovers */
+  --border:         #1E2A40;
+  --text-primary:   #E8EDF6;
+  --text-muted:     #8A97AD;
+  --accent:         #5BB8FF; /* "observation blue" — links, active states */
+  --signal-strong:  #4ADE9C; /* high confidence */
+  --signal-mid:     #E8C45A; /* uncertain */
+  --signal-weak:    #F0856B; /* weak / contested */
+  --signal-unknown: #7C8AA5; /* unknown — deliberately grey, never red (unknown ≠ wrong) */
+  --contradiction:  #FF5470; /* reserved exclusively for contradictions */
+}
+
+/* Inverted surface scale, signal hues darkened ~15%+ to hold WCAG AA on light
+   surfaces. Same semantics, same reservations. */
+:root[data-theme="light"] {
+  --bg-void:        #F4F6FA;
+  --bg-surface:     #FFFFFF;
+  --bg-raised:      #E9EEF6;
+  --border:         #D5DDEA;
+  --text-primary:   #11192A;
+  --text-muted:     #54637D;
+  --accent:         #0E6FBE;
+  --signal-strong:  #177D52;
+  --signal-mid:     #8F6E14;
+  --signal-weak:    #B14A2C;
+  --signal-unknown: #56647E;
+  --contradiction:  #C42347;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+    scroll-behavior: smooth;
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+  }
+
+  body {
+    @apply bg-void text-ink font-sans text-base antialiased;
+  }
+
+  ::selection {
+    background: var(--accent);
+    color: var(--bg-void);
+  }
+
+  /* Accessibility floor (§5.4): visible focus rings everywhere. */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  h1, h2, h3 {
+    @apply font-display font-light tracking-tight;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  /* §5.3 — eyebrow labels: 12px Plex Mono, uppercase, +0.08em tracking */
+  .eyebrow {
+    @apply font-mono text-xs uppercase text-muted;
+    letter-spacing: 0.08em;
+  }
+
+  .card {
+    @apply rounded-lg border border-edge bg-surface;
+  }
+
+  .link {
+    @apply text-accent underline-offset-4 hover:underline;
+  }
+
+  /* Markdown prose, kept on design tokens (no typography plugin). */
+  .markdown {
+    @apply text-base leading-relaxed text-ink;
+  }
+  .markdown > * + * {
+    margin-top: 0.9em;
+  }
+  .markdown h1, .markdown h2, .markdown h3, .markdown h4 {
+    @apply font-display font-medium text-ink;
+    margin-top: 1.4em;
+  }
+  .markdown h1 { font-size: 28px; line-height: 1.25; }
+  .markdown h2 { font-size: 22px; line-height: 1.3; }
+  .markdown h3 { font-size: 18px; line-height: 1.35; }
+  .markdown a {
+    @apply text-accent underline-offset-4;
+    text-decoration: underline;
+  }
+  .markdown strong { @apply font-semibold; }
+  .markdown em { font-style: italic; }
+  .markdown code {
+    @apply font-mono text-sm bg-raised rounded px-1.5 py-0.5;
+  }
+  .markdown pre {
+    @apply font-mono text-sm bg-raised rounded-lg border border-edge p-4 overflow-x-auto;
+  }
+  .markdown pre code { @apply bg-transparent p-0; }
+  .markdown ul { list-style: disc; padding-left: 1.4em; }
+  .markdown ol { list-style: decimal; padding-left: 1.4em; }
+  .markdown li + li { margin-top: 0.35em; }
+  .markdown blockquote {
+    @apply border-l-2 border-edge pl-4 text-muted;
+    font-style: italic;
+  }
+  .markdown hr { @apply border-edge; margin: 1.6em 0; }
+  .markdown table { @apply w-full text-sm; border-collapse: collapse; }
+  .markdown th { @apply eyebrow text-left py-2 border-b border-edge; }
+  .markdown td { @apply py-2 border-b border-edge align-top; }
+
+  /* FTS snippets from ts_headline arrive with <b> emphasis. */
+  .snippet b {
+    @apply text-accent font-medium;
+  }
+}
