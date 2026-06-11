@@ -57,10 +57,13 @@ create trigger on_auth_user_created
   after insert on auth.users
   for each row execute function handle_new_user();
 
--- Helper used by every RLS policy.
+-- Helper used by every RLS policy. Null-safe: short-circuits to false for
+-- anonymous callers (auth.uid() is null), and exists() guarantees a boolean
+-- (never null) so it can never poison a policy expression.
 create function is_admin() returns boolean
 language sql stable security definer set search_path = public as $$
-  select exists (select 1 from profiles where id = auth.uid() and role = 'admin');
+  select auth.uid() is not null
+     and exists (select 1 from profiles where id = auth.uid() and role = 'admin');
 $$;
 
 -- profiles.role may only be changed by admins. auth.uid() is null when the
@@ -560,12 +563,15 @@ begin
     raise exception 'Only admins may run the contradiction scan.';
   end if;
 
+  -- 'system' MUST be cast: under SELECT DISTINCT, Postgres resolves the bare
+  -- literal to text before the INSERT assignment, and there is no implicit
+  -- text -> actor_type cast (the insert would fail 42804 without this).
   insert into contradictions (hypothesis_a, hypothesis_b, kind, explanation, detected_by)
   select distinct least(a.hypothesis_id, b.hypothesis_id),
          greatest(a.hypothesis_id, b.hypothesis_id),
          'evidential',
          'These hypotheses draw opposite conclusions from the same evidence.',
-         'system'
+         'system'::actor_type
   from hypothesis_evidence a
   join hypothesis_evidence b
     on a.evidence_id = b.evidence_id
@@ -697,10 +703,12 @@ create policy "admin write" on domains for all using (is_admin()) with check (is
 create policy "public read" on questions for select using (true);
 create policy "admin write" on questions for all using (is_admin()) with check (is_admin());
 
--- hypotheses: drafts are admin-only.
-create policy "public read" on hypotheses
-  for select using (state <> 'draft' or is_admin());
-create policy "admin write" on hypotheses
+-- hypotheses: drafts are admin-only. The public-read condition stands on its
+-- own (a pure row predicate, no is_admin()); a separate admin policy adds draft
+-- visibility + writes. Permissive policies OR together.
+create policy "public read non-draft" on hypotheses
+  for select using (state <> 'draft');
+create policy "admin all" on hypotheses
   for all using (is_admin()) with check (is_admin());
 
 -- sources
@@ -736,10 +744,11 @@ create policy "admin write" on simulations for all using (is_admin()) with check
 create policy "public read" on simulation_runs for select using (true);
 create policy "admin write" on simulation_runs for all using (is_admin()) with check (is_admin());
 
--- research_notes: public read only when published.
-create policy "public read" on research_notes
-  for select using (published or is_admin());
-create policy "admin write" on research_notes
+-- research_notes: public read only when published. Public condition stands on
+-- its own; admins get unpublished + writes via a separate policy.
+create policy "public read published" on research_notes
+  for select using (published);
+create policy "admin all" on research_notes
   for all using (is_admin()) with check (is_admin());
 
 -- ─── §2.10 Dashboard Aggregates (Materialized View) ──────────────────────────
@@ -776,9 +785,39 @@ end $$;
 
 -- ─── Grants ──────────────────────────────────────────────────────────────────
 
--- PostgREST exposes the matview & view read-only.
-grant select on dashboard_stats to anon, authenticated;
-grant select on graph_nodes to anon, authenticated;
+-- Table-level privileges. RLS (above) decides WHICH rows each role sees; these
+-- grants decide whether the role may touch the table at all. Without them every
+-- read fails with 42501 BEFORE any policy is evaluated. Supabase normally sets
+-- these via default privileges, but we grant them explicitly so the migration
+-- is self-contained and portable (do not rely on project defaults).
+grant usage on schema public to anon, authenticated, service_role;
+
+-- anon: read-only; RLS filters rows (drafts/unpublished stay hidden).
+grant select on all tables in schema public to anon;
+-- authenticated: full DML; the "admin all" RLS policies gate actual writes.
+grant select, insert, update, delete on all tables in schema public to authenticated;
+-- service_role bypasses RLS but still needs table privileges.
+grant all on all tables in schema public to service_role;
+
+grant usage, select on all sequences in schema public to anon, authenticated, service_role;
+grant execute on all functions in schema public to anon, authenticated, service_role;
+
+-- Future objects created in this schema inherit the same grants.
+alter default privileges in schema public
+  grant select on tables to anon;
+alter default privileges in schema public
+  grant select, insert, update, delete on tables to authenticated;
+alter default privileges in schema public
+  grant all on tables to service_role;
+alter default privileges in schema public
+  grant usage, select on sequences to anon, authenticated, service_role;
+alter default privileges in schema public
+  grant execute on functions to anon, authenticated, service_role;
+
+-- PostgREST exposes the matview & view read-only (matviews are NOT covered by
+-- GRANT ... ON ALL TABLES, so they need explicit grants).
+grant select on dashboard_stats to anon, authenticated, service_role;
+grant select on graph_nodes to anon, authenticated, service_role;
 
 -- Function execution: search & suggestion are public; mutating/maintenance
 -- functions are kept away from anon (their bodies also self-guard).

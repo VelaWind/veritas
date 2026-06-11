@@ -113,7 +113,36 @@ everything else is a choice the spec left open.
 - **Rate limiting is best-effort in-memory** — `/api/search` uses a per-instance
   token bucket. On serverless each instance has its own bucket; this is a soft
   control. A KV/edge-backed limiter is the V1.x hardening if abuse appears.
-- **SQL validation in CI** — `npm run validate:sql` parses the migration and
+- **SQL validation in CI** — `npm run validate:sql` parses the migrations and
   seed against the real PostgreSQL grammar (`pg-query-emscripten`). A fresh
   WASM instance is created per statement because the module corrupts its heap
   when one instance parses many large statements.
+
+## Post-launch fix — empty public reads (migration 0002_fix_rls.sql)
+
+- **Root cause (diagnosed live, not guessed):** public reads returned `[]`.
+  A live diagnostic (`scripts/diagnose-rls.mjs`) showed every base table
+  returning SQL state **42501 "permission denied for table"** for BOTH the
+  `anon` and `service_role` roles — a missing table-level GRANT, which is
+  evaluated *before* RLS. It was NOT an RLS row-filter or `is_admin()` problem
+  (`is_admin()` correctly returns `false`, and `state <> 'draft' OR is_admin()`
+  is `TRUE` for active rows regardless). The home-page *stats* worked only
+  because 0001 granted the `dashboard_stats` matview explicitly while never
+  granting the base tables — it relied on Supabase default privileges that did
+  not apply in this project.
+- **Why it looked silent:** the query layer's `if (error) return []` (kept so
+  `next build` succeeds with no DB) swallowed the 42501 error, so a privilege
+  failure presented as an empty-but-no-error result. This is a deliberate
+  build-time-resilience tradeoff; runtime error surfacing to platform logs is a
+  reasonable follow-up.
+- **Fix:** explicit GRANTs to `anon` (SELECT), `authenticated` (SELECT/INSERT/
+  UPDATE/DELETE — RLS gates writes), and `service_role` (ALL), plus sequence/
+  function grants and matching `ALTER DEFAULT PRIVILEGES` so future objects are
+  covered. Mirrored into 0001; shipped as idempotent 0002 for the live DB.
+- **Also in 0002:** `is_admin()` made explicitly null-safe; public-read
+  policies on `hypotheses`/`research_notes` split so the public condition
+  stands alone (no `is_admin()` in the read path); and
+  `scan_contradictions()` casts `'system'::actor_type` — the bare literal
+  resolves to `text` under `SELECT DISTINCT` and there is no implicit
+  `text -> actor_type` cast, so the insert would fail 42804 the moment the scan
+  found a contradiction to record.
