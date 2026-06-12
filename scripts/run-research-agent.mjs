@@ -18,6 +18,7 @@
 //      NEXT_PUBLIC_SUPABASE_URL / _ANON_KEY (public reads), and the
 //      VERITAS_LLM_* provider config (defaults to local Ollama, $0/call).
 // ─────────────────────────────────────────────────────────────────────────────
+import { writeFileSync } from "node:fs";
 import { loadEnv, requireEnv } from "./agent-lib/env.mjs";
 import { parseArgs, intArg } from "./agent-lib/args.mjs";
 import { createLlmProvider } from "./agent-lib/llm.mjs";
@@ -143,6 +144,8 @@ async function submit(envelope) {
 
 const proposedTitles = [];
 const results = { hypotheses: 0, evidence: 0, skipped: 0 };
+// Structured record of what was generated (for --out; full citations included).
+const collected = [];
 
 for (let i = 0; i < wantHypotheses; i++) {
   if (!caps.canCallModel()) break;
@@ -231,10 +234,22 @@ Draft ONE NEW, distinct hypothesis (#${i + 1}) on this target, with 1–2 pieces
     rationale: reviewerNote,
   });
   if (res.capped) break;
+  let record = null;
   if (res.status === 201) {
     caps.recordProposal();
     results.hypotheses++;
     proposedTitles.push(obj.title);
+    record = {
+      title: hypPayload.title,
+      slug,
+      status,
+      confidence,
+      confidence_rationale: hypPayload.confidence_rationale,
+      reviewer_note: reviewerNote,
+      description: hypPayload.description,
+      evidence: [],
+    };
+    collected.push(record);
   } else if (res.status === 429) {
     console.log(`    ✗ server cap hit (429): ${res.error}`);
     caps.stoppedReason ??= "server queue cap (429)";
@@ -253,6 +268,7 @@ Draft ONE NEW, distinct hypothesis (#${i + 1}) on this target, with 1–2 pieces
     const evSlug = uniquify(slugify(ev.slug || ev.title, "agent-evidence"), takenSlugs);
     const citation = String(ev.citation || "").trim();
     const isUrl = /^https?:\/\//i.test(citation);
+    const relation = ev.relation || "supports";
     const evRes = await submit({
       target_type: "evidence",
       operation: "create",
@@ -269,12 +285,20 @@ Draft ONE NEW, distinct hypothesis (#${i + 1}) on this target, with 1–2 pieces
           reliability: 50,
         },
       },
-      rationale: `${ev.relation || "supports"} "${hypPayload.title}". ${citation ? `Citation: ${citation}.` : ""} Link on approval.`,
+      rationale: `${relation} "${hypPayload.title}". ${citation ? `Citation: ${citation}.` : ""} Link on approval.`,
     });
     if (evRes.capped) break;
     if (evRes.status === 201) {
       caps.recordProposal();
       results.evidence++;
+      record.evidence.push({
+        title: String(ev.title),
+        slug: evSlug,
+        summary: String(ev.summary),
+        strength: clampStrength(ev.strength),
+        relation,
+        citation,
+      });
     } else if (evRes.status === 429) {
       caps.stoppedReason ??= "server queue cap (429)";
       break;
@@ -286,6 +310,27 @@ function clampStrength(v) {
   const n = Number.parseInt(v, 10);
   if (!Number.isFinite(n)) return 50;
   return Math.min(100, Math.max(0, n));
+}
+
+if (args.out && args.out !== true) {
+  writeFileSync(
+    String(args.out),
+    JSON.stringify(
+      {
+        agent: "research",
+        dry_run: DRY,
+        model: llm.describe(),
+        target: topic,
+        domain: { slug: domain.slug, name: domain.name },
+        caps: caps.summary(),
+        stopped_early: caps.stoppedReason ?? null,
+        proposals: collected,
+      },
+      null,
+      2,
+    ),
+  );
+  console.log(`  wrote ${collected.length} proposal record(s) → ${args.out}`);
 }
 
 console.log(`\nDone — ${results.hypotheses} hypothesis + ${results.evidence} evidence proposal(s)` +

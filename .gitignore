@@ -28,3 +28,6 @@ npm-debug.log*
 # supabase local
 supabase/.temp
 supabase/.branches
+
+# agent dry-run previews + review worksheet (local, not part of the codebase)
+/agent-previews/

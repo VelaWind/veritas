@@ -19,6 +19,7 @@
 //     [--max-proposals N] [--max-model-calls N] [--max-pairs N]
 //     [--base-url http://localhost:3000] [--dry-run]
 // ─────────────────────────────────────────────────────────────────────────────
+import { writeFileSync } from "node:fs";
 import { loadEnv, requireEnv } from "./agent-lib/env.mjs";
 import { parseArgs, intArg } from "./agent-lib/args.mjs";
 import { createLlmProvider } from "./agent-lib/llm.mjs";
@@ -130,6 +131,7 @@ async function submit(envelope) {
 
 const seenPairs = new Set();
 const results = { proposed: 0, skipped: 0 };
+const collected = [];
 
 for (const f of findings) {
   if (!caps.canPropose()) break;
@@ -181,6 +183,15 @@ for (const f of findings) {
   if (res.status === 201) {
     caps.recordProposal();
     results.proposed++;
+    collected.push({
+      kind,
+      target_title: target.title,
+      other_title: other.title,
+      target_status: `${target.status} ${target.confidence}%`,
+      other_status: `${other.status} ${other.confidence}%`,
+      explanation,
+      note: noteText,
+    });
   } else if (res.status === 429) {
     console.log(`    ✗ server cap hit (429): ${res.error}`);
     caps.stoppedReason ??= "server queue cap (429)";
@@ -189,6 +200,26 @@ for (const f of findings) {
     console.log(`    ✗ proposal rejected (${res.status}): ${res.error}`);
     results.skipped++;
   }
+}
+
+if (args.out && args.out !== true) {
+  writeFileSync(
+    String(args.out),
+    JSON.stringify(
+      {
+        agent: "contradiction",
+        dry_run: DRY,
+        model: llm.describe(),
+        scope: domainName,
+        caps: caps.summary(),
+        stopped_early: caps.stoppedReason ?? null,
+        findings: collected,
+      },
+      null,
+      2,
+    ),
+  );
+  console.log(`  wrote ${collected.length} finding record(s) → ${args.out}`);
 }
 
 console.log(`\nDone — ${results.proposed} contradiction finding(s) proposed` +
