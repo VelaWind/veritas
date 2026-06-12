@@ -284,3 +284,266 @@ create with inline source, and the negative cases — anonymous→401, public-ro
 researcher read isolation, and the credited-to-proposer audit event. It is gated
 on migration 0003 being applied to the live DB (it reports BLOCKED if not). SQL
 is parser-validated (`npm run validate:sql`), and `npm run build` / `tsc` pass.
+
+### Phase A follow-up — proposer provenance on edits (migration 0004)
+
+A refinement requested after the Phase A review: when an **edit** suggestion is
+approved, the public timeline event must credit the **original proposer** (human
+or agent), not the applying admin. (Creates were already credited to the
+proposer; only the hypothesis-update trigger hard-coded `auth.uid()`.)
+
+- **Mechanism.** `apply_suggestion()` publishes the proposer's identity into
+  three transaction-local GUCs — `veritas.actor_id`, `veritas.actor_type`,
+  `veritas.agent_name` — via `set_config(..., is_local => true)` before it
+  writes. `log_hypothesis_update()` reads them, falling back to
+  `auth.uid()`/`'human'`/`null` when unset. Transaction-local means they reset
+  at commit and never leak across PostgREST requests on a pooled connection.
+- **Why a GUC and not a trigger argument.** Triggers can't take parameters, and
+  the update is an ordinary `UPDATE` from inside the function — the GUC is the
+  standard Postgres way to pass actor context to a trigger within one
+  transaction (the same shape Supabase uses for `request.jwt.claims`).
+- **No behaviour change for direct admin edits.** With no GUC set, the trigger
+  credits `auth.uid()` exactly as before; the new `actor_type`/`agent_name`
+  columns on the event default to `'human'`/`null`, matching the prior table
+  defaults. Only suggestion-applied edits change.
+- **Scope.** Evidence edits emit no timeline event in the existing schema, so
+  there is nothing to re-attribute there; only `log_hypothesis_update` and
+  `apply_suggestion` are touched (both `create or replace` in 0004, idempotent).
+- **Verified by** an added assertion in `verify-suggestions.mjs` (the edit's
+  `hypothesis_updated` event must carry `actor_id = proposer`). Requires 0004
+  applied alongside 0003.
+
+---
+
+## Phase B — AI agent layer (DESIGN; awaiting sign-off before any agent code)
+
+> **Status: design only.** This section is the security + cost model for review.
+> No agent code, agent tables, model-provider client, or runner scripts have
+> been written. Implementation begins only after explicit approval. Migration
+> 0004 above (provenance) is the *only* code shipped in this phase so far.
+
+### B.0 Design intent (the invariant that must not weaken)
+
+AI agents are the **primary researchers**: they read source material, form
+conclusions with evidence and confidence, and flag contradictions. But per §10
+of the architecture, an agent is **just another contributor** — it **proposes
+into the Phase A queue** (`actor_type='agent'`, `agent_name` set) and **never
+writes directly to active hypotheses/evidence**. Every agent output flows
+through the *same* `/api/suggestions` route, the *same* Zod validation, the
+*same* RLS, the *same* `apply_suggestion()` path, the *same* epistemic
+constraints and audit triggers as a human contribution — and a human admin
+confirms before anything joins the live map. Nothing below relaxes that.
+
+A direct consequence worth stating: **prompt injection in source material cannot
+poison the live map.** The worst an injected instruction can do is produce a bad
+*proposal*, which lands as `pending` and is rejected by a reviewer (or by the DB
+epistemic guard at approval). The agent has no path that bypasses review.
+
+### B.1 Agent identity & scoped tokens
+
+**Each agent is a first-class Supabase identity, deliberately under-privileged.**
+
+- A new `agent` value is added to the `user_role` enum (a fresh migration at
+  implementation time; the enum already carries `actor_type='agent'`). An
+  `agents` registry table holds one row per agent: `id`, `name` (→ `agent_name`),
+  `profile_id` (its Supabase Auth user), `enabled`, `scopes jsonb`
+  (`{domains:[…], max_pending, max_per_run, max_per_hour}`), `trust` (see B.3),
+  timestamps.
+- `is_contributor()` is widened to include `'agent'`, so an agent may **insert
+  its own pending suggestions** under the *existing* RLS policy
+  (`proposed_by = auth.uid() AND status='pending'`). An agent role gets **no**
+  write grant on any knowledge table and **no** `is_admin()` — so it can reach
+  *only* the queue, and only its own rows. `apply_suggestion()` keeps its
+  `is_admin()` self-guard, so an agent can never approve.
+- **Scoped tokens.** Agents are server-to-server; they authenticate with a
+  **scoped bearer token**, not a browser session. Recommended:
+  a `agent_tokens` table storing `token_hash` (SHA-256; the plaintext is shown
+  once at mint and never stored), `agent_id`, `expires_at`, `revoked_at`,
+  `last_used_at`. A new `requireAgent()` gate (sibling of `requireContributor`)
+  validates `Authorization: Bearer <token>`, resolves the agent, and acts under
+  the agent's identity. The token is **capability-narrow** — it is accepted only
+  on the propose endpoint; it is never a Supabase service key and carries no
+  admin or knowledge-table reach. Tokens are revocable and expiring; minting and
+  revocation are admin-only.
+- Agents post to a thin `POST /api/agent/suggestions` (or the existing route
+  with the agent gate) that stamps `actor_type='agent'`, `agent_name=<agent>`,
+  and `proposed_by=<agent profile>`. From there it is byte-identical to a human
+  proposal.
+
+**Provenance end-to-end.** Because `suggestions`, the create triggers, and (via
+0004) the update trigger all carry `actor_type`/`agent_name`, an approved agent
+proposal shows the agent — not the admin — as author on the public timeline.
+The reviewing admin is recorded on the suggestion's `reviewed_by`.
+
+### B.2 Rate & volume limits on the queue (defense in depth)
+
+Two independent layers, so a runaway agent can't flood review even if the client
+cap is bypassed:
+
+1. **Client-side per-run caps** (in the runner, enforced before each model call
+   and each insert): `max_model_calls`, `max_proposals`, `max_tokens` (cumulative
+   output budget). The run halts when any is hit. See B.6.
+2. **Server-side queue caps** (authoritative, in Postgres): a `BEFORE INSERT`
+   trigger on `suggestions` for `actor_type='agent'` enforces the agent's
+   `scopes.max_pending` (cap on outstanding `pending` rows) and a rolling
+   `max_per_hour` (count of this agent's suggestions in the last hour). Over the
+   cap → the insert raises, the route returns 429. This binds even a
+   mis-configured or compromised agent token.
+
+Domain scoping: an agent's `scopes.domains` restricts which `domain_id`s it may
+propose into (checked in the same trigger), so an agent can be commissioned for
+one field without touching others.
+
+### B.3 Handling low-quality or contradictory agent output
+
+- **Review is the quality gate.** Every agent proposal is `pending`; a human
+  approves or rejects. The DB epistemic guard (`epistemics_consistent`,
+  `enforce_active_rationale`) rejects an internally-inconsistent proposal *at
+  approval*, so a bad confidence/status pairing can never be applied even if a
+  reviewer slips.
+- **Required justification.** An agent proposal must carry a non-empty
+  `rationale` and, for a hypothesis, its assumptions + at least one linked or
+  proposed piece of evidence (enforced in the agent payload schema). "Confident
+  assertion with no evidence" is rejected before it reaches the queue.
+- **Duplicate suppression.** The `slug` unique constraint and a pre-insert
+  similarity check stop an agent re-proposing what already exists.
+- **Trust governor.** Each agent carries a `trust` score derived from its
+  approve/reject history. A low approval rate auto-throttles the agent (tighter
+  `max_per_run`/`max_per_hour`) and, below a floor, auto-disables it pending
+  admin review. This bounds the review burden a misbehaving agent can impose.
+- **Contradictory output is a feature, surfaced for review, not auto-acted.**
+  The Contradiction Agent (B.5) does **not** write to the `contradictions` table
+  (that stays admin + the security-definer scan). It proposes contradiction
+  findings into the queue as structured suggestions for an admin to confirm.
+
+### B.4 Auto-approve policy
+
+**Default: NO. Agents can never auto-approve — full stop.** The only apply path
+is `apply_suggestion()`, which raises unless `is_admin()`, and no agent is an
+admin. There is no code path, flag, or token scope in this design that lets an
+agent move its own (or any) suggestion to `approved`. A human reviewer is always
+in the loop before anything joins the live map — this is the B.0 invariant, and
+it is enforced in Postgres, not in app code.
+
+(If a future phase ever wants "trusted auto-approve" for a specific high-trust
+agent, it would be a separate, explicitly-opt-in, admin-gated mechanism with its
+own migration and review — out of scope for Phase B, and called out here so it
+is never added silently.)
+
+### B.5 The first two agents
+
+- **Research Agent.** Given a question or domain, reads source material via the
+  model, drafts a hypothesis (status/confidence/assumptions/falsification) plus
+  supporting/contesting evidence with citations, and proposes them into the
+  queue. Bounded by the per-run caps. It only ever produces `pending` proposals.
+- **Contradiction Agent.** Scans existing hypotheses + evidence for tension the
+  mechanical `scan_contradictions()` can't catch (semantic/assumption-level),
+  and proposes contradiction findings for admin confirmation. No direct write to
+  `contradictions`.
+
+Both are the same shape: read → reason with the model → emit `pending`
+proposals. Both inherit every guarantee above.
+
+### B.6 Admin review at volume
+
+Agents can generate proposals faster than humans review them, so the review UI
+gains (at implementation): filter by agent / actor_type, batch approve/reject,
+a dedup/cluster view, sort by agent `trust` and by evidence strength, and the
+agent's rationale + linked evidence inline. The existing `SuggestionQueue`
+already renders `agent_name`; these are additive. Trust-based prioritization lets
+admins clear high-trust agents quickly and scrutinize low-trust ones.
+
+### B.7 Cost model (designed explicitly — the only thing that costs money)
+
+Model calls are the sole marginal cost. The design makes them **cheap, capped,
+and controllable**, and lays a path to near-zero marginal cost via local models.
+
+**Pluggable provider — cloud or local by config only, no code change.** A small
+`LlmProvider` interface (`complete(messages, opts) → {text, usage}`) with
+adapters selected by environment variables:
+
+| `VERITAS_LLM_PROVIDER` | Adapter | Target |
+|---|---|---|
+| `anthropic` | official `@anthropic-ai/sdk` | Claude (cloud) |
+| `openai` | OpenAI client | OpenAI (cloud) |
+| `openai-compatible` | OpenAI-style `/chat/completions` over `VERITAS_LLM_BASE_URL` | **local Ollama** (`http://localhost:11434/v1`), vLLM, LM Studio, … |
+
+Switching cloud↔local is purely `VERITAS_LLM_PROVIDER` + `VERITAS_LLM_BASE_URL`
++ `VERITAS_LLM_MODEL` + `VERITAS_LLM_API_KEY` (server-side only — never
+`NEXT_PUBLIC_*`). The runner imports the interface, not a vendor. (Note: the
+Anthropic adapter uses the native Anthropic SDK — adaptive thinking + `effort`,
+and prompt caching on the stable prefix — rather than an OpenAI-compat shim, so
+the cloud path is first-class; the OpenAI-compatible adapter is what makes the
+local path config-only.)
+
+**Default mode is ON-DEMAND.** A run is triggered **manually** — a script
+(`node scripts/run-research-agent.mjs --question … --max-proposals …`) or an
+admin-only button hitting an admin endpoint — does **one bounded unit of work**,
+then **stops**. No always-on loop and no cron in V1. (Scheduling is possible
+later but ships **off**.)
+
+**Per-run caps so a single run can't run away** (env-configurable, enforced in
+the runner; mirrored by the B.2 server caps):
+
+| Cap | Env | Default (cheap) |
+|---|---|---|
+| Model calls per run | `AGENT_MAX_MODEL_CALLS` | 8 |
+| Proposals per run | `AGENT_MAX_PROPOSALS` | 5 |
+| Cumulative output tokens | `AGENT_MAX_OUTPUT_TOKENS` | 50_000 |
+
+The runner counts `usage` after every call and aborts the run when a cap trips —
+it can leave proposals already made, but never exceeds the bound.
+
+**Hard spending cap at the provider (the real money backstop, set by you).**
+The per-run caps bound one run; the *provider* limit bounds total spend across
+all runs regardless of bugs:
+
+- **Anthropic:** create a dedicated **Workspace** in the Console for Veritas's
+  agent, mint a **Workspace-scoped API key**, and set that workspace's **monthly
+  spend limit** (Console → Settings → Limits/Billing) plus its ITPM/OTPM rate
+  limits. The agent key cannot spend past the workspace cap. This is independent
+  of, and survives, any app-code mistake.
+- **OpenAI / OpenAI-compatible cloud:** set a hard monthly **usage limit** in
+  Billing → Limits and use a **project-scoped key**.
+- **Local (Ollama):** no marginal API cost; the "cap" is just local compute.
+
+Set **both** layers (per-run caps *and* a provider spend limit) — they protect
+against different failure modes. **This provider-side step is a console action
+only you can take; it is flagged in STATUS.md.**
+
+**Model choice for cost (cheap by default, escalate deliberately).** Defaults
+favour the cheapest capable tier; `VERITAS_LLM_MODEL` overrides per run:
+
+| Tier | Model id | Input / Output per MTok | Use |
+|---|---|---|---|
+| Default (bulk drafting) | `claude-haiku-4-5` | $1 / $5 | Routine research drafts |
+| Mid | `claude-sonnet-4-6` | $3 / $15 | Harder synthesis |
+| Hard reasoning (occasional) | `claude-opus-4-8` | $5 / $25 | Genuinely hard calls |
+| Max | `claude-fable-5` | $10 / $50 | Rare, hardest reasoning |
+
+Two cloud levers cut the bill further on the Anthropic path: **prompt caching**
+(the agent's system prompt + Veritas taxonomy/epistemic rules + domain context
+are large and stable across a run's calls → cache reads cost ~0.1× input; a run
+with several calls pays the cached prefix once) and the **Message Batches API**
+(50% off for non-interactive bulk sweeps that tolerate async completion).
+
+**Intended cost trajectory (explicit).**
+1. **Now — on-demand cloud, cheap-first.** Manual trigger, Haiku-class default,
+   per-run caps, a dedicated Anthropic workspace with a hard spend limit. Cloud
+   only.
+2. **Later — local model for volume.** Point `VERITAS_LLM_PROVIDER=openai-compatible`
+   + `VERITAS_LLM_BASE_URL` at a local Ollama for the **bulk/continuous**
+   research (near-zero marginal cost, fully private), and keep **cloud calls only
+   for the occasional hard-reasoning sub-task** (escalate specific steps to
+   `claude-opus-4-8`/`claude-fable-5`). Config-only; no code change.
+
+### B.8 What ships when (after sign-off)
+
+In order, each its own migration/commit, each kept green and stopping for review
+as instructed: (1) `agent` role + `agents`/`agent_tokens` tables + RLS + the B.2
+queue-cap trigger + `requireAgent()` gate; (2) the `LlmProvider` interface + the
+two adapters; (3) the Research Agent runner + its per-run caps; (4) the
+Contradiction Agent runner; (5) review-UI volume features; (6) a
+`verify-agents.mjs` end-to-end probe (agent proposes → lands pending → cannot
+approve → admin approves → credited to the agent on the timeline → caps enforced).
+None of this is written yet.
