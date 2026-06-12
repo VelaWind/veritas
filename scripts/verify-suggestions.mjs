@@ -212,6 +212,14 @@ async function run() {
   const { data: edited } = await service.from("hypotheses").select("title").eq("id", appliedId).single();
   check("apply: edit changed the title", edited.title.endsWith("(edited)"));
 
+  // Provenance (migration 0004): the edit's timeline event credits the
+  // proposer, not the approving admin.
+  const { data: editTl } = await service.from("timeline_events")
+    .select("actor_id").eq("node_id", appliedId).eq("event_type", "hypothesis_updated")
+    .order("id", { ascending: false }).limit(1).maybeSingle();
+  check("audit: edit timeline event credits proposer (0004)", editTl?.actor_id === researcher.userId,
+    `actor_id=${editTl?.actor_id}`);
+
   // ── Reject flow ─────────────────────────────────────────────────────────────
   const toReject = await call(researcher.cookie, "POST", "/api/suggestions",
     hypPayload(`${SLUG_PREFIX}reject-${Date.now().toString(36)}`, "Probe: to be rejected"));
