@@ -133,6 +133,14 @@ Output STRICT JSON ONLY — no prose, no markdown fences — with exactly this s
   ]
 }`;
 
+// One submit path for DRY and real, so the proposal cap is honored identically
+// in preview and in a real run. Returns {status, capped?, data?, error?}.
+async function submit(envelope) {
+  if (!caps.canPropose()) return { status: 0, capped: true };
+  if (DRY) return { status: 201, data: { id: "(dry-run)" } };
+  return propose(BASE, TOKEN, envelope);
+}
+
 const proposedTitles = [];
 const results = { hypotheses: 0, evidence: 0, skipped: 0 };
 
@@ -216,20 +224,13 @@ Draft ONE NEW, distinct hypothesis (#${i + 1}) on this target, with 1–2 pieces
 
   console.log(`  → #${i + 1} ${status} ${confidence}%  "${hypPayload.title}"`);
 
-  if (DRY) {
-    results.hypotheses++;
-    proposedTitles.push(obj.title);
-    if (Array.isArray(obj.evidence)) results.evidence += Math.min(obj.evidence.length, 2);
-    continue;
-  }
-
-  if (!caps.canPropose()) break;
-  const res = await propose(BASE, TOKEN, {
+  const res = await submit({
     target_type: "hypothesis",
     operation: "create",
     payload: hypPayload,
     rationale: reviewerNote,
   });
+  if (res.capped) break;
   if (res.status === 201) {
     caps.recordProposal();
     results.hypotheses++;
@@ -248,12 +249,11 @@ Draft ONE NEW, distinct hypothesis (#${i + 1}) on this target, with 1–2 pieces
   // guided by the relation + target named in the rationale).
   const evidence = Array.isArray(obj.evidence) ? obj.evidence.slice(0, 2) : [];
   for (const ev of evidence) {
-    if (!caps.canPropose()) break;
     if (!ev || !ev.title || !ev.summary) continue;
     const evSlug = uniquify(slugify(ev.slug || ev.title, "agent-evidence"), takenSlugs);
     const citation = String(ev.citation || "").trim();
     const isUrl = /^https?:\/\//i.test(citation);
-    const evRes = await propose(BASE, TOKEN, {
+    const evRes = await submit({
       target_type: "evidence",
       operation: "create",
       payload: {
@@ -271,6 +271,7 @@ Draft ONE NEW, distinct hypothesis (#${i + 1}) on this target, with 1–2 pieces
       },
       rationale: `${ev.relation || "supports"} "${hypPayload.title}". ${citation ? `Citation: ${citation}.` : ""} Link on approval.`,
     });
+    if (evRes.capped) break;
     if (evRes.status === 201) {
       caps.recordProposal();
       results.evidence++;
