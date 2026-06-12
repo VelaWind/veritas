@@ -4,72 +4,65 @@ Rolling status for review between phases. Most recent phase on top.
 
 ---
 
-## Phase B — AI agent layer 🟡 DESIGN COMPLETE — awaiting your sign-off before any agent code
+## Phase B — AI agent layer ✅ IMPLEMENTED & VERIFIED (2026-06-12)
 
-Per your instruction, I wrote the **complete agent security + cost model** into
-`DECISIONS.md` (§"Phase B — AI agent layer") and **stopped before writing any
-agent code**. The only code shipped this turn is the provenance trigger fix you
-asked me to fold in (migration 0004).
+AI agents are now first-class but deliberately under-privileged **contributors**:
+they **propose** into the Phase A queue (`actor_type='agent'`), and a human admin
+approves every proposal. Built in the B.8 staged order; migrations applied to the
+linked project with `supabase db push`. Full design + the deliberate deviations:
+DECISIONS.md §B (see **B.9 Implementation log**).
 
-### The design, in one screen
+### What shipped, by stage
 
-- **Invariant (unchanged):** agents are *contributors*, not writers. They
-  **propose into the Phase A queue** (`actor_type='agent'`, `agent_name` set) and
-  **never** write to active hypotheses/evidence. Same route, Zod, RLS,
-  `apply_suggestion()`, epistemic constraints, audit trail as humans. A human
-  approves before anything goes live. Prompt injection can at worst create a
-  *pending* proposal a reviewer rejects.
-- **Auth:** each agent is an under-privileged Supabase identity (new `agent`
-  role; no knowledge-table grants, never `is_admin()`); server-to-server **scoped
-  bearer tokens** (hashed, expiring, revocable) accepted only on the propose
-  endpoint via a new `requireAgent()` gate.
-- **Volume limits (defense in depth):** client-side per-run caps **and** a
-  Postgres `BEFORE INSERT` trigger enforcing per-agent `max_pending` /
-  `max_per_hour` / domain scope — so a runaway or compromised agent can't flood
-  review.
-- **Quality:** review is the gate; required rationale + evidence; duplicate
-  suppression; a trust governor that throttles/auto-disables low-approval agents.
-- **Auto-approve: NO**, enforced in Postgres (`apply_suggestion` requires
-  `is_admin()`). No agent code path can approve.
-- **Cost model:** pluggable provider (`anthropic` | `openai` | `openai-compatible`)
-  switchable **by env only** — cloud or local Ollama, no code change. **On-demand
-  by default** (manual trigger, one bounded unit of work, no loop/cron). Hard
-  **per-run caps** (model calls / proposals / output tokens). **Provider spend
-  cap** via a dedicated Anthropic workspace + workspace-scoped key + monthly spend
-  limit. Cheap-first model ladder (Haiku default → Opus/Fable only for hard
-  reasoning), prompt caching + Batch API as levers. **Trajectory:** on-demand
-  cloud now → local model for bulk later, cloud only for occasional hard reasoning.
+| Stage | Files |
+|---|---|
+| 1 — identities, tokens, caps | `0005_agent_role.sql`, `0006_agents.sql` (`agents` + `agent_tokens`, admin-only RLS, `enforce_agent_quota` BEFORE INSERT cap trigger, trust governor); `requireAgent()` in `lib/api.ts`; `POST /api/agent/suggestions`; `scripts/mint-agent-token.mjs` |
+| 2 — provider | `scripts/agent-lib/llm.mjs` — one `complete()` interface; openai-compatible (local Ollama, default, **$0/call**) / anthropic / openai, switchable by env only |
+| 3 — Research Agent | `scripts/run-research-agent.mjs` + `scripts/agent-lib/*` (caps, epistemics mirror, parsing, transport) |
+| 4 — Contradiction Agent | `scripts/run-contradiction-agent.mjs` |
+| 6 — verification | `scripts/verify-agents.mjs` |
 
-Full detail (tables, the `agents`/`agent_tokens` schema sketch, the two agents,
-review-at-volume features, and the staged ship order) is in DECISIONS.md.
+Stage 5 (B.6 review-UI volume features) is the **only** B.8 item deferred — the
+queue UI already renders `agent_name`; batch/cluster/trust-sort are additive.
 
-### ⚠ Decisions I need from you before implementing
+### Cost posture (your hard requirement: $0 per call)
 
-1. **Approve the security + cost model** as written, or tell me what to change.
-2. **Provider spend cap is yours to set** (console only): create a dedicated
-   Anthropic **Workspace**, mint a **workspace-scoped key**, set a **monthly
-   spend limit** + rate limits. I cannot do this from here. (OpenAI: Billing →
-   Limits; local Ollama: no API cost.)
-3. **Default model + caps:** I propose `claude-haiku-4-5` default with
-   `AGENT_MAX_MODEL_CALLS=8`, `AGENT_MAX_PROPOSALS=5`,
-   `AGENT_MAX_OUTPUT_TOKENS=50000`. Adjust to taste.
+Default provider is **local Ollama** via the OpenAI-compatible API — no marginal
+cost, no key needed. The cloud adapters are present but **off by default and
+switchable by env only**; a cloud provider selected without `VERITAS_LLM_API_KEY`
+**throws**. Nothing can bill unless you set `VERITAS_LLM_PROVIDER=anthropic|openai`.
 
-I will not write agent tables, the provider client, or the runners until you say go.
+### Gates
 
-### Provenance fix shipped this turn (migration 0004)
+| Gate | Result |
+|---|---|
+| `npm run validate:sql` (incl. 0005/0006) | ✅ green |
+| `tsc --noEmit` | ✅ green |
+| `npm run build` | ✅ green |
+| `node scripts/verify-agents.mjs` (live) | ✅ **ALL GREEN — 19/19** |
+| `node scripts/verify-suggestions.mjs` (live, Phase A) | ✅ unaffected (human path unchanged) |
 
-`supabase/migrations/0004_proposer_provenance.sql` — an approved **edit** now
-credits the **original proposer** (human or agent) on the public timeline, not
-the applying admin, via transaction-local GUCs read by `log_hypothesis_update()`.
-Zero behaviour change for direct admin edits. `verify-suggestions.mjs` gained an
-assertion for it. SQL parser-validated (now covers 0004).
+### How to trigger a research run
 
-### ⚠ ACTION REQUIRED (adds to the Phase A item below)
+```bash
+# 1. Mint a scoped token (admin action; token shown ONCE).
+node scripts/mint-agent-token.mjs --name research-agent --domains physics
+# 2. Run it (dev server + Ollama up).
+export VERITAS_AGENT_TOKEN="veagt_…"
+node scripts/run-research-agent.mjs --domain physics --max-proposals 5 --base-url http://localhost:3000
+```
 
-- **Apply `supabase/migrations/0004_proposer_provenance.sql`** to the live DB,
-  **together with 0003**. After both are applied, `node scripts/verify-suggestions.mjs`
-  (dev server up) should report `ALL GREEN`, including the new edit-provenance
-  check. Same constraint as before — I can't run DDL from here.
+Proposals appear in **`/admin/suggestions`** as `pending` rows labelled
+`agent: research-agent`. Approve/reject there; an approved proposal is credited to
+the **agent** on the public timeline. Full guide: README → "AI research agents".
+
+### ⚠ Only-if-you-go-cloud action (NOT needed for local)
+
+While on local Ollama there is **no spend to cap**. If you ever switch
+`VERITAS_LLM_PROVIDER` to a cloud value, set the provider-side hard spend cap
+first (Anthropic: dedicated **Workspace** + workspace-scoped key + **monthly spend
+limit**; OpenAI: Billing → Limits + project-scoped key) — per-run caps bound a
+single run, the provider cap bounds total spend. Console-only; I can't set it here.
 
 ---
 

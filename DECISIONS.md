@@ -315,12 +315,14 @@ proposer; only the hypothesis-update trigger hard-coded `auth.uid()`.)
 
 ---
 
-## Phase B — AI agent layer (DESIGN; awaiting sign-off before any agent code)
+## Phase B — AI agent layer (IMPLEMENTED 2026-06-12)
 
-> **Status: design only.** This section is the security + cost model for review.
-> No agent code, agent tables, model-provider client, or runner scripts have
-> been written. Implementation begins only after explicit approval. Migration
-> 0004 above (provenance) is the *only* code shipped in this phase so far.
+> **Status: built and verified.** The security + cost model below was signed off,
+> then implemented in the staged order of B.8 (migrations 0005/0006 applied to the
+> linked project via `supabase db push`). The implementation log and the
+> deliberate deviations are in **B.9** at the end of this section. Gates at
+> sign-off: `validate:sql`, `tsc`, `build`, and `verify-agents.mjs` (19/19) all
+> green.
 
 ### B.0 Design intent (the invariant that must not weaken)
 
@@ -547,3 +549,74 @@ Contradiction Agent runner; (5) review-UI volume features; (6) a
 `verify-agents.mjs` end-to-end probe (agent proposes → lands pending → cannot
 approve → admin approves → credited to the agent on the timeline → caps enforced).
 None of this is written yet.
+
+### B.9 Implementation log (2026-06-12) — built as designed, with these deviations
+
+Built in the B.8 order and applied to the linked project with `supabase db push`.
+Each stage kept the gates green and was committed separately. The deviations
+below are deliberate; everything else matches the design above.
+
+1. **Local model is the DEFAULT provider (overrides B.7's "cloud cheap-first").**
+   Per the sign-off instruction, **zero per-call cost is a hard requirement**, so
+   `VERITAS_LLM_PROVIDER` defaults to `openai-compatible` pointed at a LOCAL
+   Ollama (`http://localhost:11434/v1`, model `qwen2.5:14b`). The cloud adapters
+   (`anthropic`, `openai`) are present and first-class but reachable **only** by
+   explicitly setting that env var; a cloud provider selected without
+   `VERITAS_LLM_API_KEY` **throws** rather than silently doing anything — nothing
+   can bill unless the env is deliberately changed. Ollama needs no key (a dummy
+   bearer is sent so the OpenAI-style header is well-formed). The B.7 cost ladder,
+   spend caps, prompt caching, and Batch API remain the guidance **if/when** the
+   cloud path is switched on.
+
+2. **Adapters are fetch-based REST, not vendor SDKs.** B.7 sketched the Anthropic
+   adapter on the native `@anthropic-ai/sdk`. All three are implemented over
+   `fetch` against the public REST endpoints instead — no new dependency, nothing
+   added to the install footprint or the Next/tsc build for an off-by-default
+   path, and a smaller surface that cannot bill. (Anthropic prompt caching is
+   still expressible via the REST payload if the cloud path is later enabled.)
+
+3. **The enum add is split across two migrations (0005 + 0006).** Postgres forbids
+   *using* a freshly-added enum value in the transaction that *adds* it, so
+   `ALTER TYPE user_role ADD VALUE 'agent'` ships alone in 0005; the tables/RLS/
+   caps/trust ship in 0006. 0006 also compares `role::text` rather than the enum
+   literal, so it is safe even if a single push were to batch both. B.8 named one
+   migration; this is the same content, split only for that constraint.
+
+4. **Contradiction findings surface as hypothesis EDIT proposals.** The Phase A
+   queue's `target_type` is `hypothesis|evidence` only — 'contradiction' is not a
+   suggestable type, and widening it (new `node_type`, new `apply_suggestion`
+   branch) is out of Phase B scope. So the Contradiction Agent records a finding
+   as a reviewable **edit** on the more contestable hypothesis of the pair: it
+   adds an `open_question` naming the tension and puts the full A↔B explanation in
+   the rationale. It still **never** writes to `contradictions`; an admin confirms
+   and records the formal contradiction. The edit payload carries the target's own
+   `domain_id` so a domain-scoped agent passes the server scope check with no real
+   domain change.
+
+5. **Trust governor is a trigger, not wired into `apply_suggestion`.** `trust` is
+   recomputed by an `AFTER UPDATE OF status` trigger on `suggestions` whenever an
+   agent suggestion is approved/rejected (auto-disable below the floor), leaving
+   the audited `apply_suggestion()`/reject paths untouched.
+
+6. **Agent inserts run server-side under the service role, gated by the route +
+   the quota trigger.** An agent holds a scoped bearer token, not a session, so
+   `requireAgent()` resolves it and the route performs a **capability-narrow**
+   insert (always `pending`, always the agent's own identity). RLS is bypassed on
+   that insert, but the authoritative `enforce_agent_quota` BEFORE INSERT trigger
+   and every epistemic constraint at approval still bind. `is_contributor()` is
+   still widened to `'agent'` as defense in depth — an agent session, if one were
+   ever issued, stays RLS-scoped to its own pending rows.
+
+**Auto-approve remains NO**, enforced in Postgres exactly as B.4 specifies.
+**The provider spend cap (B.7) is moot while local** — there is no marginal cost;
+it becomes relevant only if `VERITAS_LLM_PROVIDER` is switched to a cloud value,
+and is flagged in STATUS.md for that case.
+
+**Shipped:** migrations `0005_agent_role.sql` / `0006_agents.sql`;
+`requireAgent()` (`lib/api.ts`) + `POST /api/agent/suggestions`;
+`scripts/agent-lib/*` (the `LlmProvider`, per-run caps, epistemics mirror,
+parsing/transport helpers); `scripts/run-research-agent.mjs`,
+`scripts/run-contradiction-agent.mjs`, `scripts/mint-agent-token.mjs`,
+`scripts/verify-agents.mjs`. The review UI already renders `agent_name`, so B.6's
+volume features (batch/cluster/trust-sort) are the **only** B.8 item deferred —
+additive, not required for the invariant.

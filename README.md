@@ -130,6 +130,62 @@ the dashboard statistics.
 
 ---
 
+## AI research agents (Post-1.0 Phase B)
+
+AI agents are **primary researchers, not writers**. An agent is just another
+contributor: it **proposes** hypotheses, evidence, and contradiction findings
+into the Phase A suggestion queue (`actor_type='agent'`), through the same Zod
+validation, the same `apply_suggestion()` path, the same epistemic constraints
+and audit trail as a human — and **a human admin approves every proposal** before
+anything joins the live map. Agents can never write to the knowledge tables and
+can never self-approve (enforced in Postgres, not app code). Prompt injection in
+a source can, at worst, produce a *pending* proposal a reviewer rejects.
+
+### Model provider — local by default, $0 per call
+
+The provider is chosen entirely by environment, so cloud↔local is config-only:
+
+| `VERITAS_LLM_PROVIDER` | Target | Cost |
+|---|---|---|
+| `openai-compatible` **(default)** | local **Ollama** (`http://localhost:11434/v1`, `qwen2.5:14b`) | **$0 / call** |
+| `anthropic` | Claude (cloud) | metered — **off unless selected** |
+| `openai` | OpenAI (cloud) | metered — **off unless selected** |
+
+The cloud adapters exist but are reachable **only** by explicitly setting
+`VERITAS_LLM_PROVIDER`; a cloud provider without `VERITAS_LLM_API_KEY` throws, so
+nothing can bill unless you deliberately switch. See `.env.example` for all knobs.
+
+### Triggering a run (on-demand, bounded)
+
+A run is **manual** and does one bounded unit of work, then stops — no loop, no
+cron. With a dev server running and Ollama up:
+
+```bash
+# 1. Mint a scoped token for an agent (admin action; prints the token ONCE).
+node scripts/mint-agent-token.mjs --name research-agent --domains physics
+
+# 2. Hand the token to the runner and trigger a research run.
+export VERITAS_AGENT_TOKEN="veagt_…"            # (PowerShell: $env:VERITAS_AGENT_TOKEN="…")
+node scripts/run-research-agent.mjs --domain physics --max-proposals 5 \
+  --base-url http://localhost:3000
+
+# Or research a specific question, or scan for contradictions:
+node scripts/run-research-agent.mjs --question hard-problem-consciousness
+node scripts/run-contradiction-agent.mjs --domain physics
+
+# Preview without writing anything:
+node scripts/run-research-agent.mjs --domain physics --dry-run
+```
+
+Per-run caps (`--max-model-calls` / `--max-proposals` / `--max-output-tokens`, or
+`AGENT_MAX_*` env; defaults 8 / 5 / 50000) bound a single run; the server also
+enforces each agent's `max_pending` / `max_per_hour` / domain scope in Postgres.
+
+**What you'll see:** the proposals land in **`/admin/suggestions`** as `pending`
+rows labelled `agent: research-agent`, each with its rationale, proposed fields,
+and (for evidence) a "link on approval" note. Approve or reject them there; an
+approved proposal is credited to the **agent** on the public timeline.
+
 ## Deploy to Vercel
 
 1. Push the repo to GitHub/GitLab/Bitbucket.
@@ -172,6 +228,12 @@ node scripts/verify-admin.mjs   # end-to-end admin WRITE path over real HTTP:
                                 # epistemic-guard negative cases, full cleanup.
                                 # Needs a running server; set BASE_URL
                                 # (default http://localhost:3210)
+node scripts/verify-suggestions.mjs # Phase A queue: propose/approve/reject/
+                                # withdraw + RLS/authz negatives (needs 0003+0004)
+node scripts/verify-agents.mjs  # Phase B agent layer: token authz, propose→
+                                # pending→admin-approve→credited-to-agent, and the
+                                # server caps (max_pending/max_per_hour/scope).
+                                # Needs a running server + migrations 0005+0006.
 ```
 
 ---
