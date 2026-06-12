@@ -4,10 +4,13 @@ import { SUPABASE_ANON_KEY, SUPABASE_URL } from "./env";
 
 type CookieToSet = { name: string; value: string; options: CookieOptions };
 
+/** Paths that require a signed-in session (role is enforced in each layout). */
+const PROTECTED_PREFIXES = ["/admin", "/contribute"];
+
 /**
  * Refreshes the auth session on every request and enforces auth gate 1 of
- * §4.2: /admin/* requires a signed-in user. (The role check — gate 1.5 —
- * happens server-side in app/admin/layout.tsx; RLS is gate 3.)
+ * §4.2: /admin/* and /contribute/* require a signed-in user. (The role check —
+ * gate 1.5 — happens server-side in each section's layout; RLS is gate 3.)
  */
 export async function updateSession(request: NextRequest) {
   let supabaseResponse = NextResponse.next({ request });
@@ -37,7 +40,7 @@ export async function updateSession(request: NextRequest) {
 
   const path = request.nextUrl.pathname;
 
-  if (!user && path.startsWith("/admin")) {
+  if (!user && PROTECTED_PREFIXES.some((p) => path.startsWith(p))) {
     const url = request.nextUrl.clone();
     url.pathname = "/login";
     url.searchParams.set("next", path);

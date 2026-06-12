@@ -6,18 +6,19 @@ import { createClient } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
 
 const LINKS = [
-  { href: "/admin", label: "Overview", exact: true },
-  { href: "/admin/domains", label: "Domains" },
-  { href: "/admin/questions", label: "Questions" },
-  { href: "/admin/hypotheses", label: "Hypotheses" },
-  { href: "/admin/evidence", label: "Evidence" },
-  { href: "/admin/simulations", label: "Simulations" },
-  { href: "/admin/notes", label: "Notes" },
-  { href: "/admin/contradictions", label: "Contradictions" },
-  { href: "/admin/suggestions", label: "Suggestions" },
+  { href: "/contribute", label: "Overview", exact: true },
+  { href: "/contribute/hypotheses/new", label: "Propose hypothesis" },
+  { href: "/contribute/evidence/new", label: "Propose evidence" },
+  { href: "/contribute/suggestions", label: "My suggestions" },
 ];
 
-export function AdminNav({ displayName }: { displayName: string }) {
+export function ContributeNav({
+  displayName,
+  role,
+}: {
+  displayName: string;
+  role: string;
+}) {
   const pathname = usePathname();
   const router = useRouter();
 
@@ -31,7 +32,7 @@ export function AdminNav({ displayName }: { displayName: string }) {
   return (
     <aside className="flex shrink-0 flex-row flex-wrap items-center gap-1 border-b border-edge pb-4 lg:w-48 lg:flex-col lg:items-stretch lg:border-b-0 lg:border-r lg:pb-0 lg:pr-6">
       <p className="eyebrow w-full pb-2 lg:pb-4">
-        Admin · <span className="text-ink">{displayName}</span>
+        Contribute · <span className="text-ink">{displayName}</span>
       </p>
       {LINKS.map((l) => {
         const active = l.exact ? pathname === l.href : pathname.startsWith(l.href);
@@ -49,6 +50,14 @@ export function AdminNav({ displayName }: { displayName: string }) {
           </Link>
         );
       })}
+      {role === "admin" && (
+        <Link
+          href="/admin/suggestions"
+          className="rounded px-3 py-1.5 text-sm text-muted hover:bg-raised hover:text-ink"
+        >
+          Review queue →
+        </Link>
+      )}
       <button
         type="button"
         onClick={signOut}

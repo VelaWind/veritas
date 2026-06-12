@@ -249,6 +249,36 @@ export interface ResearchNote {
   updated_at: string;
 }
 
+// ── Suggestion queue (Post-1.0 Phase A) ─────────────────────────────────────
+
+export type SuggestionOperation = "create" | "edit";
+export type SuggestionStatus = "pending" | "approved" | "rejected" | "withdrawn";
+/** A node kind a contributor may propose (subset of NodeType). */
+export type SuggestionTarget = "hypothesis" | "evidence";
+
+export interface Suggestion {
+  id: string;
+  target_type: SuggestionTarget;
+  operation: SuggestionOperation;
+  target_id: string | null;
+  payload: Record<string, unknown>;
+  rationale: string;
+  status: SuggestionStatus;
+  proposed_by: string | null;
+  actor_type: ActorType;
+  agent_name: string | null;
+  reviewed_by: string | null;
+  review_notes: string;
+  reviewed_at: string | null;
+  applied_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SuggestionWithProposer extends Suggestion {
+  proposer: { display_name: string; role: UserRole } | null;
+}
+
 // ── Composites used by pages ────────────────────────────────────────────────
 
 export interface EvidenceWithSource extends Evidence {

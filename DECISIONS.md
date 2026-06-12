@@ -190,3 +190,97 @@ database, not by inspection alone.
   action, used for nothing else.
 - **Gates at sign-off:** `npm run build` (113 pages, SSG params resolved from
   live data), `tsc --noEmit`, and `npm run validate:sql` all pass clean.
+
+---
+
+# Post-1.0
+
+The phases below extend the architecture's "Post-1.0 horizon" (§9). Each ships
+behind the same invariant: **the database enforces epistemics and authorization;
+application code is thin.** No phase weakens an existing constraint, RLS policy,
+or auth gate, and no phase gives any non-admin direct write access to the
+knowledge tables.
+
+## Phase A — Researcher role + suggestion queue (migration 0003)
+
+**Goal.** Let `researcher`-role users propose new hypotheses/evidence and edits
+without touching public knowledge; admins approve or reject. The `researcher`
+role already existed in the `user_role` enum (reserved in 1.0 for exactly this),
+so no enum change was needed.
+
+**The one new write path is a queue, not the knowledge tables.** Contributors
+write only into `suggestions` (RLS-scoped to their own `pending` rows). They can
+never insert/update/delete `hypotheses`/`evidence` directly — the existing
+"admin all / admin write" policies are unchanged, and no contributor policy was
+added to any knowledge table.
+
+**Authorization model (three gates, mirroring §4.2).**
+- *Propose*: `requireContributor()` (handler) admits `researcher|admin`; RLS
+  `"contributor insert own"` forces `proposed_by = auth.uid()` and
+  `status='pending'`; `is_contributor()` is a null-safe security-definer helper
+  modelled exactly on `is_admin()`.
+- *Approve*: `requireAdmin()` (handler) → the `apply_suggestion()` function
+  self-guards with `is_admin()` and raises `42501` otherwise. A contributor
+  cannot self-approve: the `"proposer update own pending"` RLS `with check`
+  permits only `pending → pending|withdrawn`, and a direct PostgREST attempt to
+  set `status='approved'` matches no permissive policy (verified by the live
+  script's RLS probe).
+
+**Approval is one atomic, fully-audited transaction.** `apply_suggestion(id,
+notes)` (security definer) re-reads the locked suggestion, inserts/updates the
+real node, and stamps the review fields in a single transaction. The insert/
+update fires the **existing** triggers (`log_hypothesis_insert`,
+`log_hypothesis_update`, `log_confidence_change`, `touch_updated_at`,
+`on_evidence_linked` where relevant) and is checked by the **existing**
+constraints (`epistemics_consistent`, `enforce_active_rationale`). Security
+definer bypasses *RLS* on the target tables (so the function self-guards on
+`is_admin()`), but CHECK constraints and triggers are **not** RLS and still
+fire — so every epistemic guarantee holds. An epistemically invalid proposal
+(e.g. status `established` with confidence 30) is rejected by the DB at approval
+time with a clear message, and the suggestion stays pending.
+
+**Why a DB function and not the route doing the insert.** Atomicity: apply +
+status-update must not be separable (no orphaned "approved but not applied", no
+double-apply on retry). The function also keeps the epistemic write path in
+Postgres, consistent with the §6 design note. Cost: the function maps
+`payload` jsonb → columns, which mirrors the admin `POST` routes. The shared
+contract that keeps them in sync is the Zod schema: the propose route validates
+each payload with the *same* `hypothesisCreateSchema`/`evidenceCreateSchema`/…
+the admin forms use (`SUGGESTION_PAYLOAD_SCHEMAS`), so an approved suggestion
+yields exactly what a direct admin write would.
+
+**Attribution.** Created nodes carry the **proposer** as
+`created_by`/`actor_type`/`agent_name`, so the lifecycle trigger credits the
+proposer in the public timeline ("hypothesis proposed by X"). `reviewed_by`
+records the approving admin on the suggestion row. One asymmetry, by design and
+documented: the `hypothesis_updated` timeline event for an *edit* is written by
+the existing trigger with `actor_id = auth.uid()` = the applying admin (that
+trigger is untouched working code). Full provenance is always reconstructable by
+joining the suggestion (`applied_id → node`).
+
+**Scope decisions (deliberate, to avoid weakening anything).**
+- *Confidence is not editable through the queue.* It is the most
+  epistemically-sensitive field and admins own it via the dedicated confidence
+  editor (which records `confidence_history`). The edit path mirrors the admin
+  edit form, which also excludes confidence. A `create` proposal *does* carry an
+  initial confidence (it is a new record an admin must approve; the band
+  constraint still applies).
+- *Target types are limited to `hypothesis` and `evidence`* via a CHECK on
+  `suggestions.target_type` (which reuses `node_type`). Domains/questions/
+  simulations/notes remain admin-only in Phase A.
+
+**Reuse, not duplication.** `actor_type`/`agent_name` columns on `suggestions`
+exist now so Phase B agents propose into the *same* table and the *same*
+`apply_suggestion()` path — no second review mechanism. The admin `HypothesisForm`
+/`EvidenceForm` gained a `propose` prop that re-targets submission to
+`/api/suggestions` (one source of truth for each form; the admin path is byte-
+for-byte unchanged when `propose` is absent).
+
+**Verification.** `scripts/verify-suggestions.mjs` drives the real HTTP routes
+with forged cookies for a temp admin + two researchers + one public user:
+propose→approve (create + edit), reject (reason required), withdraw, evidence
+create with inline source, and the negative cases — anonymous→401, public-role→
+403, researcher-approve→403, the direct-PostgREST self-approve RLS probe, cross-
+researcher read isolation, and the credited-to-proposer audit event. It is gated
+on migration 0003 being applied to the live DB (it reports BLOCKED if not). SQL
+is parser-validated (`npm run validate:sql`), and `npm run build` / `tsc` pass.

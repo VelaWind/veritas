@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "validate:sql": "node scripts/validate-sql.mjs supabase/migrations/0001_core.sql supabase/migrations/0002_fix_rls.sql supabase/seed.sql"
+    "validate:sql": "node scripts/validate-sql.mjs supabase/migrations/0001_core.sql supabase/migrations/0002_fix_rls.sql supabase/migrations/0003_suggestions.sql supabase/seed.sql"
   },
   "dependencies": {
     "@supabase/ssr": "^0.6.1",

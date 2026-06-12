@@ -250,6 +250,53 @@ export const contradictionResolveSchema = z
     }
   });
 
+// ── Suggestion queue (Post-1.0 Phase A) ─────────────────────────────────────
+
+export const suggestionTargetSchema = z.enum(["hypothesis", "evidence"]);
+export const suggestionOperationSchema = z.enum(["create", "edit"]);
+
+/**
+ * The payload of a suggestion is validated against the SAME create/edit schema
+ * the admin forms use — one shared contract, so an approved suggestion produces
+ * exactly the record a direct admin write would. The DB constraints remain the
+ * final authority (the apply_suggestion() function re-checks them).
+ */
+export const SUGGESTION_PAYLOAD_SCHEMAS = {
+  hypothesis: { create: hypothesisCreateSchema, edit: hypothesisUpdateSchema },
+  evidence: { create: evidenceCreateSchema, edit: evidenceUpdateSchema },
+} as const;
+
+/** Envelope only — the payload is re-validated per (target_type, operation). */
+export const suggestionEnvelopeSchema = z
+  .object({
+    target_type: suggestionTargetSchema,
+    operation: suggestionOperationSchema,
+    target_id: z.string().uuid().nullable().optional(),
+    payload: z.record(z.unknown()),
+    rationale: z.string().trim().max(2000).default(""),
+  })
+  .superRefine((data, ctx) => {
+    if (data.operation === "edit" && !data.target_id) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["target_id"],
+        message: "An edit suggestion must name the record it edits (target_id).",
+      });
+    }
+  });
+
+export const suggestionReviewSchema = z.object({
+  notes: z.string().trim().max(2000).default(""),
+});
+
+export const suggestionRejectSchema = z.object({
+  notes: z
+    .string()
+    .trim()
+    .min(1, "A rejection needs a short reason for the proposer.")
+    .max(2000),
+});
+
 // ── Misc ────────────────────────────────────────────────────────────────────
 
 export const searchQuerySchema = z.object({

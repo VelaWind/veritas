@@ -26,9 +26,11 @@ interface Props {
   sources: Array<Pick<Source, "id" | "title" | "year">>;
   domains: Array<{ id: string; name: string }>;
   initial?: Evidence;
+  /** Propose into the review queue instead of writing directly (Phase A). */
+  propose?: boolean;
 }
 
-export function EvidenceForm({ sources, domains, initial }: Props) {
+export function EvidenceForm({ sources, domains, initial, propose = false }: Props) {
   const router = useRouter();
   const editing = Boolean(initial);
 
@@ -49,6 +51,7 @@ export function EvidenceForm({ sources, domains, initial }: Props) {
     year: "" as string,
     reliability: 70,
   });
+  const [proposalNote, setProposalNote] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
 
@@ -77,6 +80,24 @@ export function EvidenceForm({ sources, domains, initial }: Props) {
             }
           : null,
     };
+
+    if (propose) {
+      const res = await api.post("/api/suggestions", {
+        target_type: "evidence",
+        operation: editing ? "edit" : "create",
+        target_id: initial?.id ?? null,
+        payload,
+        rationale: proposalNote,
+      });
+      setPending(false);
+      if (res.error) {
+        setError(res.error);
+        return;
+      }
+      router.push("/contribute/suggestions");
+      router.refresh();
+      return;
+    }
 
     const res = editing
       ? await api.patch<Evidence>(`/api/evidence/${initial!.id}`, payload)
@@ -266,6 +287,23 @@ export function EvidenceForm({ sources, domains, initial }: Props) {
         )}
       </fieldset>
 
+      {propose && (
+        <Field
+          label="Note to reviewer (optional)"
+          hint="Why are you proposing this? Anything an admin should weigh when reviewing."
+        >
+          {(id) => (
+            <textarea
+              id={id}
+              rows={3}
+              value={proposalNote}
+              onChange={(e) => setProposalNote(e.target.value)}
+              className={inputClass}
+            />
+          )}
+        </Field>
+      )}
+
       {error && (
         <p role="alert" className="text-sm" style={{ color: "var(--contradiction)" }}>
           {error}
@@ -273,7 +311,13 @@ export function EvidenceForm({ sources, domains, initial }: Props) {
       )}
 
       <Button type="submit" variant="primary" disabled={pending}>
-        {pending ? "Saving…" : editing ? "Save changes" : "Add evidence"}
+        {pending
+          ? "Submitting…"
+          : propose
+            ? "Submit for review"
+            : editing
+              ? "Save changes"
+              : "Add evidence"}
       </Button>
     </form>
   );

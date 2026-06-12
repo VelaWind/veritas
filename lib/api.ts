@@ -46,6 +46,39 @@ export async function requireAdmin() {
   return { ok: true as const, supabase, user };
 }
 
+/**
+ * Like requireAdmin, but admits 'researcher' as well as 'admin' (Post-1.0
+ * Phase A). Used by the suggestion-queue propose path: contributors may write
+ * ONLY into `suggestions` (RLS-gated to their own pending rows), never to the
+ * knowledge tables. Returns a session-bound client carrying the user's JWT so
+ * the insert runs under their identity and RLS.
+ */
+export async function requireContributor() {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) {
+    return { ok: false as const, response: apiError("Authentication required.", 401) };
+  }
+
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("role")
+    .eq("id", user.id)
+    .single();
+
+  if (!profile || (profile.role !== "researcher" && profile.role !== "admin")) {
+    return {
+      ok: false as const,
+      response: apiError("Researcher or admin role required.", 403),
+    };
+  }
+
+  return { ok: true as const, supabase, user, role: profile.role as "researcher" | "admin" };
+}
+
 /** Friendly translation of the DB epistemic-guard errors (§2.3/§2.6). */
 export function translateDbError(message: string): string {
   if (message.includes("epistemics_consistent")) {

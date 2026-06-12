@@ -23,9 +23,11 @@ interface Props {
   domains: Array<{ id: string; name: string }>;
   questions: Array<{ id: string; title: string; domain_id: string }>;
   initial?: Hypothesis;
+  /** Propose into the review queue instead of writing directly (Phase A). */
+  propose?: boolean;
 }
 
-export function HypothesisForm({ domains, questions, initial }: Props) {
+export function HypothesisForm({ domains, questions, initial, propose = false }: Props) {
   const router = useRouter();
   const editing = Boolean(initial);
 
@@ -48,6 +50,7 @@ export function HypothesisForm({ domains, questions, initial }: Props) {
   const [falsification, setFalsification] = useState(
     initial?.falsification_criteria ?? "",
   );
+  const [proposalNote, setProposalNote] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
 
@@ -86,6 +89,24 @@ export function HypothesisForm({ domains, questions, initial }: Props) {
     }
 
     setPending(true);
+    if (propose) {
+      const res = await api.post("/api/suggestions", {
+        target_type: "hypothesis",
+        operation: editing ? "edit" : "create",
+        target_id: initial?.id ?? null,
+        payload: parsed.data,
+        rationale: proposalNote,
+      });
+      setPending(false);
+      if (res.error) {
+        setError(res.error);
+        return;
+      }
+      router.push("/contribute/suggestions");
+      router.refresh();
+      return;
+    }
+
     const res = editing
       ? await api.patch<Hypothesis>(`/api/hypotheses/${initial!.id}`, parsed.data)
       : await api.post<Hypothesis>("/api/hypotheses", parsed.data);
@@ -367,6 +388,23 @@ export function HypothesisForm({ domains, questions, initial }: Props) {
         )}
       </Field>
 
+      {propose && (
+        <Field
+          label="Note to reviewer (optional)"
+          hint="Why are you proposing this? Anything an admin should weigh when reviewing."
+        >
+          {(id) => (
+            <textarea
+              id={id}
+              rows={3}
+              value={proposalNote}
+              onChange={(e) => setProposalNote(e.target.value)}
+              className={inputClass}
+            />
+          )}
+        </Field>
+      )}
+
       {error && (
         <p role="alert" className="text-sm" style={{ color: "var(--contradiction)" }}>
           {error}
@@ -374,7 +412,13 @@ export function HypothesisForm({ domains, questions, initial }: Props) {
       )}
 
       <Button type="submit" variant="primary" disabled={pending}>
-        {pending ? "Saving…" : editing ? "Save changes" : "Create hypothesis"}
+        {pending
+          ? "Submitting…"
+          : propose
+            ? "Submit for review"
+            : editing
+              ? "Save changes"
+              : "Create hypothesis"}
       </Button>
     </form>
   );
