@@ -64,6 +64,9 @@ create table if not exists suggestions (
 create index if not exists idx_suggestions_status   on suggestions (status, created_at desc);
 create index if not exists idx_suggestions_proposer on suggestions (proposed_by, created_at desc);
 
+-- (drop-then-create so the whole migration stays idempotent / re-runnable;
+--  `create trigger` has no `if not exists`.)
+drop trigger if exists trg_touch_suggestions on suggestions;
 create trigger trg_touch_suggestions before update on suggestions
   for each row execute function touch_updated_at();
 
