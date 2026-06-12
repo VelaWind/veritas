@@ -37,7 +37,7 @@ export type NodeType = "question" | "hypothesis" | "evidence" | "domain" | "simu
 
 export type ActorType = "human" | "agent" | "system";
 
-export type UserRole = "public" | "researcher" | "admin";
+export type UserRole = "public" | "researcher" | "admin" | "agent";
 
 export type TimelineEventType =
   | "hypothesis_created"
@@ -277,6 +277,43 @@ export interface Suggestion {
 
 export interface SuggestionWithProposer extends Suggestion {
   proposer: { display_name: string; role: UserRole } | null;
+}
+
+// ── Agent layer (Post-1.0 Phase B) ──────────────────────────────────────────
+
+/** Per-agent bounds, stored on `agents.scopes` jsonb. */
+export interface AgentScopes {
+  /** Allowed domain ids; empty/absent means unrestricted. */
+  domains?: string[];
+  /** Max outstanding `pending` suggestions (server-enforced). */
+  max_pending?: number;
+  /** Max proposals a single runner pass may make (client-enforced default). */
+  max_per_run?: number;
+  /** Max suggestions from this agent per rolling hour (server-enforced). */
+  max_per_hour?: number;
+}
+
+export interface Agent {
+  id: string;
+  name: string;
+  profile_id: string;
+  enabled: boolean;
+  scopes: AgentScopes;
+  /** 0–100, derived from approve/reject history. */
+  trust: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentToken {
+  id: string;
+  agent_id: string;
+  token_hash: string;
+  label: string;
+  expires_at: string | null;
+  revoked_at: string | null;
+  last_used_at: string | null;
+  created_at: string;
 }
 
 // ── Composites used by pages ────────────────────────────────────────────────

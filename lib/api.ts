@@ -1,6 +1,9 @@
+import { createHash } from "node:crypto";
 import { NextResponse } from "next/server";
 import type { ZodError } from "zod";
 import { createClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/admin";
+import type { AgentScopes } from "@/types/domain";
 
 /** §6: every handler returns a `{ data, error }` envelope. */
 export function apiData<T>(data: T, init?: ResponseInit) {
@@ -77,6 +80,75 @@ export async function requireContributor() {
   }
 
   return { ok: true as const, supabase, user, role: profile.role as "researcher" | "admin" };
+}
+
+/**
+ * Auth gate for the agent propose path (Post-1.0 Phase B). Agents are
+ * server-to-server: they authenticate with a SCOPED BEARER TOKEN (not a Supabase
+ * session, never the service key), accepted ONLY here. The plaintext token is
+ * hashed and matched against `agent_tokens`; a valid, unexpired, unrevoked token
+ * on an enabled agent resolves to that agent's identity.
+ *
+ * Returns the service-role client to perform the insert: the agent has no
+ * session, so the route stamps `proposed_by = agent.profile_id`,
+ * `actor_type='agent'`, `agent_name = agent.name`, `status='pending'` itself —
+ * capability-narrow. RLS is bypassed, but the authoritative server-side caps
+ * (`enforce_agent_quota` BEFORE INSERT trigger) and every epistemic constraint
+ * at approval still bind. An agent can never approve (apply_suggestion requires
+ * is_admin()).
+ */
+export async function requireAgent(request: Request) {
+  const header = request.headers.get("authorization") ?? "";
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  if (!match) {
+    return {
+      ok: false as const,
+      response: apiError("Agent bearer token required.", 401),
+    };
+  }
+
+  const tokenHash = createHash("sha256").update(match[1].trim()).digest("hex");
+  const supabase = createAdminClient();
+
+  const { data: token, error } = await supabase
+    .from("agent_tokens")
+    .select("id, expires_at, revoked_at, agent:agents(id, name, profile_id, enabled, scopes, trust)")
+    .eq("token_hash", tokenHash)
+    .maybeSingle();
+
+  if (error) {
+    return { ok: false as const, response: apiError("Token lookup failed.", 500) };
+  }
+  if (!token) {
+    return { ok: false as const, response: apiError("Invalid agent token.", 401) };
+  }
+  if (token.revoked_at) {
+    return { ok: false as const, response: apiError("Agent token revoked.", 401) };
+  }
+  if (token.expires_at && new Date(token.expires_at).getTime() <= Date.now()) {
+    return { ok: false as const, response: apiError("Agent token expired.", 401) };
+  }
+
+  // PostgREST returns the embedded to-one relation as an object (or array under
+  // some configs) — normalize.
+  const agentRaw = Array.isArray(token.agent) ? token.agent[0] : token.agent;
+  const agent = agentRaw as
+    | { id: string; name: string; profile_id: string; enabled: boolean; scopes: AgentScopes; trust: number }
+    | undefined;
+  if (!agent) {
+    return { ok: false as const, response: apiError("Token is not bound to an agent.", 401) };
+  }
+  if (!agent.enabled) {
+    return { ok: false as const, response: apiError(`Agent "${agent.name}" is disabled.`, 403) };
+  }
+
+  // Best-effort last-used stamp (never blocks the request).
+  await supabase
+    .from("agent_tokens")
+    .update({ last_used_at: new Date().toISOString() })
+    .eq("id", token.id);
+
+  return { ok: true as const, supabase, agent };
 }
 
 /** Friendly translation of the DB epistemic-guard errors (§2.3/§2.6). */
