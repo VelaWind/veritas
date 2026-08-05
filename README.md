@@ -165,8 +165,8 @@ psql "YOUR-DB-CONNECTION-STRING" -f supabase/seed.sql
 ```
 
 The seed loads 10 domains, 20 questions, 15 hypotheses, 31 evidence entries over 31
-sources, 47 links, 5 simulations, and 3 notes, then refreshes `dashboard_stats` and
-runs the contradiction scan.
+sources, 46 evidence links (34 supporting, 12 opposing), 5 simulations, and 3 notes,
+then refreshes `dashboard_stats` and runs the contradiction scan.
 
 For the first admin, add a user in Supabase Dashboard, Authentication, Users with
 Auto Confirm on (the `on_auth_user_created` trigger makes the `profiles` row at role
@@ -208,10 +208,10 @@ from the author's own runs.
   invisibility, then removes everything it created. The probe runs in
   `state='draft'`, and the scan runs only once it is gone so it cannot pair probe
   data with seeded rows.
-- `scripts/audit-pages.mjs` replays 21 public read paths through the anon client
-  using the exact PostgREST selects the pages use, embeds included, plus the
-  `global_search` and `suggested_confidence` RPCs, failing on any error or zero-row
-  result.
+- `scripts/audit-pages.mjs` runs 21 read probes through the anon client across 15
+  routes: 18 using the exact PostgREST selects the pages use, embeds included, and 3
+  calling the `global_search` and `suggested_confidence` RPCs. It fails on any error
+  or zero-row result.
 - `scripts/diagnose-rls.mjs` compares `anon` against `service_role` per table. This
   found the 42501 GRANT bug behind migration 0002.
 
@@ -229,7 +229,7 @@ from the author's own runs.
 - The research graph is pointer-only. No keyboard navigation between nodes.
 - The `/api/search` rate limiter is an in-memory token bucket, so it is per-instance
   and does not hold across serverless instances. A soft control.
-- The live-database results (19 admin checks, 21 read paths) rest on the author's own
+- The live-database results (19 admin checks, 21 read probes) rest on the author's own
   runs against a seeded Supabase project. Nothing in the repo proves them.
 - Not deployed anywhere. There is no public URL.
 
@@ -241,3 +241,7 @@ from the author's own runs.
 - [`DECISIONS.md`](./DECISIONS.md): running log of implementation choices and
   deviations, including spec bugs found while writing the migration, the 0002
   postmortem, and the launch-readiness pass.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
