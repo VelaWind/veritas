@@ -620,3 +620,132 @@ parsing/transport helpers); `scripts/run-research-agent.mjs`,
 `scripts/verify-agents.mjs`. The review UI already renders `agent_name`, so B.6's
 volume features (batch/cluster/trust-sort) are the **only** B.8 item deferred —
 additive, not required for the invariant.
+
+---
+
+# Recurring class — soft failures (a fallback that outlived its state)
+
+## Post-launch fix — the placeholder-URL outage (2026-08-09)
+
+**The incident.** `veritas-delta-pearl.vercel.app` served every page with HTTP 200
+for roughly two months while its database was completely unreachable. Vercel's
+logs carried `[veritas:query:listTimeline] TypeError: fetch failed` once per
+query per request; every page rendered its empty state and looked entirely
+normal.
+
+**Root cause.** `NEXT_PUBLIC_SUPABASE_URL` was marked **"Sensitive"** in Vercel's
+environment-variable settings. A `NEXT_PUBLIC_*` value must be inlined into the
+bundle at build time, which is exactly what the Sensitive flag prevents — so the
+variable read as present and correct in the dashboard while being empty during
+the build. `lib/supabase/env.ts` fell through to `https://placeholder.supabase.co`,
+that host does not resolve, and every fetch failed at the network layer. The
+value is inlined into the *server* bundle too, so it could not be corrected at
+runtime; only a rebuild would fix it.
+
+**This is the third instance of one failure shape, not a one-off.** All three are
+*a wrong value produced a plausible-looking success*:
+
+1. **0002 missing GRANT** — SQL state 42501 on every base table, swallowed by
+   `if (error) return []`. Presented as an empty knowledge base.
+2. **Placeholder baked into `NEXT_PUBLIC_SUPABASE_URL` at the original deploy** —
+   auth called a non-existent host. Presented as login simply not working.
+3. **This outage** — the same placeholder, this time via the Sensitive flag, for
+   two months. Presented as an empty knowledge base.
+
+**The pattern worth recording.** This codebase's safety fallbacks — placeholder
+credentials in `env.ts`, empty-array returns in `lib/queries/*` — exist so the
+build works without a database. Every one of them converts a hard failure into a
+soft, invisible one. They are individually correct and collectively a hazard,
+because each one is reachable from states it was never designed for.
+
+**The rule going forward: a fallback must be reachable only in the state it was
+designed for.** Concretely: fallbacks are gated on `HAS_LIVE_SUPABASE`. With no
+credentials, fallbacks apply and the build works. With live credentials, there is
+no fallback — failures are loud. Any future fallback added to this codebase must
+name the state it is for and be unreachable outside it.
+
+### Fix 1 — production refuses to build on placeholder credentials
+
+`lib/supabase/env.ts` throws at module load when the target is production and
+`HAS_LIVE_SUPABASE` is false. The message names the Sensitive-flag trap
+explicitly, because the dashboard shows nothing wrong and the next person to hit
+this will have forgotten.
+
+- **`VERCEL_ENV`, not `NODE_ENV`, is the production signal on Vercel.**
+  `next build` sets `NODE_ENV=production` for preview and production deploys
+  alike, so `NODE_ENV` cannot tell them apart.
+- **Off Vercel, `NODE_ENV=production` counts only outside the build phase.**
+  `next build` always sets `NODE_ENV=production`, *including* the credential-free
+  local build these placeholders exist to support. `NEXT_PHASE !==
+  'phase-production-build'` exempts that build while still catching a self-hosted
+  `next start` running on placeholders.
+- **The throw is server-guarded (`typeof window === "undefined"`).** `env.ts` is
+  imported by `lib/supabase/client.ts`, which is browser code; an unguarded
+  module-load check could fire in a visitor's browser instead of in the build. It
+  cannot trigger on a correctly configured deploy — the guard makes that
+  impossible rather than merely unlikely.
+
+**Local development and preview builds still work with no credentials at all.**
+That property is why the placeholder exists and it is deliberately retained. What
+is now impossible is *shipping a production build that uses it*.
+
+### Fix 2 — a failed query no longer looks like an empty one
+
+The distinction is made once, in `lib/queries/log.ts`, which all 58 error paths
+in `lib/queries/*` already funnel through — so there is one place to reason about
+and no call site drifts:
+
+- `HAS_LIVE_SUPABASE === false` → unchanged. Log, return the fallback, render the
+  empty state. This is the no-credentials path and it stays exactly as it was.
+- `HAS_LIVE_SUPABASE === true` and the query failed → log as before, then throw
+  `QueryFailedError`.
+
+`logQueryThrow` re-throws an existing `QueryFailedError` unchanged rather than
+logging it a second time, since several query functions wrap their own bodies in
+`try/catch` and would otherwise double-report. `incrementPopularity` is untouched
+— a lost view tick is genuinely not an error.
+
+**The empty states themselves are unchanged.** "No hypotheses match your filters"
+is still correct and still needed; it simply can no longer be what a reader sees
+when the database is unreachable.
+
+### Error boundaries — a throw is a designed state
+
+The Phase 5 boundaries (`app/global-error.tsx`, `app/(public)/error.tsx`,
+`app/admin/error.tsx`) already existed and were already on the token system; their
+copy was extended to distinguish a fault from an absence. **Added: a root
+`app/error.tsx`** — the public boundary is scoped to the `(public)` route group,
+so `/contribute` and `/(auth)` previously fell through to `global-error.tsx`,
+which discards the layout and reads as a crash.
+
+Every boundary now states plainly that the data could not be loaded and that this
+is a fault rather than an absence, in the visual language of the empty states it
+must never be confused with.
+
+### Accepted trade-off — Vercel builds now depend on Supabase being reachable
+
+SSG pages fetch at build time. Now that queries throw on failure, **a transient
+Supabase outage during a build turns a shipped-but-empty deploy into a failed
+deploy.** That is the correct trade and the entire point of the change — a failed
+build is visible in thirty seconds, an empty deploy went unnoticed for two months
+— but it is a real new coupling and is recorded as such: `npm run build` has a
+live dependency on Supabase. A build failing at "Generating static pages" with
+`QueryFailedError` means the database was unreachable, not that the code is wrong.
+
+### Verified
+
+- `npm run build`, no environment variables at all → **succeeds** (the
+  no-credentials path is intact).
+- `VERCEL_ENV=production npm run build`, no credentials → **fails** at "Collecting
+  page data" with the Sensitive-flag message.
+- `VERCEL_ENV=production npm run build`, real credentials → **succeeds**, 115
+  static pages from live data.
+- Live credentials pointed at an unreachable host, production server: `/timeline`
+  logs `[veritas:query:listTimeline] TypeError: fetch failed` — the exact line
+  from the outage — then throws, and the page renders the **error boundary**
+  inside the normal layout. The empty state does not appear. (Reproduced by
+  building through a local proxy and then killing it, because `NEXT_PUBLIC_*` is
+  inlined at build time and cannot be broken at runtime — itself a confirmation
+  of the root-cause mechanism.)
+- `tsc --noEmit`, `npm run validate:sql` (7 files), `node scripts/contrast.mjs`
+  (ALL PASS) all clean.
