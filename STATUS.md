@@ -12,40 +12,53 @@ commit per stage.
 
 | Stage | State |
 |---|---|
-| 1 — roster, status, public profiles (`0007`) | ✅ code complete — **blocked on migration** |
-| 2 — skeptic lane + citation verifier (`0008`) | not started |
+| 1 — roster, status, public profiles (`0007`) | ✅ **shipped & live-verified** |
+| 2 — skeptic lane + citation verifier (`0008`) | ✅ **shipped & live-verified** |
 | 3 — council (`0009`) | not started |
 | 4 — Internal Affairs (`0010`) | not started |
 | 5 — site features (debate, confidence-over-time, changelog) | not started |
 
-### 🛑 BLOCKING — migration 0007 must be applied before the build gate can pass
+Migrations 0007 and 0008 are **applied to the linked project** (`supabase db
+push`). Every gate is green against the live database:
 
-`npm run build` currently **fails against the live database**, correctly:
+| Gate | Result |
+|---|---|
+| `node scripts/verify-agents.mjs` | ✅ **ALL GREEN — 38** (was 19 at Phase B) |
+| `node scripts/verify-suggestions.mjs` | ✅ ALL GREEN — 25 (human path unaffected) |
+| `npm run build` (live credentials) | ✅ green, 117/117 pages |
+| `npm run validate:sql` (9 files) | ✅ green |
+| `tsc --noEmit` · `contrast.mjs` | ✅ clean |
 
-```
-QueryFailedError: Query "listPublicAgentNames" failed against the live database:
-[PGRST205] Could not find the table 'public.agent_public' in the schema cache
-```
+The 0007 gate earned its keep: it caught a real regression. The Phase B probe
+disabled an agent by writing `enabled: false`, which 0007 made inert — the agent
+kept proposing. The check now asserts both halves of the new contract.
 
-That is the Phase-2 loud-failure behaviour doing its job — the code is fine (the
-same build **succeeds with zero credentials**, 38/38 pages, both `/agents` routes
-rendering). It is a schema-before-code ordering dependency, not a defect.
+### Where stage 3 picks up
 
-**Apply it with:** `supabase db push` (needs `SUPABASE_ACCESS_TOKEN` from
-`.env.supabase.local`; the CLI is linked). Every remaining Phase D stage has the
-same dependency, so this unblocks 0008–0010 too.
+The design (DECISIONS §D.3) is signed off and unchanged. Council needs
+`0009_council.sql` (`councils`, `council_turns`, both public), a
+`run-council.mjs` driving advocate → skeptic → verifier → synthesizer with
+reasoning shared between rounds, `/council/[id]` transcripts, and the verdict
+landing as an ordinary pending suggestion. Two decisions already made and worth
+not re-litigating: a council convened on a **question** proposes against that
+question's most contested hypothesis (the B.9 deviation-4 shape, so
+`apply_suggestion()` stays untouched), and the transcript passed between rounds
+is **budgeted** — per-turn output capped, prior turns included newest-first with
+an explicit truncation marker — because 4 roles × 3 rounds silently overflows a
+32k local context and the failure looks like reasoning.
 
-**After applying, the real gate is:** `node scripts/verify-agents.mjs` must stay
-**19/19** — 0007 replaces two Phase-B functions (`recompute_agent_trust`,
-`enforce_agent_quota`) so `status` becomes authoritative.
+A `council` agent identity does not exist yet. It is not one of the eight, so
+stage 3 adds it **via the seed script, not a migration** — consistent with
+"more domains later by seed".
 
 ### ⚠ Other actions that are yours
 
-- **Run `scripts/seed-agent-roster.mjs --with-tokens`** after 0007 — needs
-  `SUPABASE_SERVICE_ROLE_KEY` and creates **eight Supabase auth users** +
-  profiles + registry rows. `--dry-run` prints the plan and writes nothing.
-  Only six of the eight get tokens: the skeptic and citation-verifier run inside
-  the research lane and never authenticate.
+- **Run `scripts/seed-agent-roster.mjs --with-tokens`** — not yet run. Needs
+  `SUPABASE_SERVICE_ROLE_KEY`; creates **eight Supabase auth users** + profiles +
+  registry rows. `--dry-run` prints the plan and writes nothing. Only six of the
+  eight get tokens: the skeptic and citation-verifier run inside the research
+  lane and never authenticate. Until this runs, `/agents` renders its empty
+  state — the schema is live but the roster is not seeded.
 - **Optional:** set `VERITAS_CROSSREF_MAILTO` to join Crossref's polite pool.
   No API key; Crossref and OpenAlex are both free and keyless.
 
