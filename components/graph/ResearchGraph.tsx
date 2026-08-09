@@ -260,6 +260,46 @@ export function ResearchGraph({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected, size]);
 
+  // Zoom. Attached imperatively rather than through React's `onWheel` because
+  // the synthetic wheel listener is registered passively at the root: React
+  // cannot honour preventDefault() there, so the browser scrolled the page at
+  // the same time as the graph zoomed. Most visible zooming out, where the page
+  // slides down under the cursor.
+  //
+  // Scoped to the canvas element, so this is not a scroll lock: a wheel event
+  // anywhere else on the page keeps its default behaviour.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const onWheel = (e: WheelEvent) => {
+      // Unconditional while over the canvas: the gesture is always consumed as
+      // zoom, so the page must never move. Falling through at the zoom clamps
+      // would make the page lurch exactly when the graph stopped responding.
+      e.preventDefault();
+
+      const t = transformRef.current;
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+      const k = Math.max(0.3, Math.min(4, t.k * factor));
+      // Anchor the zoom on the cursor: the graph point under it stays put.
+      t.x = mx - ((mx - t.x) * k) / t.k;
+      t.y = my - ((my - t.y) * k) / t.k;
+      t.k = k;
+      draw();
+    };
+
+    // { passive: false } is the whole point — the default is passive for wheel.
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+    return () => canvas.removeEventListener("wheel", onWheel);
+    // `draw` is re-created each render (it closes over `size`/`selected`), so
+    // this re-binds with it and never calls a stale one. Re-running every
+    // render is also what re-attaches the listener when the canvas mounts after
+    // the "no nodes match" empty state.
+  }, [draw]);
+
   // Pointer interactions: pan, click-select, hover.
   function toGraphCoords(clientX: number, clientY: number) {
     const canvas = canvasRef.current!;
@@ -360,18 +400,8 @@ export function ResearchGraph({
                 dragState.current.panning = false;
                 hoverRef.current = null;
               }}
-              onWheel={(e) => {
-                const t = transformRef.current;
-                const rect = canvasRef.current!.getBoundingClientRect();
-                const mx = e.clientX - rect.left;
-                const my = e.clientY - rect.top;
-                const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
-                const k = Math.max(0.3, Math.min(4, t.k * factor));
-                t.x = mx - ((mx - t.x) * k) / t.k;
-                t.y = my - ((my - t.y) * k) / t.k;
-                t.k = k;
-                draw();
-              }}
+              // Zoom is bound in a useEffect above, not here: onWheel is
+              // passive and cannot preventDefault the page scroll.
             />
           )}
         </div>
