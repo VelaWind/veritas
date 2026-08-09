@@ -267,11 +267,81 @@ async function run() {
       .eq("id", agent.agentId);
   }
 
-  // ── Disabled agent (requireAgent → 403 before insert) ───────────────────────
+  // ── Phase D: `status` is authoritative, `enabled` is derived ────────────────
+  // 0007 made status the single source of truth and derives enabled from it by
+  // trigger. The Phase B probe wrote `enabled: false` directly, which is now
+  // inert — so assert BOTH halves of that contract: the legacy write does
+  // nothing, and the real mechanism still refuses the proposal. Asserting the
+  // inert half is what would catch a future revert of the derive trigger.
   await service.from("agents").update({ enabled: false }).eq("id", agent.agentId);
-  const disabled = await callAgent(agent.token, hypBody(`${SLUG_PREFIX}dis-${Date.now().toString(36)}`, "disabled", physics.id));
-  check("caps: disabled agent → 403", disabled.status === 403, `got ${disabled.status}`);
-  await service.from("agents").update({ enabled: true }).eq("id", agent.agentId);
+  {
+    const { data: row } = await service
+      .from("agents").select("enabled, status").eq("id", agent.agentId).single();
+    check(
+      "status: writing enabled=false directly is inert",
+      row?.enabled === true && row?.status === "active",
+      `enabled=${row?.enabled} status=${row?.status}`,
+    );
+  }
+
+  await service.from("agents").update({ status: "suspended" }).eq("id", agent.agentId);
+  const suspended = await callAgent(agent.token, hypBody(`${SLUG_PREFIX}sus-${Date.now().toString(36)}`, "suspended", physics.id));
+  check("status: suspended agent → 403", suspended.status === 403, `got ${suspended.status}`);
+  {
+    const { data: row } = await service
+      .from("agents").select("enabled").eq("id", agent.agentId).single();
+    check(
+      "status: suspension is fail-safe (derives enabled=false)",
+      row?.enabled === false,
+      `enabled=${row?.enabled}`,
+    );
+  }
+  await service.from("agents").update({ status: "active" }).eq("id", agent.agentId);
+
+  // ── Phase D: throttling divides the caps — it does not stop the agent ───────
+  // This is the mechanism IA (D.4) uses for a proportionate sanction, so it must
+  // demonstrably still let work through. Clear the pending backlog first so the
+  // effective cap (max_pending 4 / divisor 4 = 1) is deterministic.
+  await service.from("suggestions").delete()
+    .eq("proposed_by", agent.profileId ?? agent.userId).eq("status", "pending");
+  await service.from("agents").update({
+    status: "throttled",
+    scopes: { domains: [physics.id], max_pending: 4, max_per_hour: 1000, throttle_divisor: 4 },
+  }).eq("id", agent.agentId);
+  {
+    const first = await callAgent(agent.token, hypBody(`${SLUG_PREFIX}th1-${Date.now().toString(36)}`, "throttled ok", physics.id));
+    check("throttle: still permits work → 201", first.status === 201, `got ${first.status}`);
+    const second = await callAgent(agent.token, hypBody(`${SLUG_PREFIX}th2-${Date.now().toString(36)}`, "throttled cap", physics.id));
+    check("throttle: divided pending cap (4/4=1) → 429", second.status === 429, `got ${second.status}`);
+  }
+  await service.from("agents").update({
+    status: "active",
+    scopes: { domains: [physics.id], max_pending: 50, max_per_hour: 1000 },
+  }).eq("id", agent.agentId);
+
+  // ── Phase D: the public projection is the security boundary (§D.7) ──────────
+  // RLS cannot restrict columns, so agent_public's column LIST is what keeps
+  // trust and scopes private. Assert the list, and assert the base tables stay
+  // unreachable to anon.
+  {
+    const anonC = createClient(URL_, ANON, { auth: { persistSession: false, autoRefreshToken: false } });
+    const { data: pub, error: pubErr } = await anonC.from("agent_public").select("*").limit(1);
+    check("public: anon can read agent_public", !pubErr && Array.isArray(pub), pubErr?.message ?? "");
+    const cols = pub?.[0] ? Object.keys(pub[0]) : [];
+    check(
+      "public: agent_public leaks no trust / scopes / profile_id",
+      cols.length > 0 && !["trust", "scopes", "profile_id"].some((c) => cols.includes(c)),
+      cols.join(",") || "(no rows to inspect)",
+    );
+    for (const t of ["agents", "agent_tokens", "suggestions", "agent_incidents"]) {
+      const { data, error } = await anonC.from(t).select("*").limit(1);
+      check(
+        `public: anon cannot read ${t}`,
+        Boolean(error) || (data ?? []).length === 0,
+        error ? `blocked: ${error.code ?? error.message}` : `rows=${data?.length}`,
+      );
+    }
+  }
 
   // ── Trust governor recomputed on decision ───────────────────────────────────
   // One approved (above) → trust should be 100 over a single decided suggestion.
