@@ -277,6 +277,20 @@ export interface Suggestion {
 
 export interface SuggestionWithProposer extends Suggestion {
   proposer: { display_name: string; role: UserRole } | null;
+  /**
+   * Phase D §D.2 — the skeptic's objection, shown beside the proposal in review.
+   * Absent for human proposals and for lanes that are not critiqued.
+   */
+  critiques?: SuggestionCritiqueRow[];
+}
+
+/** Embedded shape returned with a suggestion (see `suggestion_critiques`). */
+export interface SuggestionCritiqueRow {
+  critic_name: string;
+  verdict: CritiqueVerdict;
+  body: string;
+  findings: string[];
+  created_at: string;
 }
 
 // ── Agent layer (Post-1.0 Phase B) ──────────────────────────────────────────
@@ -354,6 +368,42 @@ export interface AgentPublicStats {
 
 export interface AgentProfile extends AgentPublic {
   stats: AgentPublicStats | null;
+}
+
+export type CritiqueVerdict =
+  | "weak_assumption"
+  | "evidence_thin"
+  | "confidence_overstated"
+  | "scope_creep"
+  | "sound";
+
+/** The skeptic's annotation on a proposal (§D.2). Admin-only, like the queue. */
+export interface SuggestionCritique {
+  id: string;
+  suggestion_id: string;
+  critic_agent_id: string | null;
+  critic_name: string;
+  verdict: CritiqueVerdict;
+  body: string;
+  findings: string[];
+  created_at: string;
+}
+
+export type CitationStatus = "verified" | "unresolved" | "mismatch";
+
+/** Keyed on the citation, not on a row — see DECISIONS §D.5a. Public. */
+export interface CitationCheck {
+  citation_key: string;
+  doi: string | null;
+  url: string | null;
+  claimed_title: string;
+  status: CitationStatus;
+  resolved_title: string | null;
+  resolved_year: number | null;
+  matched_via: string;
+  score: number | null;
+  source: string;
+  checked_at: string;
 }
 
 export interface AgentToken {

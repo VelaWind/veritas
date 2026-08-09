@@ -4,7 +4,10 @@ import { logQueryError, logQueryThrow } from "./log";
 
 // Two FKs point at profiles (proposed_by, reviewed_by) so the embed must name
 // the constraint explicitly, or PostgREST cannot disambiguate.
-const EMBED = `*, proposer:profiles!suggestions_proposed_by_fkey(display_name, role)`;
+// The skeptic's critique travels WITH the proposal (§D.2): a reviewer must see
+// the objection and the claim together, not have to go looking for one.
+const EMBED = `*, proposer:profiles!suggestions_proposed_by_fkey(display_name, role),
+  critiques:suggestion_critiques(critic_name, verdict, body, findings, created_at)`;
 
 /**
  * Suggestions are never public. Always read with a cookie-bound client so RLS

@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import type { ZodError } from "zod";
 import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
-import type { AgentScopes } from "@/types/domain";
+import type { AgentKind, AgentScopes, AgentStatus } from "@/types/domain";
 
 /** §6: every handler returns a `{ data, error }` envelope. */
 export function apiData<T>(data: T, init?: ResponseInit) {
@@ -112,7 +112,7 @@ export async function requireAgent(request: Request) {
 
   const { data: token, error } = await supabase
     .from("agent_tokens")
-    .select("id, expires_at, revoked_at, agent:agents(id, name, profile_id, enabled, scopes, trust)")
+    .select("id, expires_at, revoked_at, agent:agents(id, name, kind, status, profile_id, enabled, scopes, trust)")
     .eq("token_hash", tokenHash)
     .maybeSingle();
 
@@ -133,7 +133,18 @@ export async function requireAgent(request: Request) {
   // some configs) — normalize.
   const agentRaw = Array.isArray(token.agent) ? token.agent[0] : token.agent;
   const agent = agentRaw as
-    | { id: string; name: string; profile_id: string; enabled: boolean; scopes: AgentScopes; trust: number }
+    | {
+        id: string;
+        name: string;
+        // Phase D: the lane the agent belongs to. The propose route requires a
+        // skeptic critique from `research` agents specifically (§D.2).
+        kind: AgentKind;
+        status: AgentStatus;
+        profile_id: string;
+        enabled: boolean;
+        scopes: AgentScopes;
+        trust: number;
+      }
     | undefined;
   if (!agent) {
     return { ok: false as const, response: apiError("Token is not bound to an agent.", 401) };

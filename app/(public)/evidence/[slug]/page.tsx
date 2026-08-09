@@ -11,6 +11,9 @@ import { PageHeader } from "@/components/layout/PageHeader";
 import { EpistemicBadge } from "@/components/epistemics/EpistemicBadge";
 import { Markdown } from "@/components/Markdown";
 import { SOURCE_TYPE_LABELS } from "@/lib/knowledge-engine/sources";
+import { getCitationCheck } from "@/lib/queries/citations";
+import { sourceCitationKey } from "@/lib/citations";
+import { CitationBadge } from "@/components/epistemics/CitationBadge";
 import { stripMarkdown, truncate } from "@/lib/utils";
 
 export const revalidate = 3600;
@@ -48,6 +51,13 @@ export default async function EvidenceDetailPage({
   const { slug } = await params;
   const e = await getEvidenceBySlug(publicClient, slug);
   if (!e) notFound();
+
+  // Looked up by the citation's own key, so a check recorded while this was
+  // still a proposal is found here unchanged (§D.5a).
+  const citationCheck = await getCitationCheck(
+    publicClient,
+    sourceCitationKey(e.source?.doi, e.source?.url),
+  );
 
   return (
     <div className="mx-auto max-w-content space-y-10 px-4 py-12 sm:px-6">
@@ -146,6 +156,11 @@ export default async function EvidenceDetailPage({
                 >
                   Visit source <ExternalLink size={13} aria-hidden />
                 </a>
+              )}
+              {citationCheck && (
+                <div className="border-t border-edge pt-4">
+                  <CitationBadge check={citationCheck} />
+                </div>
               )}
             </div>
           ) : (

@@ -26,6 +26,8 @@ import { capsFromArgs } from "./agent-lib/caps.mjs";
 import { makeAnonClient, propose } from "./agent-lib/agent-client.mjs";
 import { clampConfidence, normalizeStatus } from "./agent-lib/epistemics.mjs";
 import { slugify, uniquify, extractJson, titleKey } from "./agent-lib/util.mjs";
+import { critiqueProposal, critiqueEnvelope } from "./agent-lib/skeptic.mjs";
+import { verifyCitations, summarizeCitations } from "./agent-lib/citations.mjs";
 
 loadEnv();
 const args = parseArgs();
@@ -227,11 +229,34 @@ Draft ONE NEW, distinct hypothesis (#${i + 1}) on this target, with 1–2 pieces
 
   console.log(`  → #${i + 1} ${status} ${confidence}%  "${hypPayload.title}"`);
 
+  // ── D.2 skeptic lane (always on) ───────────────────────────────────────────
+  // One call per BUNDLE — the hypothesis together with the evidence offered for
+  // it — not one per row. The same critique is attached to the hypothesis and to
+  // each evidence proposal from this bundle, because that is what was actually
+  // reviewed. Charged to the same cap budget as the research calls.
+  const critique = await critiqueProposal(
+    llm,
+    caps,
+    { ...hypPayload, evidence: Array.isArray(obj.evidence) ? obj.evidence : [] },
+    extractJson,
+  );
+  if (!critique) {
+    // Out of model budget. A research proposal may not enter the queue without
+    // a critique (the route refuses it anyway), so stop rather than degrade.
+    caps.stoppedReason ??= "model-call cap reached before the skeptic pass";
+    break;
+  }
+  console.log(
+    `     skeptic: ${critique.verdict}${critique.degraded ? " (degraded)" : ""} — ${critique.body.slice(0, 100)}…`,
+  );
+  const bundleCritique = critiqueEnvelope(critique);
+
   const res = await submit({
     target_type: "hypothesis",
     operation: "create",
     payload: hypPayload,
     rationale: reviewerNote,
+    critique: bundleCritique,
   });
   if (res.capped) break;
   let record = null;
@@ -286,6 +311,9 @@ Draft ONE NEW, distinct hypothesis (#${i + 1}) on this target, with 1–2 pieces
         },
       },
       rationale: `${relation} "${hypPayload.title}". ${citation ? `Citation: ${citation}.` : ""} Link on approval.`,
+      // The same bundle critique: this evidence was reviewed as part of the
+      // hypothesis it was offered for, which is what the skeptic actually saw.
+      critique: bundleCritique,
     });
     if (evRes.capped) break;
     if (evRes.status === 201) {
@@ -302,6 +330,27 @@ Draft ONE NEW, distinct hypothesis (#${i + 1}) on this target, with 1–2 pieces
     } else if (evRes.status === 429) {
       caps.stoppedReason ??= "server queue cap (429)";
       break;
+    }
+  }
+
+  // ── D.5a citation verification ─────────────────────────────────────────────
+  // Server-side resolution against Crossref/OpenAlex. Costs no model calls, so
+  // it is not charged to the run budget, and a failure here degrades to a
+  // missing badge rather than a lost proposal.
+  if (!DRY && record && record.evidence.length > 0) {
+    const { ok, results: checks, error } = await verifyCitations(
+      BASE,
+      TOKEN,
+      record.evidence.map((e) => ({ citation: e.citation, claimed_title: e.title })),
+    );
+    if (ok) {
+      console.log(`     citations: ${summarizeCitations(checks)}`);
+      for (const c of checks) {
+        const hit = record.evidence.find((e) => e.citation && c.citation_key);
+        if (hit) hit.citation_status = c.status;
+      }
+    } else {
+      console.log(`     citations: check unavailable (${error})`);
     }
   }
 }

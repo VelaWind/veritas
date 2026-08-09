@@ -150,6 +150,13 @@ async function call(cookie, method, path, body) {
   return { status: res.status, ...((json ?? {})) };
 }
 
+const PROBE_CRITIQUE = {
+  critic_name: "skeptic",
+  verdict: "weak_assumption",
+  body: "Probe critique from verify-agents.mjs: the stated assumption is unjustified.",
+  findings: ["The probe assumption is marked unjustified."],
+};
+
 const hypBody = (slug, title, domainId) => ({
   target_type: "hypothesis", operation: "create",
   payload: {
@@ -160,6 +167,11 @@ const hypBody = (slug, title, domainId) => ({
     open_questions: [], falsification_criteria: "If the probe is cleaned up.",
   },
   rationale: "Agent probe proposal.",
+  // Phase D §D.2: the probe agent is kind='research', and a research proposal
+  // without a skeptic critique is refused at the route — so the harness now
+  // carries one, exactly as the real runner does. The refusal itself is
+  // asserted separately below.
+  critique: PROBE_CRITIQUE,
 });
 
 const created = { hypotheses: [], evidence: [], sources: [], suggestions: [], agents: [], users: [] };
@@ -318,6 +330,89 @@ async function run() {
     status: "active",
     scopes: { domains: [physics.id], max_pending: 50, max_per_hour: 1000 },
   }).eq("id", agent.agentId);
+
+  // ── Phase D §D.2: the skeptic lane is mandatory and powerless ──────────────
+  // Two halves of one promise. It must be impossible to get a research proposal
+  // into the queue WITHOUT an objection attached, and impossible for that
+  // objection to decide anything.
+  {
+    const noCritique = { ...hypBody(`${SLUG_PREFIX}nc-${Date.now().toString(36)}`, "uncritiqued", physics.id) };
+    delete noCritique.critique;
+    const res = await callAgent(agent.token, noCritique);
+    check("skeptic: research proposal without a critique → 422", res.status === 422, `got ${res.status}`);
+  }
+
+  {
+    const slug = `${SLUG_PREFIX}crit-${Date.now().toString(36)}`;
+    const res = await callAgent(agent.token, hypBody(slug, "critiqued", physics.id));
+    check("skeptic: proposal + critique land together → 201", res.status === 201, `got ${res.status}`);
+    const sid = res.data?.id;
+
+    const { data: crit } = await service
+      .from("suggestion_critiques").select("verdict, body, critic_name").eq("suggestion_id", sid);
+    check(
+      "skeptic: critique stored with the proposal",
+      (crit ?? []).length === 1 && crit[0].verdict === "weak_assumption",
+      `rows=${crit?.length} verdict=${crit?.[0]?.verdict}`,
+    );
+
+    // The blocking test: a maximally hostile critique must move nothing.
+    await service.from("suggestion_critiques").update({
+      verdict: "confidence_overstated",
+      body: "This claim is entirely unsupported and should not be accepted.",
+    }).eq("suggestion_id", sid);
+    const { data: after } = await service
+      .from("suggestions").select("status").eq("id", sid).single();
+    check(
+      "skeptic: a hostile critique does NOT change the proposal's status",
+      after?.status === "pending",
+      `status=${after?.status}`,
+    );
+
+    // And a 'sound' verdict must not fast-track it either — there is no
+    // auto-approve in this codebase and the skeptic does not create one.
+    await service.from("suggestion_critiques").update({ verdict: "sound" }).eq("suggestion_id", sid);
+    const { data: after2 } = await service
+      .from("suggestions").select("status").eq("id", sid).single();
+    check(
+      "skeptic: a 'sound' verdict does NOT approve anything",
+      after2?.status === "pending",
+      `status=${after2?.status}`,
+    );
+  }
+
+  // ── Phase D §D.5a: the SERVER decides what a citation resolves to ──────────
+  // The agent posts a citation string and never a verdict, so a compromised
+  // runner cannot stamp its own references verified.
+  {
+    const res = await fetch(`${BASE}/api/agent/citations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${agent.token}` },
+      body: JSON.stringify({
+        citations: [
+          { citation: "https://doi.org/10.1038/nature12373", claimed_title: "" },
+          { citation: "A work that does not exist, Nobody, 1899", claimed_title: "A work that does not exist" },
+        ],
+      }),
+    });
+    const json = await res.json().catch(() => null);
+    const out = json?.data ?? [];
+    check("citations: verifier route resolves server-side → 200", res.status === 200, `got ${res.status}`);
+    check(
+      "citations: a real DOI resolves to verified",
+      out[0]?.status === "verified",
+      `status=${out[0]?.status} title=${out[0]?.resolved_title ?? "—"}`,
+    );
+    check(
+      "citations: a fabricated reference is unresolved, not rejected",
+      out[1]?.status === "unresolved",
+      `status=${out[1]?.status}`,
+    );
+    const { data: anonRead } = await createClient(URL_, ANON, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    }).from("citation_checks").select("citation_key").limit(1);
+    check("citations: checks are publicly readable", (anonRead ?? []).length >= 1, `rows=${anonRead?.length}`);
+  }
 
   // ── Phase D: the public projection is the security boundary (§D.7) ──────────
   // RLS cannot restrict columns, so agent_public's column LIST is what keeps

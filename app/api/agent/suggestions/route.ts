@@ -6,7 +6,9 @@ import {
   requireAgent,
   translateDbError,
 } from "@/lib/api";
+import type { z } from "zod";
 import {
+  agentCritiqueSchema,
   SUGGESTION_PAYLOAD_SCHEMAS,
   suggestionEnvelopeSchema,
 } from "@/lib/validations";
@@ -60,27 +62,81 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  const { data, error } = await auth.supabase
-    .from("suggestions")
-    .insert({
-      target_type,
-      operation,
-      target_id: target_id ?? null,
-      payload: parsedPayload.data,
-      rationale,
-      proposed_by: auth.agent.profile_id,
-      actor_type: "agent",
-      agent_name: auth.agent.name,
-      status: "pending",
-    })
-    .select()
-    .single();
+  // D.2 — the skeptic lane is always on for research agents. A research proposal
+  // arrives with its strongest objection already attached or it does not arrive.
+  // Other lanes (contradiction findings, IA) are not critiqued.
+  const rawCritique = (body as { critique?: unknown }).critique;
+  let critique: z.infer<typeof agentCritiqueSchema> | null = null;
+  if (rawCritique !== undefined && rawCritique !== null) {
+    const parsed = agentCritiqueSchema.safeParse(rawCritique);
+    if (!parsed.success) return apiZodError(parsed.error);
+    critique = parsed.data;
+  }
+  if (auth.agent.kind === "research" && !critique) {
+    return apiError(
+      "A research proposal must carry a skeptic critique. The skeptic lane is not optional.",
+      422,
+    );
+  }
+
+  // Written together in one transaction when there is a critique, so the queue
+  // never shows an uncritiqued proposal (§D.2). The function still inserts
+  // through the enforce_agent_quota trigger, so every cap and scope check
+  // applies exactly as it does below — and it hard-codes status 'pending', so a
+  // critique can never influence the outcome.
+  const { data, error } = critique
+    ? await auth.supabase
+        .rpc("propose_with_critique", {
+          p_target_type: target_type,
+          p_operation: operation,
+          p_target_id: target_id ?? null,
+          p_payload: parsedPayload.data,
+          p_rationale: rationale,
+          p_proposed_by: auth.agent.profile_id,
+          p_agent_name: auth.agent.name,
+          p_critic_name: critique.critic_name,
+          p_verdict: critique.verdict,
+          p_body: critique.body,
+          p_findings: critique.findings,
+        })
+        .single()
+    : await auth.supabase
+        .from("suggestions")
+        .insert({
+          target_type,
+          operation,
+          target_id: target_id ?? null,
+          payload: parsedPayload.data,
+          rationale,
+          proposed_by: auth.agent.profile_id,
+          actor_type: "agent",
+          agent_name: auth.agent.name,
+          status: "pending",
+        })
+        .select()
+        .single();
 
   if (error) {
     // 53400 (configuration_limit_exceeded) → caps; 42501 → scope/identity.
-    if (error.code === "53400") return apiError(translateDbError(error.message), 429);
-    if (error.code === "42501") return apiError(translateDbError(error.message), 403);
-    return apiError(translateDbError(error.message), 409);
+    const status =
+      error.code === "53400" ? 429 : error.code === "42501" ? 403 : 409;
+
+    // D.4 check #3 — the quota trigger RAISES, so a refusal leaves no row behind
+    // and would be invisible to a later audit. Record it. Best-effort: a failed
+    // audit write must never change the answer the agent gets.
+    if (status === 429 || status === 403) {
+      await auth.supabase
+        .from("agent_incidents")
+        .insert({
+          agent_id: auth.agent.id,
+          agent_name: auth.agent.name,
+          kind: status === 429 ? "cap_exceeded" : "scope_denied",
+          sqlstate: error.code ?? "",
+          detail: error.message.slice(0, 500),
+        })
+        .then(undefined, () => undefined);
+    }
+    return apiError(translateDbError(error.message), status);
   }
   return apiData(data, { status: 201 });
 }

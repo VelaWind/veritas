@@ -9,6 +9,7 @@ import { Field, inputClass } from "@/components/ui/Field";
 import { api } from "@/lib/client-api";
 import { formatDate } from "@/lib/utils";
 import type { SuggestionStatus, SuggestionWithProposer } from "@/types/domain";
+import { CritiquePanel } from "./CritiquePanel";
 
 const STATUS_COLOR: Record<SuggestionStatus, string> = {
   pending: "var(--signal-mid)",
@@ -143,6 +144,8 @@ export function SuggestionQueue({ items }: { items: SuggestionWithProposer[] }) 
                   {s.rationale}
                 </p>
               )}
+
+              <CritiquePanel critiques={s.critiques} />
 
               <details className="mt-3">
                 <summary className="cursor-pointer text-xs text-muted hover:text-ink">

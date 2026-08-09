@@ -289,6 +289,25 @@ export const suggestionReviewSchema = z.object({
   notes: z.string().trim().max(2000).default(""),
 });
 
+// ── Phase D §D.2: the skeptic's critique, posted with the proposal ──────────
+// Deliberately NOT part of `suggestionEnvelopeSchema`: a human contributor has
+// no critique field, and the agent route is the only place this is accepted.
+export const critiqueVerdictSchema = z.enum([
+  "weak_assumption",
+  "evidence_thin",
+  "confidence_overstated",
+  "scope_creep",
+  "sound",
+]);
+
+export const agentCritiqueSchema = z.object({
+  critic_name: z.string().trim().min(1).max(100),
+  verdict: critiqueVerdictSchema,
+  /** The objection itself. Non-empty: "looks reasonable" is not an output. */
+  body: z.string().trim().min(1).max(4000),
+  findings: z.array(z.string().trim().min(1).max(500)).max(10).default([]),
+});
+
 export const suggestionRejectSchema = z.object({
   notes: z
     .string()
