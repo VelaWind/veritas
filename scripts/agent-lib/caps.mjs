@@ -58,9 +58,15 @@ export class RunCaps {
 /** Build caps from CLI args, falling back to AGENT_MAX_* env, then cheap defaults. */
 export function capsFromArgs(args) {
   return new RunCaps({
+    // Raised 8 → 16 for Phase D: the always-on skeptic lane (§D.2) critiques
+    // every proposal before it is posted, and its calls come out of this SAME
+    // budget rather than getting their own. At the old default a research run
+    // would have produced about half as many proposals as before — the doubling
+    // keeps throughput where it was while every proposal now arrives with its
+    // strongest objection attached.
     maxModelCalls: intArg(
       args["max-model-calls"] ?? process.env.AGENT_MAX_MODEL_CALLS,
-      8,
+      16,
     ),
     maxProposals: intArg(
       args["max-proposals"] ?? process.env.AGENT_MAX_PROPOSALS,

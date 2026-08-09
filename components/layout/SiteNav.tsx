@@ -17,6 +17,7 @@ const LINKS = [
   { href: "/graph", label: "Graph" },
   { href: "/lab", label: "Lab" },
   { href: "/notes", label: "Notes" },
+  { href: "/agents", label: "Agents" },
 ] as const;
 
 function Reticle() {

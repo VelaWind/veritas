@@ -4,43 +4,69 @@ Rolling status for review between phases. Most recent phase on top.
 
 ---
 
-## Phase D — The agent society 📐 DESIGN ONLY — awaiting your sign-off (2026-08-10)
+## Phase D — The agent society 🚧 IN PROGRESS (design signed off 2026-08-10)
 
-Stage 0 complete: the D.1–D.5 design is in `DECISIONS.md` → "Phase D". **Nothing
-is built.** No migration, no script, no schema change. Implementation starts only
-after you sign off, in the D.10 order (roster → skeptic+citations → council → IA
-→ site features), one migration and one commit per stage.
+Design: `DECISIONS.md` → "Phase D" (D.0–D.10), signed off with four answers
+recorded there. Implementation runs in the D.10 order, one migration and one
+commit per stage.
 
-### ⚠ Four questions I need answered before writing code (DECISIONS D.10)
+| Stage | State |
+|---|---|
+| 1 — roster, status, public profiles (`0007`) | ✅ code complete — **blocked on migration** |
+| 2 — skeptic lane + citation verifier (`0008`) | not started |
+| 3 — council (`0009`) | not started |
+| 4 — Internal Affairs (`0010`) | not started |
+| 5 — site features (debate, confidence-over-time, changelog) | not started |
 
-1. **Is `trust` genuinely public** on agent profiles, or should the public page
-   show approval rate + last audit only? Irreversible once indexed.
-2. **Confirm I may replace two Phase-B-verified functions** —
-   `recompute_agent_trust()` and `enforce_agent_quota()` — so `status`
-   (active/throttled/suspended) becomes authoritative. Without it, throttling and
-   IA's main power are decorative. The existing 19 checks are the gate.
-3. **Council convened on a *question* proposes against that question's most
-   contested hypothesis** (the B.9 deviation-4 shape), rather than widening
-   `suggestions.target_type` and touching `apply_suggestion()`. Confirm.
-4. **Ten agent identities** — confirm you want the full roster seeded, or a
-   smaller starter set.
+### 🛑 BLOCKING — migration 0007 must be applied before the build gate can pass
 
-### ⚠ Actions that will be yours once implementation starts
+`npm run build` currently **fails against the live database**, correctly:
 
-- **Apply migrations 0007–0010** with `supabase db push` (CLI is linked, so no
-  dashboard paste this time).
-- **Run `scripts/seed-agent-roster.mjs`** — needs `SUPABASE_SERVICE_ROLE_KEY`
-  and creates ten Supabase **auth users** + profiles + registry rows.
+```
+QueryFailedError: Query "listPublicAgentNames" failed against the live database:
+[PGRST205] Could not find the table 'public.agent_public' in the schema cache
+```
+
+That is the Phase-2 loud-failure behaviour doing its job — the code is fine (the
+same build **succeeds with zero credentials**, 38/38 pages, both `/agents` routes
+rendering). It is a schema-before-code ordering dependency, not a defect.
+
+**Apply it with:** `supabase db push` (needs `SUPABASE_ACCESS_TOKEN` from
+`.env.supabase.local`; the CLI is linked). Every remaining Phase D stage has the
+same dependency, so this unblocks 0008–0010 too.
+
+**After applying, the real gate is:** `node scripts/verify-agents.mjs` must stay
+**19/19** — 0007 replaces two Phase-B functions (`recompute_agent_trust`,
+`enforce_agent_quota`) so `status` becomes authoritative.
+
+### ⚠ Other actions that are yours
+
+- **Run `scripts/seed-agent-roster.mjs --with-tokens`** after 0007 — needs
+  `SUPABASE_SERVICE_ROLE_KEY` and creates **eight Supabase auth users** +
+  profiles + registry rows. `--dry-run` prints the plan and writes nothing.
+  Only six of the eight get tokens: the skeptic and citation-verifier run inside
+  the research lane and never authenticate.
 - **Optional:** set `VERITAS_CROSSREF_MAILTO` to join Crossref's polite pool.
   No API key; Crossref and OpenAlex are both free and keyless.
 
+### Behaviour changes already landed
+
+- **`--max-model-calls` default raised 8 → 16.** The always-on skeptic lane
+  spends the *same* budget, so the old default would have halved proposals per
+  run. Override with `--max-model-calls` or `AGENT_MAX_MODEL_CALLS`.
+- **`enabled` is no longer directly settable.** Since 0007 it is derived from
+  `status`; `update agents set enabled = false` is now a no-op. Disable an agent
+  with `status = 'suspended'`.
+- **`mint-agent-token.mjs` no longer clobbers scopes.** Re-minting a token for a
+  rostered agent used to reset `scopes` to CLI defaults — silently turning a
+  domain-scoped researcher into an unscoped one. Each field is now overridden
+  only when actually passed.
+
 ### Cost posture — unchanged, still $0/call
 
-Local Ollama stays the default for every new lane. One behaviour change to flag:
-the always-on skeptic **roughly doubles the model calls per research run** and
-spends the *same* `max_model_calls` budget, so an existing `--max-model-calls 8`
-run yields about half as many proposals unless raised. A council is the expensive
-object — ~4N+1 calls, minutes not seconds on a local 14B model.
+Local Ollama for every new lane; Crossref and OpenAlex are free and keyless. A
+council remains the expensive object — ~4N+1 calls, minutes not seconds on a
+local 14B model.
 
 ---
 

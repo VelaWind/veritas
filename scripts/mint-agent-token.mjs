@@ -82,18 +82,35 @@ if (args.domains && args.domains !== true) {
   if (missing.length) console.warn(`⚠ unknown domain slug(s) ignored: ${missing.join(", ")}`);
 }
 
+// Preserve the scopes an existing agent already has. Re-minting a token for a
+// rostered agent (Phase D) used to rewrite `scopes` from CLI defaults, so
+// `mint-agent-token.mjs --name physics-researcher` with no --domains silently
+// turned a domain-scoped researcher into an UNSCOPED one — a privilege widening
+// as a side effect of rotating a credential. Now each field is overridden only
+// when it was actually passed.
+const { data: existing } = await service
+  .from("agents")
+  .select("scopes")
+  .eq("name", name)
+  .maybeSingle();
+const prior = existing?.scopes ?? {};
+
+const gaveDomains = args.domains !== undefined && args.domains !== true;
 const scopes = {
-  domains: domainIds,
-  max_pending: intArg(args["max-pending"], 20),
-  max_per_run: intArg(args["max-per-run"], 5),
-  max_per_hour: intArg(args["max-per-hour"], 30),
+  ...prior,
+  domains: gaveDomains ? domainIds : (prior.domains ?? []),
+  max_pending: intArg(args["max-pending"], prior.max_pending ?? 20),
+  max_per_run: intArg(args["max-per-run"], prior.max_per_run ?? 5),
+  max_per_hour: intArg(args["max-per-hour"], prior.max_per_hour ?? 30),
 };
 
 let agentId;
 {
+  // `enabled` is deliberately not written: since 0007 it is derived from
+  // `status`, so minting a token can never reinstate a suspended agent.
   const { data, error } = await service
     .from("agents")
-    .upsert({ name, profile_id: userId, enabled: true, scopes }, { onConflict: "name" })
+    .upsert({ name, profile_id: userId, scopes }, { onConflict: "name" })
     .select("id")
     .single();
   if (error) throw new Error(`upsert agent: ${error.message}`);

@@ -293,16 +293,67 @@ export interface AgentScopes {
   max_per_hour?: number;
 }
 
+// ── Agent society (Post-1.0 Phase D) ────────────────────────────────────────
+
+export type AgentKind =
+  | "research"
+  | "contradiction"
+  | "skeptic"
+  | "verifier"
+  | "council"
+  | "internal_affairs";
+
+/** Authoritative since 0007; `enabled` is derived from it. */
+export type AgentStatus = "active" | "throttled" | "suspended";
+
 export interface Agent {
   id: string;
   name: string;
+  display_name: string;
+  kind: AgentKind;
+  charter: string;
+  /** Declared field of expertise — distinct from the enforced `scopes.domains`. */
+  domain_id: string | null;
+  status: AgentStatus;
   profile_id: string;
+  /** Derived from `status` by trigger; never set it directly. */
   enabled: boolean;
   scopes: AgentScopes;
-  /** 0–100, derived from approve/reject history. */
+  /** 0–100, derived from approve/reject history. Admin-only — never public. */
   trust: number;
   created_at: string;
   updated_at: string;
+}
+
+/**
+ * The public projection (`agent_public` view). Deliberately excludes `trust`,
+ * `scopes`, and `profile_id`: the column list is the security boundary, because
+ * RLS cannot restrict columns. See DECISIONS §D.1.
+ */
+export interface AgentPublic {
+  name: string;
+  display_name: string;
+  kind: AgentKind;
+  charter: string;
+  status: AgentStatus;
+  domain_slug: string | null;
+  domain_name: string | null;
+  created_at: string;
+}
+
+/** Counts only, from `agent_public_stats`. Never payloads or pending content. */
+export interface AgentPublicStats {
+  name: string;
+  proposed: number;
+  approved: number;
+  rejected: number;
+  pending: number;
+  /** null until the agent has at least one decided proposal. */
+  approval_rate: number | null;
+}
+
+export interface AgentProfile extends AgentPublic {
+  stats: AgentPublicStats | null;
 }
 
 export interface AgentToken {

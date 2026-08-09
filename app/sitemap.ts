@@ -5,6 +5,7 @@ import { listHypothesisSlugs } from "@/lib/queries/hypotheses";
 import { listEvidenceSlugs } from "@/lib/queries/evidence";
 import { listQuestionSlugs } from "@/lib/queries/questions";
 import { listNoteSlugs } from "@/lib/queries/notes";
+import { listPublicAgentNames } from "@/lib/queries/agents";
 import { CATEGORY_META } from "@/lib/knowledge-engine/simulations";
 import { SITE_URL } from "@/lib/utils";
 
@@ -23,14 +24,16 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
     "/lab",
     "/search",
     "/notes",
+    "/agents",
   ];
 
-  const [domains, hypotheses, evidence, questions, notes] = await Promise.all([
+  const [domains, hypotheses, evidence, questions, notes, agents] = await Promise.all([
     listDomainSlugs(publicClient),
     listHypothesisSlugs(publicClient),
     listEvidenceSlugs(publicClient),
     listQuestionSlugs(publicClient),
     listNoteSlugs(publicClient),
+    listPublicAgentNames(publicClient),
   ]);
 
   const now = new Date();
@@ -53,6 +56,7 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
     ...evidence.map((slug) => ({ url: `${SITE_URL}/evidence/${slug}`, lastModified: now, priority: 0.5 })),
     ...questions.map((slug) => ({ url: `${SITE_URL}/questions/${slug}`, lastModified: now, priority: 0.7 })),
     ...notes.map((slug) => ({ url: `${SITE_URL}/notes/${slug}`, lastModified: now, priority: 0.4 })),
+    ...agents.map((name) => ({ url: `${SITE_URL}/agents/${name}`, lastModified: now, priority: 0.4 })),
   ];
 
   return entries;
