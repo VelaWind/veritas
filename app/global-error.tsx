@@ -31,7 +31,8 @@ export default function GlobalError({
         </p>
         <h1 style={{ fontWeight: 300, fontSize: 28 }}>The observatory went dark.</h1>
         <p style={{ color: "#8A97AD", maxWidth: 480 }}>
-          A fatal error occurred. Reload to try again.
+          A fatal error occurred and no data could be loaded. This is a fault in
+          the instrument, not an empty record. Reload to try again.
         </p>
         <button
           onClick={reset}

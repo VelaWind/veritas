@@ -4,7 +4,18 @@ import { useEffect } from "react";
 import Link from "next/link";
 import { Button } from "@/components/ui/Button";
 
-export default function PublicError({
+/**
+ * Root error boundary. The Phase 5 boundaries are scoped to route groups —
+ * app/(public)/error.tsx does not cover /contribute or /(auth) — so anything
+ * outside those segments previously fell through to global-error.tsx, which
+ * throws away the layout and reads as a crash.
+ *
+ * The copy matters as much as the boundary: a query that fails now throws
+ * rather than returning an empty array, and the reader must be able to tell a
+ * fault from an absence. "No hypotheses match your filters" is a fact about
+ * the knowledge base; this page is a fact about the instrument.
+ */
+export default function RootError({
   error,
   reset,
 }: {
@@ -22,12 +33,12 @@ export default function PublicError({
         Instrument error
       </p>
       <h1 className="max-w-2xl font-display text-2xl font-light text-ink">
-        This part of the map could not be loaded.
+        This data could not be loaded.
       </h1>
       <p className="max-w-xl text-muted">
-        This is an error in the interface, not a statement about the knowledge
-        itself — a fault, not an absence. Do not read it as "there is nothing
-        here". You can retry, or return to a known-good surface.
+        Something went wrong reaching the record — this is a fault in the
+        instrument, not an empty result. Nothing here should be read as an
+        absence of evidence. Retry, or return to a known-good surface.
       </p>
       <div className="flex flex-wrap gap-3">
         <Button variant="primary" onClick={reset}>

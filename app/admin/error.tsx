@@ -20,9 +20,13 @@ export default function AdminError({
         Admin error
       </p>
       <h1 className="font-display text-xl font-light text-ink">
-        This admin action failed.
+        This admin view could not be loaded.
       </h1>
       <p className="max-w-xl text-sm text-muted">
+        The action or query failed — this is a fault, not an empty result. Do
+        not treat the missing rows as absent data.
+      </p>
+      <p className="max-w-xl font-mono text-xs text-muted">
         {error.message || "An unexpected error occurred."}
       </p>
       <Button variant="primary" onClick={reset}>
