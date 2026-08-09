@@ -749,3 +749,425 @@ live dependency on Supabase. A build failing at "Generating static pages" with
   of the root-cause mechanism.)
 - `tsc --noEmit`, `npm run validate:sql` (7 files), `node scripts/contrast.mjs`
   (ALL PASS) all clean.
+
+---
+
+# Phase D — The agent society (DESIGN ONLY — awaiting sign-off)
+
+> **Nothing in this section is built.** It is the Stage 0 design for review. No
+> migration is written, no script exists, no schema is changed. Implementation
+> starts only after sign-off, in the order at D.10.
+
+## D.0 The invariants this phase does not touch
+
+Phase D adds agents, opinions, and public surfaces. It adds **no new write path
+to the knowledge tables**, and every guarantee from §B.0 holds unchanged:
+
+- Agents **propose into `suggestions`** and nothing else. No agent, council, or
+  auditor gains `is_admin()`, and `apply_suggestion()` keeps its `is_admin()`
+  self-guard, so no agent can approve anything — its own or anyone's.
+- The provider stays **local Ollama by default, $0/call**. Every new lane
+  (skeptic, council, IA) uses the same `complete()` interface and the same cloud
+  adapters that are off unless `VERITAS_LLM_PROVIDER` is deliberately set.
+- Every run is **on-demand and bounded** by the existing per-run cap machinery.
+  The new lanes do not get their own budget; they spend the *same* one (D.8).
+- Prompt injection still cannot poison the map. More agents means more
+  *proposals*, all of them `pending`.
+
+Three things get genuinely new powers, and each is bounded in Postgres rather
+than in the runner:
+
+| New power | Bound |
+|---|---|
+| Skeptic annotates a proposal | Cannot change its status. No trigger from critiques to `suggestions`; verified by script. |
+| Council proposes a verdict | Lands as an ordinary `pending` suggestion. Same queue, same caps, same review. |
+| IA throttles/suspends an agent | A security-definer function that permits **only** monotonically more-restrictive transitions. Cannot reinstate, cannot touch knowledge. |
+
+## D.1 Domain-expert agents, displayed
+
+**Registry extension.** `agents` gains: `display_name`, `kind` (new enum
+`agent_kind`: `research | contradiction | skeptic | verifier | council |
+internal_affairs`), `charter text` (the persona/research approach that becomes
+the system prompt), `domain_id uuid references domains(id)` (field of expertise,
+nullable for roster-wide agents), and `status` (new enum `agent_status`:
+`active | throttled | suspended`).
+
+**`status` vs the existing `enabled`.** `enabled` is what the verified Phase B
+`enforce_agent_quota` trigger reads, and I am not rewriting that check. Instead
+`status` becomes authoritative and a `BEFORE INSERT OR UPDATE` trigger derives
+`enabled := (status <> 'suspended')`. This forces two consequences worth naming
+now, because both mean replacing a function that Phase B verified 19/19:
+
+- `recompute_agent_trust()` currently does `set enabled = false` on the
+  trust-floor breach. That write would be overwritten by the derive trigger, so
+  it is replaced (`create or replace`) to set `status = 'suspended'` instead.
+  Same behaviour, expressed through the new authoritative column.
+- `enforce_agent_quota()` is replaced to read `status` and, when `throttled`,
+  divide `max_pending`/`max_per_hour` by `scopes.throttle_divisor` (default 4,
+  floor 1). Everything else in the trigger is byte-identical.
+
+Both are `create or replace`, both are behaviour-preserving for every case
+`verify-agents.mjs` already covers, and that script must stay 19/19 before the
+stage is committed — with new cases added for throttle and derive.
+
+**Public profile surface, without exposing the registry.** `agents` is admin-only
+under RLS with `revoke all from anon`, and RLS cannot restrict *columns*. So the
+public surface is a **view**, `agent_public`, selecting only:
+
+```
+name, display_name, kind, charter, domain (joined slug + name), status,
+trust, created_at, last_audit_at, last_audit_severity, last_audit_summary
+```
+
+The view is deliberately **`security_invoker = off`** (the default), so it runs
+as owner and bypasses the admin-only RLS on `agents`. That is the exact inverse
+of the choice made for `graph_nodes` in 0001, which is `security_invoker = on`
+so the reader's RLS applies. The inversion is intentional and the reason is the
+column list: here the projection *is* the security boundary, and it is a fixed,
+reviewable set of columns rather than a row filter. `scopes` (caps, domain ids)
+and everything in `agent_tokens` stay unreachable.
+
+**Stats without exposing the queue.** `suggestions` is never public and stays
+that way. A second view `agent_public_stats` exposes **counts only** — proposed,
+approved, rejected, pending, and the derived approval rate — never payloads,
+never rationales, never pending content.
+
+**"Recent activity" is the public timeline, not the queue.** An agent's activity
+feed on its profile reads `timeline_events where agent_name = …`, which is
+already anon-readable and is the honest public record: what the agent actually
+got *approved* into the map. Pending work stays invisible until a human accepts
+it. This needs no new exposure at all.
+
+**Seed roster** (nine identities, one model underneath, expertise entirely in
+`charter` + `domain_id` + token scope):
+
+| Agent | kind | Domain |
+|---|---|---|
+| `physics-researcher` | research | physics |
+| `cosmology-researcher` | research | cosmology |
+| `consciousness-researcher` | research | consciousness |
+| `mathematics-researcher` | research | mathematics |
+| `origin-of-life-researcher` | research | origin-of-life |
+| `contradiction-agent` | contradiction | — (roster-wide) |
+| `skeptic` | skeptic | — |
+| `citation-verifier` | verifier | — |
+| `internal-affairs` | internal_affairs | — |
+| `council` | council | — |
+
+That is ten rows; the council proposes under its own identity so verdicts are
+attributable (D.3). Provisioning nine-plus Supabase identities by hand is not
+reasonable, so `scripts/seed-agent-roster.mjs` creates the auth users, profiles
+at role `agent`, registry rows, and charters idempotently under the service role.
+Domain slugs are resolved at seed time and the script fails loudly if a domain is
+missing rather than seeding a scopeless agent.
+
+**Pages.** `/agents` (index, grouped by kind) and `/agents/[name]` (charter,
+domain, status, trust, approval rate, last audit result, recent activity). Public,
+on the existing token system, static with ISR like the rest of the observatory.
+
+## D.2 Skeptic pass on every proposal (always-on lane)
+
+**Storage.** New table `suggestion_critiques`:
+
+```
+id, suggestion_id → suggestions(id) on delete cascade,
+critic_agent_id → agents(id), verdict (enum critique_verdict:
+  weak_assumption | evidence_thin | confidence_overstated |
+  scope_creep | sound), body text, findings jsonb, created_at
+```
+
+`sound` exists so "I attacked this and it held" is recordable — otherwise the
+skeptic is incentivised to manufacture objections, which is the same conformity
+failure in the opposite direction.
+
+**How it attaches, and why it is one transaction.** D.2 requires the critique to
+exist *before* the proposal enters the queue, but the critique needs the
+suggestion's id as a foreign key. Resolving that by inserting the suggestion,
+then the critique, leaves a window where an uncritiqued proposal is visible in
+review. So the propose route accepts an optional `critique` object and both rows
+are written by one security-definer function, `propose_with_critique()`, in a
+single transaction. A research-lane proposal without a critique is rejected at
+the route. The skeptic's critique is produced **in-process during the same run**,
+before the HTTP call — the runner drafts, critiques, then posts once.
+
+**The skeptic cannot block, mechanically.** There is no trigger from
+`suggestion_critiques` to `suggestions`; the critique table has no path to
+`status`. The skeptic agent holds an ordinary agent token, so it cannot approve
+(`apply_suggestion` self-guards) and cannot reject (admin route). A `sound`
+verdict does not fast-track anything either — there is no auto-approve in this
+codebase and D.2 does not add one. Verified by an explicit assertion: insert a
+maximally hostile critique, assert the suggestion is still `pending`.
+
+**Prompt design against conformity.** The skeptic's system prompt is adversarial
+by construction — find the weakest assumption, attack the evidence, check the
+confidence is honest against the band — and it never sees the proposing agent's
+identity or trust score, so it cannot learn to go easy on a high-trust
+colleague. It is rewarded for specific, checkable objections; "looks reasonable"
+is not an acceptable output and the parser rejects it.
+
+**Visibility.** Admin-only, alongside the proposal it critiques. The review queue
+renders proposal and strongest objection side by side. Critiques are not public
+because the proposals they attach to are not public; the *council* transcript is
+the public deliberation artifact (D.3).
+
+## D.3 Full council on demand
+
+**Schema.** Two tables, both **public**:
+
+```
+councils      id, subject_type ('hypothesis'|'question'), subject_id, subject_slug,
+              status (running|complete|aborted), rounds_run,
+              outcome (enum council_outcome: consensus | split | no_verdict),
+              vote jsonb            -- final position per role
+              verdict text,          -- the synthesizer's write-up
+              suggestion_id → suggestions(id),   -- the proposal it produced
+              model, started_at, completed_at
+
+council_turns council_id, round int, seq int,
+              role (enum council_role: advocate|skeptic|verifier|synthesizer),
+              agent_id, content text, reasoning text, created_at
+```
+
+`council_turns` stores `reasoning` separately from `content` because D.3 requires
+**sharing reasoning chains between rounds**, not just conclusions — the next
+round's prompt is built from prior `reasoning`, and the public transcript renders
+both.
+
+**Disagreement is recorded, never resolved by force.** `outcome` has no
+"majority wins" path: a 2–2 split is stored as `split` with each role's final
+position in `vote`, and the synthesizer is instructed to *write the disagreement*
+— what each side would need to see to change its mind — rather than to pick a
+winner. `no_verdict` covers a council that ran out of rounds or budget. The
+verdict proposal's rationale carries the split verbatim.
+
+**The verdict lands as an ordinary suggestion.** An `edit` proposal on the
+subject hypothesis, credited to the `council` agent identity, with a rationale
+citing `/council/<id>`. It is `pending` like everything else. Note the Phase B
+constraint that shaped this: `suggestions.target_type` is `hypothesis|evidence`
+only, so a council convened on a *question* proposes the edit against the
+question's most contested hypothesis and says so in the rationale — the same
+shape as B.9 deviation 4 for contradiction findings, for the same reason.
+
+**Rendering.** `/council/[id]` — subject, outcome badge, the vote, then the
+transcript by round with each role's turn. Linked from the hypothesis/question
+page ("this claim has been debated"). Public, no auth.
+
+**Practical bound, stated because it will bite.** Four roles × N rounds is
+4N model calls plus synthesis. On a local 14B model at consumer speed a 3-round
+council is roughly 13 calls and can take 10–20 minutes. Default `--rounds 2`, and
+the transcript passed between rounds is budgeted: per-turn output is capped
+(~400 tokens) and prior turns are included newest-first until a context budget is
+reached, with an explicit `[earlier turns truncated]` marker in the prompt and in
+the stored transcript. Without that budget, round 3 silently overflows a 32k
+context and the model starts ignoring the earliest arguments — which would look
+like reasoning and would not be.
+
+## D.4 Internal Affairs
+
+**Mechanical first, model second.** Every check below is computed in SQL/JS and
+stored as structured `findings` *before* any model call. The model writes the
+report *from* those findings and cannot invent one. If the model is unavailable
+the audit still produces its findings and a null report.
+
+| # | Check | Source |
+|---|---|---|
+| 1 | Citations that fail to resolve | `citation_checks` (D.5a) `status in ('unresolved','mismatch')` joined to the agent's recent proposals |
+| 2 | Proposals outside the agent's domain | `suggestions.payload->>'domain_id'` vs the agent's `domain_id`. Note the quota trigger already blocks out-of-*scope* inserts, so this catches the case it cannot: an agent proposing outside its **declared expertise** while still inside its token scope, and scope drift after an admin edits `scopes` |
+| 3 | Cap violations (429s) and their frequency | New `agent_incidents` table, written by the propose route when the quota trigger raises `53400`/`42501`. **This ships in the first migration, not with IA**, so there is history to audit by the time IA runs |
+| 4 | Near-duplicate resubmission | Normalized-title/slug match between a new `pending` proposal and this agent's own previously `rejected` ones. Exact normalized match only — no `pg_trgm` dependency, so genuine near-duplicates with reworded titles will be missed; stated as a known limit rather than implied coverage |
+| 5 | Approval-rate trend vs roster baseline | `suggestions` counts over a trailing window per agent, compared to the roster median |
+| 6 | Stale pending / abandoned follow-ups | `pending` older than N days; `open_question`s an agent added and never returned to |
+
+**Storage.** `agent_audits`: `id, agent_id (null = roster-wide), run_at,
+findings jsonb, report text, severity (enum audit_severity: ok | notice |
+concern | critical), public_summary text, actions_taken jsonb`.
+
+**Powers, enforced in Postgres.** IA acts only through
+`ia_apply_sanction(p_agent_name, p_action, p_reason)`, security definer,
+executable by `service_role` only, called from a capability-narrow route after
+`requireAgent()` confirms the caller's registry row has `kind =
+'internal_affairs'`. The function:
+
+- accepts `p_action` in `('throttle','suspend')` and nothing else;
+- ranks status `active=0 < throttled=1 < suspended=2` and **raises unless the new
+  rank is strictly greater than the current one**. Loosening is not a permission
+  it lacks — it is a transition the function refuses to express;
+- writes `agents.status` and an `agent_audits` action row, and touches nothing
+  else. No knowledge table, no `scopes`, no `trust`, no delete, no insert of
+  agents.
+
+Reinstatement (`→ active`) is admin-only, via `requireAdmin()` and a separate
+route, never reachable from any agent token.
+
+**Suspension is fail-safe.** It sets `enabled=false` through the derive trigger,
+which makes the quota trigger reject that agent's inserts. It stops work; it
+cannot corrupt the map, because nothing IA can reach is a knowledge table.
+
+**The auditor is not exempt.** `internal-affairs` is an ordinary registry row
+with a public profile, its runs are `agent_audits` rows like any other, and it is
+included in its own roster sweep. It *may* sanction itself — self-suspension is
+fail-safe and therefore allowed — and it cannot un-suspend itself, because
+reinstatement is admin-only. That asymmetry is the point.
+
+## D.5 Site features
+
+**(a) Citation verifier — keyed by citation, not by proposal.** Crossref +
+OpenAlex over `fetch`, both free and keyless (Crossref's polite pool wants a
+contact address: optional `VERITAS_CROSSREF_MAILTO`, no key). Table
+`citation_checks` is keyed on the **normalized citation** (lowercased DOI, else
+normalized URL), not on a suggestion or evidence id:
+
+```
+citation_key text primary key, doi, status (enum citation_status:
+verified | unresolved | mismatch), resolved_title, resolved_year,
+matched_via (doi|title), score numeric, source (crossref|openalex),
+raw jsonb, checked_at
+```
+
+Keying on the citation rather than the row means **no change to
+`apply_suggestion()`** is needed to carry a result from proposal to approved
+evidence — the queue and the public evidence page both look the check up by the
+citation they already hold. It is also reusable: two agents citing the same DOI
+resolve it once. Public-readable, because it is a fact about a public citation.
+`unresolved` is a badge, never an auto-reject, exactly as specified.
+
+**(b) State of the Debate, per question.** Public, at
+`/questions/[slug]/debate`, linked from the question page. Competing hypotheses
+with confidence, the evidence balance (supporting vs opposing weight, which
+`suggested_confidence()` already computes), open contradictions, any council
+transcripts on those hypotheses, and how the picture moved over time from
+`confidence_history`. **No schema change** — every input already exists and is
+already public.
+
+**(c) Confidence over time — extend, do not duplicate.** `ConfidenceMeter`
+already contains a `HistorySparkline`: an unlabelled inline-SVG sparkline hidden
+inside the details disclosure. The plan is to promote it to
+`components/charts/ConfidenceOverTime.tsx` — a real dated axis on Recharts (an
+existing dependency), with the rationale for each change on hover — and have
+`ConfidenceMeter` render that instead of its private sparkline. One component,
+not two. `confidence_history` already carries a public SELECT policy. The
+dashboard's map-wide "how beliefs moved" view aggregates the same table.
+
+**(d) Public changelog.** `/changelog`, grouped by week from `timeline_events`,
+joined with `councils` so verdicts appear alongside. Deliberately **no new
+`timeline_event_type` value**: adding one would force the migration split
+described in B.9 deviation 3, and the councils table already carries everything
+needed to render the entry.
+
+## D.6 Schema summary — four migrations, applied with `supabase db push`
+
+The CLI is linked, so these apply directly; no dashboard paste (unlike 0003/0004).
+One migration per implementation stage, so each commit is independently
+verifiable.
+
+| Migration | Adds |
+|---|---|
+| `0007_agent_roster.sql` | enums `agent_kind`, `agent_status`; `agents` columns (`display_name`, `kind`, `charter`, `domain_id`, `status`); derive trigger for `enabled`; **replaces** `recompute_agent_trust()` and `enforce_agent_quota()`; `agent_incidents`; views `agent_public`, `agent_public_stats`; grants |
+| `0008_critiques_citations.sql` | enums `critique_verdict`, `citation_status`; `suggestion_critiques`; `citation_checks`; `propose_with_critique()`; RLS + grants |
+| `0009_council.sql` | enums `council_role`, `council_outcome`; `councils`, `council_turns`; public SELECT policies; grants |
+| `0010_internal_affairs.sql` | enum `audit_severity`; `agent_audits`; `ia_apply_sanction()`; RLS + grants |
+
+**No `ALTER TYPE … ADD VALUE` anywhere in Phase D.** Every enum above is a *new*
+type, which Postgres permits creating and using in the same transaction — the
+B.9 deviation 3 split applies only to adding values to an existing enum, and
+avoiding that is one reason the changelog derives council entries from `councils`
+rather than from a new `timeline_event_type`.
+
+## D.7 Public vs admin-only — the complete matrix
+
+| Surface | Anon | Admin | Notes |
+|---|---|---|---|
+| `agent_public`, `agent_public_stats` views | read | read | Fixed column projection; the security boundary |
+| `agents`, `agent_tokens` base tables | **no** | read/write | Unchanged from Phase B |
+| `councils`, `council_turns` | read | read | Full transcripts public — the transparency artifact |
+| `citation_checks` | read | read | Facts about public citations |
+| `confidence_history`, `timeline_events` | read | read | Already public in 0001 |
+| `suggestions` | **no** | read/write | Unchanged — never public |
+| `suggestion_critiques` | **no** | read | Attached to non-public proposals |
+| `agent_audits` full report | **no** | read | `/admin/audits` |
+| `agent_audits` → `public_summary`, `severity`, `run_at` | read | read | Surfaced via `agent_public` only |
+| `agent_incidents` | **no** | read | Operational detail |
+| Pages `/agents`, `/agents/[name]`, `/council/[id]`, `/changelog`, `/questions/[slug]/debate` | public | — | |
+| Page `/admin/audits` | — | admin | |
+
+The rule behind the matrix: **deliberation is public, the queue is not.** What an
+agent argued and what it got approved are public record; what it has *proposed
+and not yet had accepted* is not, because pending content is unreviewed and
+publishing it would make the map look like it contains claims it does not.
+
+## D.8 Cost, caps, and the local-model reality
+
+Still **$0/call** — local Ollama by default, Crossref and OpenAlex free and
+keyless, no new dependency anywhere in this phase.
+
+The real budget is *time and calls*, and the new lanes multiply both:
+
+- **The skeptic roughly doubles a research run's model calls.** Its calls count
+  against the *same* `max_model_calls` — it does not get its own budget. So an
+  existing `--max-model-calls 8` run now yields about half as many proposals
+  unless raised. That is the correct trade (every proposal arrives with its
+  strongest objection attached) but it is a behaviour change to an existing
+  script and must be called out in STATUS.
+- **A council is the expensive object**: ~4N+1 calls, minutes not seconds
+  locally. Default `--rounds 2`; hard-capped by the existing cap machinery.
+- **IA is nearly free**: six mechanical checks in SQL, one model call for the
+  write-up.
+
+## D.9 Verification plan — the new invariants
+
+`verify-agents.mjs` stays 19/19 and gains a Phase D block; `verify-suggestions.mjs`
+and `verify-admin.mjs` must stay green untouched. New assertions, each one the
+mechanical form of a promise made above:
+
+1. **Skeptic cannot block** — insert a hostile critique on a pending proposal;
+   assert status is still `pending` and no timeline event fired.
+2. **A research-lane proposal without a critique is refused** at the route.
+3. **IA cannot reinstate** — `ia_apply_sanction('…','reinstate',…)` raises;
+   suspended → active via the function raises; the admin route succeeds.
+4. **IA cannot touch knowledge** — attempt a hypothesis write with the IA token;
+   expect 401/403.
+5. **Council verdict lands as `pending` only** — assert the produced suggestion
+   is `pending`, credited to `council`, and that no hypothesis row changed.
+6. **Throttle actually throttles** — set `throttled`, assert the quota trigger
+   rejects at the divided cap with `53400`.
+7. **Suspension is fail-safe** — suspended agent's insert raises `42501`.
+8. **Public views leak nothing** — query `agent_public` as anon and assert the
+   column set; assert `agents`, `agent_tokens`, `suggestions`,
+   `suggestion_critiques` all return zero rows / error for anon.
+9. **Self-audit is not special** — IA may suspend itself; IA cannot un-suspend
+   itself.
+
+Plus the standing gates at every commit: `validate:sql`, `tsc --noEmit`,
+`npm run build`, `contrast.mjs`.
+
+## D.10 Implementation order, and what I want confirmed first
+
+Order, one commit and one migration per stage, gates green at each:
+**1.** 0007 + roster seed + `/agents` profiles → **2.** 0008 + skeptic lane +
+citation verifier → **3.** 0009 + council → **4.** 0010 + IA → **5.** site
+features (b), (c), (d).
+
+Open questions I would rather settle before writing code than discover mid-build:
+
+1. **Is `trust` genuinely public?** D.1 says show it. It is a number that can
+   read as harsh (a 40% approval rate is a public scarlet letter for an agent
+   that is doing legitimately hard work in a contested domain). Alternative:
+   public profile shows approval rate and last audit result, and `trust` stays
+   admin-only. I will do exactly what you say; flagging it because it is
+   irreversible once the page is indexed.
+2. **Replacing two Phase-B-verified functions** (`recompute_agent_trust`,
+   `enforce_agent_quota`) is the highest-risk change in the phase. The
+   alternative is to leave `enabled` authoritative and treat `status` as
+   cosmetic — simpler and lower risk, but then throttling has no teeth and IA's
+   main power is decorative. I recommend the replacement, with the existing 19
+   checks re-run as the gate.
+3. **Council on a question proposes against its most contested hypothesis** (the
+   B.9 deviation 4 shape). The cleaner alternative is to widen
+   `suggestions.target_type` to include `question`, which means a new
+   `apply_suggestion()` branch and touching the most safety-critical function in
+   the schema. I recommend the deviation-4 shape for Phase D and a separate,
+   deliberate migration later if question edits become common.
+4. **Ten agent identities** need auth users, profiles, and tokens. The seed
+   script needs `SUPABASE_SERVICE_ROLE_KEY` and is destructive-adjacent (it
+   creates auth users). Confirm you want it to provision all ten, or a smaller
+   starter roster.

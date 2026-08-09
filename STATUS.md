@@ -4,6 +4,46 @@ Rolling status for review between phases. Most recent phase on top.
 
 ---
 
+## Phase D — The agent society 📐 DESIGN ONLY — awaiting your sign-off (2026-08-10)
+
+Stage 0 complete: the D.1–D.5 design is in `DECISIONS.md` → "Phase D". **Nothing
+is built.** No migration, no script, no schema change. Implementation starts only
+after you sign off, in the D.10 order (roster → skeptic+citations → council → IA
+→ site features), one migration and one commit per stage.
+
+### ⚠ Four questions I need answered before writing code (DECISIONS D.10)
+
+1. **Is `trust` genuinely public** on agent profiles, or should the public page
+   show approval rate + last audit only? Irreversible once indexed.
+2. **Confirm I may replace two Phase-B-verified functions** —
+   `recompute_agent_trust()` and `enforce_agent_quota()` — so `status`
+   (active/throttled/suspended) becomes authoritative. Without it, throttling and
+   IA's main power are decorative. The existing 19 checks are the gate.
+3. **Council convened on a *question* proposes against that question's most
+   contested hypothesis** (the B.9 deviation-4 shape), rather than widening
+   `suggestions.target_type` and touching `apply_suggestion()`. Confirm.
+4. **Ten agent identities** — confirm you want the full roster seeded, or a
+   smaller starter set.
+
+### ⚠ Actions that will be yours once implementation starts
+
+- **Apply migrations 0007–0010** with `supabase db push` (CLI is linked, so no
+  dashboard paste this time).
+- **Run `scripts/seed-agent-roster.mjs`** — needs `SUPABASE_SERVICE_ROLE_KEY`
+  and creates ten Supabase **auth users** + profiles + registry rows.
+- **Optional:** set `VERITAS_CROSSREF_MAILTO` to join Crossref's polite pool.
+  No API key; Crossref and OpenAlex are both free and keyless.
+
+### Cost posture — unchanged, still $0/call
+
+Local Ollama stays the default for every new lane. One behaviour change to flag:
+the always-on skeptic **roughly doubles the model calls per research run** and
+spends the *same* `max_model_calls` budget, so an existing `--max-model-calls 8`
+run yields about half as many proposals unless raised. A council is the expensive
+object — ~4N+1 calls, minutes not seconds on a local 14B model.
+
+---
+
 ## Phase B — AI agent layer ✅ IMPLEMENTED & VERIFIED (2026-06-12)
 
 AI agents are now first-class but deliberately under-privileged **contributors**:
