@@ -1379,3 +1379,143 @@ package's own `package.json`, not the manifest, the lockfile, or `npm ls`.**
 - `npm run validate:sql` → 9 files, all parsed clean.
 - `npm run smoke` vs `http://localhost:3000` → **ALL GREEN, 69 passed, 0
   failed**, including the five F-09 page↔API agreement checks.
+
+---
+
+# Default privileges — AUDIT.md F-07 (2026-08-11, migration 0009)
+
+`0001_core.sql:806-807` set `alter default privileges in schema public grant
+select on tables to anon`, so every table created since inherited anon read
+automatically. Four migrations each had to *remember* a compensating `REVOKE`
+(0003, 0006 ×2, 0007, 0008). All four remembered, so there was no live defect —
+but the default was open, and the failure mode was one forgotten line shipping a
+private table to the public internet.
+
+**0009 inverts the default.** New tables created by `postgres` in `public` now
+grant `anon` nothing; a public table must be granted deliberately.
+
+## Everything below came from live catalog queries, not the migration files
+
+That distinction is the whole point of the exercise, and it changed the design
+twice.
+
+**There are TWO default-ACL entries for `public` tables, owned by different
+roles.** `pg_default_acl` before 0009:
+
+| owning_role | acl for anon | meaning |
+|---|---|---|
+| `postgres` | `rDxtm` | SELECT, TRUNCATE, REFERENCES, TRIGGER, MAINTAIN |
+| `supabase_admin` | `arwdDxtm` | **everything** |
+
+`ALTER DEFAULT PRIVILEGES` without `FOR ROLE` silently binds to the *current*
+role. A role-scoped default that misses the role actually creating tables is a
+no-op that reads in review exactly like a fix. So 0009 names `FOR ROLE postgres`
+explicitly, justified by live ownership — `postgres` owns **24 of 24** relations
+in `public` (21 tables, 3 views, 1 matview; no other owner exists).
+
+**`REVOKE ALL`, not `REVOKE SELECT`.** The live default granted anon `rDxtm`, not
+`r`. Revoking only SELECT would have left future tables TRUNCATE-able by anon,
+which RLS does not restrain.
+
+## The residual: `supabase_admin`, which this migration cannot close
+
+The `supabase_admin` default ACL is **more permissive** than the one 0009 fixed
+(`anon` gets ALL on any table that role creates in `public`), and 0009 leaves it
+untouched — provably, not accidentally:
+
+```
+pg_has_role('postgres','supabase_admin','MEMBER')  -> false
+pg_roles.rolsuper for postgres                     -> false
+```
+
+`ALTER DEFAULT PRIVILEGES FOR ROLE` requires membership in that role or
+superuser. Running it as `postgres` fails outright and would abort the migration.
+**Wrapping it in an exception handler so the migration "succeeds" was rejected**
+— that is the soft-failure shape this document is a catalogue of, and it would
+have produced a green push that fixed half of what it claimed. The statement is
+therefore left in `0009` as a commented block with the evidence for why it
+cannot run.
+
+**Live exposure today is nil:** `supabase_admin` owns 0 of the 24 relations in
+`public`. This is a latent path, not an active one. Closing it needs a session
+as `supabase_admin` (dashboard SQL editor or Supabase support) and is tracked
+here rather than pretended away.
+
+## Two relations keep their anon grant deliberately
+
+Both were flagged during the keep-public audit because neither can be tied to an
+anonymous read in application code. **Neither was revoked**, because "I could not
+find a caller" is not the same as "nothing calls it", and 0009's remit was the
+default for *future* tables — not a re-grant pass over existing ones, which is
+precisely how 0002's outage was created.
+
+- **`graph_nodes`** (view). Zero references in `app`, `lib`, or `components`. The
+  only reader in the repository is `scripts/audit-pages.mjs:83`, an audit script
+  — not the site. `/graph` renders from `getGraphPayload`, which reads the five
+  base tables directly (`lib/queries/graph.ts:48-55`) and never touches this
+  view. It appears to be a leftover from 0001 that the graph implementation
+  outgrew. Revoking it would most likely be inert, and would also break that
+  audit script for no gain. **Left public; a candidate for deletion rather than
+  revocation, decided separately.**
+- **`profiles`** (table). `anon` holds the grant, but the RLS predicate is
+  `((id = auth.uid()) OR is_admin())`, and an anonymous request has no
+  `auth.uid()` — so anon reads zero rows no matter what the grant says. Every
+  code path is authenticated (`lib/api.ts:56,86`, `app/admin/layout.tsx:24`,
+  `app/contribute/layout.tsx:26`). The grant is functionally dead, and RLS is the
+  thing actually protecting the table. **Left public** because removing a grant
+  whose only effect is currently nil is pure risk with no security gain; if it is
+  ever revoked, RLS must remain the primary control, not the grant.
+
+## Still outstanding, deliberately not in 0009
+
+**`anon` holds TRUNCATE on all 19 relations it can read** — the ACL is `rDxtm`,
+not `r`. RLS does **not** restrain TRUNCATE. Calibrated honestly: this is not
+currently exploitable, because PostgREST exposes no TRUNCATE verb, so there is no
+route from an anon API key to that privilege. It is a latent over-grant, not a
+live hole. It is uniform across every relation rather than specific to one, so it
+needs its own migration and its own smoke run, and folding it into a
+default-privileges change would have meant altering existing grants — the one
+thing 0009 was scoped never to do.
+
+## Verified after the push, in this order
+
+1. **`pg_default_acl`** — the `postgres` entry no longer lists `anon` at all
+   (`{postgres=…,authenticated=…,service_role=…}`); the `supabase_admin` entry is
+   byte-identical to before, as predicted.
+2. **All 17 keep-public relations still hold anon SELECT**, checked via
+   `pg_class.relacl` + `has_table_privilege` so the matview `dashboard_stats` was
+   covered — it does not appear in `information_schema.role_table_grants` at all,
+   which is exactly how it would have been missed.
+3. **`verify-agents.mjs` → ALL GREEN, 38/0**, including `anon can read
+   agent_public` and the four `anon cannot read …` denials.
+4. **`smoke` vs production → ALL GREEN**, no page serving 200 with empty content.
+5. **Behavioural proof, not catalog-reading.** Created a throwaway table as
+   `postgres`, and `anon` had **no** privilege on it — SELECT, INSERT, UPDATE,
+   DELETE, TRUNCATE, REFERENCES, TRIGGER all `false`, with `authenticated`
+   SELECT `true` as a control — then dropped it and confirmed removal. Before
+   0009 that table would have been created with `anon=rDxtm`. The catalog change
+   and the behaviour change were verified separately because the first does not
+   imply the second.
+
+## The guard that makes a regression non-silent
+
+`scripts/smoke.ts` gained 17 assertions (69 → 86 checks) that ask PostgREST, with
+the anon key, whether each keep-public relation is still readable. It tests the
+**privilege**, so 0 rows is a pass — content is already covered by the route
+assertions.
+
+This matters most for the four *embedded* relations — `sources`,
+`hypothesis_evidence`, `confidence_history`, `simulation_runs` — which no route
+marker covers. If anon lost read on those, the affected pages would still render
+and still return 200, just with a sub-section quietly missing. That is the 0002
+shape again, one level down.
+
+Two design choices, both learned from this document:
+
+- **Missing credentials is a FAILURE, not a skip.** A guard that quietly does
+  nothing when it cannot run would report ALL GREEN having checked nothing.
+- **The assertion was negative-controlled**, because a check that cannot fail is
+  worth nothing. Against relations anon must not read, the same request returns
+  **HTTP 401 / SQLSTATE 42501** (`agents`, `suggestions`, `agent_tokens`), while
+  `domains` returns 200 with rows. The check discriminates, and it labels a
+  42501 explicitly as `GRANT REVOKED`.

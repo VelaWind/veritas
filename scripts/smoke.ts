@@ -518,6 +518,87 @@ async function main(): Promise<void> {
     }
   }
 
+  // ─── anon GRANTS on the keep-public relations (AUDIT.md F-07) ─────────────
+  //
+  // 0009 revoked the blanket default that handed `anon` rights on every future
+  // table. That is the right shape, but it makes a grant regression cheap: one
+  // stray REVOKE, or a new migration that rebuilds a relation and forgets to
+  // re-grant, and anon silently loses read on something the public site needs.
+  //
+  // 0002_fix_rls.sql is the precedent — RLS enabled with no matching GRANT,
+  // every row denied to anon, pages rendering their empty state under HTTP 200.
+  // The route checks above would catch that for the handful of relations whose
+  // content appears in a marker, but NOT for the embedded ones (sources,
+  // hypothesis_evidence, confidence_history, simulation_runs), which surface
+  // only as a missing sub-section on a page that still looks fine.
+  //
+  // So this asks PostgREST the same question a browser's anon client asks. A
+  // privilege failure is HTTP 401/403 with SQLSTATE 42501; an RLS denial is a
+  // 200 with `[]`. We assert on the PRIVILEGE, so 0 rows is a pass here —
+  // content is already covered by the route and API assertions above.
+  console.log("\n── anon can still read the keep-public relations (F-07) ───────");
+
+  const KEEP_PUBLIC = [
+    "domains", "hypotheses", "questions", "evidence", "sources",
+    "hypothesis_evidence", "confidence_history", "contradictions",
+    "timeline_events", "research_notes", "simulations", "simulation_runs",
+    "graph_edges", "citation_checks", "dashboard_stats", "agent_public",
+    "agent_public_stats",
+  ];
+
+  let sbUrl = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
+  let sbKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "";
+  if (!sbUrl || !sbKey) {
+    const { readFileSync, existsSync } = await import("node:fs");
+    if (existsSync(".env.local")) {
+      for (const line of readFileSync(".env.local", "utf8").split(/\r?\n/)) {
+        if (!line || line.startsWith("#") || !line.includes("=")) continue;
+        const i = line.indexOf("=");
+        const k = line.slice(0, i).trim();
+        const v = line.slice(i + 1).trim().replace(/^["']|["']$/g, "");
+        if (k === "NEXT_PUBLIC_SUPABASE_URL" && !sbUrl) sbUrl = v;
+        if (k === "NEXT_PUBLIC_SUPABASE_ANON_KEY" && !sbKey) sbKey = v;
+      }
+    }
+  }
+
+  // Missing credentials is a FAILURE, not a skip. A guard that quietly does
+  // nothing when it cannot run is the exact failure mode this file exists to
+  // prevent — it would report ALL GREEN having checked nothing.
+  if (!sbUrl || !sbKey) {
+    check(
+      "F-07: anon credentials available for the grant check",
+      false,
+      "set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY, or run from a directory with .env.local — the grant check cannot be skipped silently",
+    );
+  } else {
+    const base = sbUrl.replace(/\/$/, "");
+    for (const rel of KEEP_PUBLIC) {
+      let status = 0;
+      let body = "";
+      try {
+        const res = await fetch(
+          `${base}/rest/v1/${rel}?select=*&limit=1`,
+          {
+            headers: { apikey: sbKey, Authorization: `Bearer ${sbKey}` },
+            signal: AbortSignal.timeout(TIMEOUT_MS),
+          },
+        );
+        status = res.status;
+        body = (await res.text()).slice(0, 200);
+      } catch (err) {
+        body = err instanceof Error ? err.message : String(err);
+      }
+      check(
+        `anon can read ${rel}`,
+        status === 200,
+        `HTTP ${status || "network error"} ${body}${
+          body.includes("42501") ? "  <- GRANT REVOKED (SQLSTATE 42501)" : ""
+        }`,
+      );
+    }
+  }
+
   console.log(
     `\n${fail === 0 ? "ALL GREEN" : `${fail} FAILURE(S)`} — ${pass} passed, ${fail} failed  (${BASE})`,
   );
