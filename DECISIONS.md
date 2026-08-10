@@ -633,7 +633,10 @@ logs carried `[veritas:query:listTimeline] TypeError: fetch failed` once per
 query per request; every page rendered its empty state and looked entirely
 normal.
 
-**Root cause.** `NEXT_PUBLIC_SUPABASE_URL` was marked **"Sensitive"** in Vercel's
+**Root cause.** *(Attribution corrected 2026-08-10 — see "Correction" at the end
+of this entry. The Sensitive flag does not withhold values from builds; the
+recorded mechanism is disproven and the actual cause is undetermined.)* `NEXT_PUBLIC_SUPABASE_URL` was marked
+**"Sensitive"** in Vercel's
 environment-variable settings. A `NEXT_PUBLIC_*` value must be inlined into the
 bundle at build time, which is exactly what the Sensitive flag prevents — so the
 variable read as present and correct in the dashboard while being empty during
@@ -749,6 +752,75 @@ live dependency on Supabase. A build failing at "Generating static pages" with
   of the root-cause mechanism.)
 - `tsc --noEmit`, `npm run validate:sql` (7 files), `node scripts/contrast.mjs`
   (ALL PASS) all clean.
+
+### Correction (2026-08-10) — the Sensitive flag does not blank the build
+
+The root-cause attribution above was tested empirically against the live
+deployment during setup for the planned Vercel experiment (AUDIT.md §8 — whether
+a credential-free *preview* deployment can poison *production's* Data Cache;
+still UNVERIFIED and unaffected by this correction), because it contained a
+contradiction: `NEXT_PUBLIC_SITE_URL` is *also* marked Sensitive (60 days old,
+never recreated), yet production's sitemap carries the correct domain.
+
+**Evidence, all gathered without changing any Vercel setting:**
+
+1. `vercel env pull --environment=production` returns
+   `NEXT_PUBLIC_SITE_URL=""` and `SUPABASE_SERVICE_ROLE_KEY=""` (Sensitive —
+   undecryptable after creation) but plaintext values for
+   `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` (recreated
+   non-Sensitive 2026-08-08/09). So SITE_URL **is** Sensitive in Production and
+   Preview, today.
+2. Production `/sitemap.xml` and `/robots.txt` emit
+   `https://veritas-delta-pearl.vercel.app`, not the `localhost:3000` fallback.
+3. Next 15.1 inlines `NEXT_PUBLIC_*` into the **server** bundle as a build-time
+   literal: the local build output contains the URL string verbatim in
+   `.next/server/app/sitemap.xml/route.js` and `robots.txt/route.js`, and no
+   `process.env.NEXT_PUBLIC_SITE_URL` read survives anywhere under
+   `.next/server`. ISR regeneration therefore re-runs the same baked literal —
+   it cannot repair a value that was empty at build. Point 2 thus proves the
+   Sensitive value **was present in the build environment** of the current
+   production deployment (built 2026-08-10).
+4. Client chunks (all 19 referenced by `/`, `/login`, `/timeline`, `/search`,
+   `/lab`): the non-Sensitive `NEXT_PUBLIC_SUPABASE_URL` value appears inlined
+   in the login chunk (positive control — inlining works and is observable).
+   The SITE_URL value appears in none of them — but neither does its
+   `localhost:3000` fallback string, so the constant was tree-shaken out (no
+   client code references it). Its absence says nothing about the flag.
+
+**The client/server inlining question is settled without further experiment.**
+There is one build environment and Next's inlining is flag-blind text substitution
+applied to both compilations; there is no mechanism by which Sensitive could
+block client inlining while permitting server inlining — and server inlining of
+a Sensitive value demonstrably worked (point 3).
+
+**What this does to the root cause above — wrong then, or Vercel changed
+since:** three things favor *wrong then*. (a) Vercel's sensitive-env docs, last
+updated 2026-06-03 — before this project's first deploy — describe only
+read-back protection and *build-log redaction*; redacting a value from build
+logs presupposes it is present during the build. (b) The diagnosis's own line
+"read as present and correct in the dashboard" cannot be literally true of a
+Sensitive variable — its value is unreadable after creation, so its correctness
+was never actually verified. (c) The 2026-08-05 redeploys, built with the old
+variable still in place, did not fix the site — for the flag theory to survive,
+Vercel would have to have changed behavior in the five days before 2026-08-10.
+**The recorded root cause is disproven; the actual cause of the outage is
+undetermined.** A wrong or empty value stored at creation would fit the
+evidence, but the old value was unreadable (the flag's one real effect) and the
+variable is deleted, so no candidate cause can be confirmed or ranked against
+the alternatives. What can be said is only that the 2026-08-08 recreation —
+which both re-entered the value and dropped the flag — coincided with the fix,
+without establishing which aspect mattered. A platform change between June and
+early August cannot be fully excluded; a change after 2026-08-05 is what the
+flag theory requires, and nothing supports one.
+
+**What stands unchanged:** every fix in this entry. Fix 1, Fix 2, and the
+fallback rule defend against *an empty value reaching a production build*,
+whichever way it arrives — wrong stored value, deleted variable, or flag
+semantics on some future platform. The guard message's mention of the Sensitive
+flag should be read as "the value can be missing while the dashboard shows a
+variable exists", not "the flag blanks builds". Likewise the "Verified"
+parenthetical above confirmed the *inlined-at-build* mechanism, not the flag's
+role in it.
 
 ## Fourth instance — the cached fallback (2026-08-10, AUDIT.md F-09)
 
