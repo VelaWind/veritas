@@ -99,6 +99,10 @@ and does not check semantics, privileges, or migration ordering.
 
 ### F-09 — HIGH — A credential-free run poisons the persistent data cache, and a credentialed server then serves empty payloads with HTTP 200
 
+**Status: RESOLVED (2026-08-10)** — cause mitigated by M1/M2 (`71d50c7`),
+detection in `scripts/smoke.ts`, exposure bounded by documented environment
+isolation. Full closure record and its stated evidentiary limits: **§8.5**.
+
 `unstable_cache` entries are written to `.next/cache/fetch-cache` keyed on the
 cache key alone. **Nothing in that key records whether credentials were present
 when the value was computed.** So a run with no credentials — where
@@ -347,8 +351,20 @@ const IS_PRODUCTION =
     process.env.NEXT_PHASE !== "phase-production-build");
 ```
 
-Whether `NEXT_PUBLIC_SITE_URL` is actually set in the Vercel production
-environment is **UNVERIFIED** — that cannot be determined from this checkout.
+~~Whether `NEXT_PUBLIC_SITE_URL` is actually set in the Vercel production
+environment is **UNVERIFIED** — that cannot be determined from this checkout.~~
+
+**Resolved 2026-08-10 — it IS set correctly in production.** Determined from
+outside the checkout: production `/sitemap.xml` and `/robots.txt` emit
+`https://veritas-delta-pearl.vercel.app`, not the `localhost:3000` fallback.
+This is build-time evidence, not merely runtime — Next 15 inlines
+`NEXT_PUBLIC_SITE_URL` into the server bundle as a literal (no
+`process.env.NEXT_PUBLIC_SITE_URL` read survives anywhere under `.next/server`),
+so ISR regeneration replays the baked value and could not have repaired an empty
+one. **The silent-fallback hazard described above is unchanged and still
+unguarded** — this confirms the current deploy is configured correctly, not that
+a future misconfiguration would be caught. See `DECISIONS.md`, "Correction
+(2026-08-10) — the Sensitive flag does not blank the build".
 
 ---
 
@@ -788,7 +804,7 @@ guard described at `README.md:62-64`).
 
 ---
 
-## 8. F-09 — Vercel exposure and proposed mitigations
+## 8. F-09 — Vercel exposure, mitigations, and closure
 
 ### 8.1 Does the build-time guard abort before a cache entry is written?
 
@@ -831,41 +847,105 @@ directions.
 
 ### 8.2 Can Vercel's Data Cache be poisoned the same way?
 
-**UNVERIFIED.** I could not determine this from this checkout, and I will not
-guess. What is established and what is not:
+**Answered from Vercel's documentation (2026-08-10), not from a live test.** The
+preview→production vector is closed by documented environment isolation; the
+production→production vector is **not**, and that is what M1/M2 exist for.
 
-**Established:**
+**Established independently of the docs:**
 - The mechanism is real and deterministic on the filesystem cache handler used
   by `next start` (§F-09, reproduced end to end).
 - A Vercel *preview* deployment runs with `VERCEL_ENV=preview`, which by design
   does not trip the guard, and if it has no Supabase credentials its
   `/api/stats` and `/api/graph` will compute and cache the same empty payloads.
 - A Vercel *production* deployment cannot be created without credentials, so it
-  cannot poison its own cache at runtime.
+  cannot poison its own cache with the *no-credentials* fallback.
 
-**Not established — the three questions that decide real exposure:**
-1. Whether Vercel's Data Cache is shared between the `preview` and `production`
-   environments of one project, or partitioned by environment. If partitioned,
-   preview poison never reaches production and the residual risk is limited to
-   previews looking broken.
-2. Whether Vercel's restored build cache (`.next/cache` is restored between
-   builds of the same project) carries `fetch-cache` entries into the runtime
-   Data Cache of a subsequent deployment.
-3. Whether the `unstable_cache` key incorporates the deployment id. If it does,
-   entries cannot survive a redeploy at all and the production exposure is nil.
+**Which cache layer applies.** Both pages were checked, because
+[Data Cache](https://vercel.com/docs/caching/runtime-cache/data-cache)
+(*last updated 2026-07-27*) states it is "for Next.js 14 and below" and directs
+Next.js 15+ to
+[Runtime Cache](https://vercel.com/docs/caching/runtime-cache)
+(*last updated 2026-07-27*) — a real gap, since this project is Next 15.1.6. It
+closes cleanly: the Runtime Cache page's own version table maps **Next.js 15 +
+`unstable_cache` → Data cache**, so the two call sites land on Data Cache. Both
+pages assert environment isolation regardless, so the answer does not depend on
+resolving the layer.
 
-Answering these requires an experiment on Vercel itself — deploy a preview with
-the Supabase env vars unset, request `/api/graph`, then check whether a
-production deployment serves an empty payload. I have not run that, and nothing
-in this repository can answer it.
+**The three questions of §8.2, answered:**
 
-**Interim risk statement:** on the evidence available, the demonstrated exposure
-is to any self-hosted or `next start` deployment, and to Vercel *preview*
-deployments. Production exposure on Vercel is **UNVERIFIED**.
+1. **Shared between `preview` and `production`, or partitioned? — Partitioned.**
+   Data Cache: *"**Isolated by environment**: Each deployment environment
+   (`production` or `preview`) uses its own cache, so they never share cached
+   data"*, and *"Every plan splits the cache by deployment environment, so
+   `production` and `preview` never share cached data."* Runtime Cache states
+   the same in near-identical words. Note "**every plan**" — the Hobby/Pro
+   project-sharing distinction in the storage-scope tables does not affect the
+   environment axis. **Per this section's own stated logic, preview poison never
+   reaches production, and the residual preview risk is limited to previews
+   looking broken.**
+2. **Does the restored build cache carry `fetch-cache` entries into a later
+   deployment's runtime Data Cache? — No.** Data Cache: *"Cache is **not**
+   updated at build time."* This agrees with the local finding in §8.1(b) that a
+   credential-free build wrote **0** `fetch-cache` entries; the build is not the
+   vector in either direction.
+3. **Does the cache key incorporate the deployment id? — No.** Data Cache:
+   *"**Persistent across deployments**: Cached data persists across deployments
+   unless you explicitly invalidate it"*, and *"Vercel persists cached data
+   across deployments, unless you explicitly invalidate it using framework APIs
+   like `res.revalidate`, `revalidateTag`, and `revalidatePath`, or by manually
+   purging the cache."* Runtime Cache adds: *"TTL and tag updates aren't
+   reconciled between deployments."*
 
-### 8.3 Proposed mitigations — not implemented
+**Question 3 came back the dangerous way, and it is the reason M1/M2 are
+load-bearing rather than defence in depth.** Entries carry no deployment id, so
+**a redeploy does not clear poison** — the intuitive "just ship again" recovery
+does not work. Combined with the fact that production can poison *itself*, this
+is a live production risk that documented isolation does nothing to reduce:
 
-Listed cheapest-first. All are proposals; none has been written.
+> The no-credentials fallback cannot occur in production (the §8.1 guard makes
+> that build impossible), but an **empty-yet-successful** read can. A `null`
+> `dashboard_stats` from a matview that was never refreshed, or a genuinely
+> empty graph payload, is not a failure — the query layer does not throw, so
+> Phase 2's loud-failure hardening never engages — and pre-M2 it was written to
+> the cache under exactly the healthy key. That is precisely the original F-09
+> discovery: `/api/stats` returning `data is null — dashboard_stats never
+> refreshed` on a server whose `/graph` page rendered 76 nodes. It then persists
+> for the full revalidate window, survives every redeploy, and is served with
+> HTTP 200.
+
+**So the preview verdict must not be read as "F-09 was not a real risk."** It
+bounds one vector (preview→production) and leaves the one that actually produced
+the observed incident (production→production, via a degraded-but-successful
+read) fully intact. M1 stops the credential-free write; **M2 is what stops the
+production self-poisoning case**, and without it a single empty read pins itself
+into a cache that no redeploy will clear.
+
+**Basis and why we did not verify live.** Every answer above is **Vercel's
+documented behaviour, not an observation of this running system.** The live
+experiment was designed (`probe/f09-preview-cache`, an empty commit on a
+pre-M1/M2 tree, so the preview would actually write poison) and deliberately
+**not run**. A *positive* result — preview poison surfacing in production —
+would itself have been a production incident: it would have written empty
+payloads into the production cache, where M1/M2 prevent new writes but do not
+clean existing entries, and where question 3's answer means no redeploy would
+remove them. Running a test whose success condition is "production is now
+serving empty data" was not a reasonable trade against documentation this
+explicit. This is a deliberate, recorded limit on the strength of the evidence,
+not an oversight.
+
+**Residual risk statement:** the demonstrated exposure is to any self-hosted or
+`next start` deployment, and to Vercel *preview* deployments. Production
+exposure via a preview is **closed by documented environment isolation**.
+Production exposure via production's own degraded reads was **real, is mitigated
+by M1/M2, and is not self-healing on redeploy** — see §8.4 for the recovery
+lever.
+
+### 8.3 Mitigations — M1, M2 and M5 shipped
+
+Listed cheapest-first, as originally proposed. **M1, M2 and M5 have since been
+implemented** — M1/M2 in commit `71d50c7`, M5 in `scripts/smoke.ts`. M3 and M4
+remain proposals held in reserve. The sketches below are preserved as first
+written; see the note after the recommendation for what actually shipped.
 
 **M1 — Do not cache a value computed without credentials.** The root cause is
 that an empty fallback is cached as though it were a result. Gate the cache
@@ -927,3 +1007,77 @@ next occurrence to be silent. Verified by negative control (§F-09).
 **Recommendation: M1 + M2, with M5 already in place.** M1 stops the write, M2
 stops the read from ever being stored behind it, and M5 catches a regression.
 M3 and M4 are held in reserve.
+
+**Shipped (commit `71d50c7`).** M1 and M2 were implemented as recommended, in
+`app/api/graph/route.ts` and `app/api/stats/route.ts`, with `EmptyPayloadError`
+added to `lib/api.ts`. M2 departs from the sketch in one respect worth noting:
+throwing is used purely as the signal that tells `unstable_cache` not to persist
+a value — the route catches `EmptyPayloadError` and answers from an *uncached*
+read, so an empty result is still **served**, only never **stored**. That keeps
+a fresh pre-seed database rendering empty rather than erroring, which the sketch
+above flagged as the trade-off to avoid. `QueryFailedError` and everything else
+propagates and stays loud.
+
+Note the scope limit, stated precisely because the two claims differ: M1 and M2
+are **write-path** mitigations. They prevent poison being *created*; they do not
+validate or clean entries that already exist. Hand-placed poison in the live
+cache keys is still served, and the M5 detector still catches it (6 failures,
+including "page renders 76 nodes, API returns 0"). "Can no longer be created by
+a credential-free run" is proven; "can no longer exist" is not, and is not
+claimed — which is why §8.4's recovery lever matters.
+
+### 8.4 The recovery lever — verified reachable on production
+
+Because question 3 means poison outlives a redeploy, on-demand revalidation is
+the primary remediation path, so it was exercised **before** any deliberate
+poisoning rather than after. Verified 2026-08-10 against
+`veritas-delta-pearl.vercel.app` using the `scripts/verify-admin.mjs` pattern
+(temp admin provisioned via the service role, `@supabase/ssr` cookie forged,
+user deleted afterwards):
+
+- **Admin gate is genuinely enforced.** Unauthenticated
+  `POST /api/revalidate` → **HTTP 401**, `{"data":null,"error":"Authentication
+  required."}`.
+- **The route is reachable and executes.** Authenticated
+  `POST /api/revalidate {"tags":["graph","stats"]}` → **HTTP 200**,
+  `{"data":{"revalidated":true,"tags":["graph","stats"],"paths":[]},"error":null}`.
+  Both poison-bearing tags accepted; `revalidateTag` ran without error.
+- **Recovery therefore does not require a redeploy** — which matters precisely
+  because, per question 3, a redeploy would not have worked anyway.
+
+**What was NOT established: eviction was not directly observed.** HTTP 200
+confirms the handler ran and `revalidateTag` did not throw — nothing more.
+Latency was measured and is **explicitly not counted as evidence**: `/api/graph`
+went 235ms hot → 610ms then 546ms after the purge, elevated but never settling
+back to hot, which is not a clean cold-then-warm signature. Payload comparison
+cannot help either, since production data was unchanged throughout (76 nodes /
+99 edges, 15 hypotheses). Actual eviction rests on documented semantics — *"The
+revalidation propagates to all regions within 300ms"* — and would only be
+directly provable against poison that genuinely exists, which is the thing we
+declined to create.
+
+**Backup lever.** Dashboard purge: project → **CDN** → **Caches** → **Purge
+cache** → *All content* → cache layer *Runtime and Data Cache*. One hazard,
+documented by Vercel: *"On Hobby and Pro, your projects share a single cache, so
+purging deletes the cached data for every project in your team in that
+environment."* It is not scoped to this project on those plans.
+
+### 8.5 F-09 status — RESOLVED (2026-08-10)
+
+- **Cause mitigated.** M1 stops a credential-free run offering a value to the
+  cache at all; M2 stops an empty-but-successful read being stored by a
+  credentialed production runtime — the vector that produced the original
+  incident. Shipped in `71d50c7`.
+- **Detection in place.** `scripts/smoke.ts` asserts page↔API agreement and
+  fails on an empty payload against a seeded database, so a recurrence cannot be
+  silent. Verified by negative control.
+- **Exposure bounded.** Preview→production is closed by Vercel's documented
+  environment isolation (§8.2); production→production is closed on the write
+  path by M1/M2, with `POST /api/revalidate` verified as the recovery lever for
+  any entry that predates them (§8.4).
+
+**Resolved on documentation, with two limits recorded rather than smoothed
+over:** environment isolation is Vercel's documented behaviour and was
+deliberately not verified live (§8.2), and tag eviction was not directly
+observed (§8.4). Neither gap is load-bearing for the mitigations themselves,
+which hold regardless of how the platform partitions its caches.
