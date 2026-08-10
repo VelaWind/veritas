@@ -26,8 +26,8 @@ export default function PublicError({
       </h1>
       <p className="max-w-xl text-muted">
         This is an error in the interface, not a statement about the knowledge
-        itself — a fault, not an absence. Do not read it as "there is nothing
-        here". You can retry, or return to a known-good surface.
+        itself — a fault, not an absence. Do not read it as &ldquo;there is
+        nothing here&rdquo;. You can retry, or return to a known-good surface.
       </p>
       <div className="flex flex-wrap gap-3">
         <Button variant="primary" onClick={reset}>
