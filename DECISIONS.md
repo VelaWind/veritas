@@ -750,6 +750,69 @@ live dependency on Supabase. A build failing at "Generating static pages" with
 - `tsc --noEmit`, `npm run validate:sql` (7 files), `node scripts/contrast.mjs`
   (ALL PASS) all clean.
 
+## Fourth instance — the cached fallback (2026-08-10, AUDIT.md F-09)
+
+**The same class again, and this one got past the fix for the last one.**
+
+`unstable_cache` keys record nothing about credentials. A run where
+`HAS_LIVE_SUPABASE` is false returns the query layer's empty fallback — the
+designed, correct behaviour for that state — and `unstable_cache` stores it
+under *exactly the key a credentialed run uses*. The entry survives a rebuild,
+and a later credentialed server serves it as a fresh hit for the full revalidate
+window: 900s for `/api/stats`, 3600s for `/api/graph`. HTTP 200, valid
+`{ data, error: null }` envelope, empty payload.
+
+**Why the Phase 2 loud-failure design did not catch it.** That design makes a
+*failed* query loud: with live credentials `logQueryError`/`logQueryThrow` throw
+instead of returning the fallback. But nothing failed here. The empty value was
+produced by a healthy code path in the state it was designed for
+(no credentials → return fallback), and was then *carried across a state
+boundary* by the cache into a context where that state no longer held. Phase 2
+gated the fallback on `HAS_LIVE_SUPABASE` at the moment of computation; it had
+no way to know a value computed under one setting of that flag would be replayed
+under the other.
+
+So the rule from the third instance — *a fallback must be reachable only in the
+state it was designed for* — needs a second clause:
+
+> **A fallback must not outlive the state it was computed in.** Anything that
+> persists a value across process boundaries — a cache, a snapshot, a
+> materialized view — must either record the state the value was computed under,
+> or refuse to store values computed in a degraded state.
+
+**Mitigations chosen: M1 and M2 (AUDIT.md §8.3). M3 and M4 held in reserve.**
+
+- **M1 — bypass the cache entirely when `HAS_LIVE_SUPABASE` is false.**
+  `app/api/graph/route.ts:19` and `app/api/stats/route.ts:31`. This is the fix
+  for the cause: the degraded value is never offered to the cache at all.
+  Verified — a credential-free preview runtime that previously wrote **2**
+  poisoned entries now writes **0**, while still serving the empty payload
+  correctly.
+- **M2 — refuse to *store* an empty payload when credentials are live.** Inside
+  each cached callback, an empty result throws `EmptyPayloadError`
+  (`lib/api.ts`), because throwing is the only way to tell `unstable_cache` not
+  to persist a value. The route catches it and answers from an **uncached** read.
+  That distinction is the whole design: the empty result is still *served*, it is
+  only refused entry to the cache — so a fresh pre-seed database renders its
+  empty state rather than erroring, which is what M2 in the audit warned about.
+  Any other error, including `QueryFailedError`, propagates and stays loud.
+
+**Known residual risk, stated because it is easy to misread.** M1 and M2 are
+**write-path** mitigations. They stop poison being created; they do not detect or
+clean poison that already exists. A cache poisoned before these shipped will keep
+serving until the entry revalidates or the cache is cleared — verified by
+hand-writing the poisoned entries back after the mitigation and observing them
+served unchanged. That is precisely why the smoke assertion stays:
+`scripts/smoke.ts` fails when `/graph` and `/api/graph` disagree on node count,
+or when either payload is empty against a seeded database.
+
+**Verified whether Vercel production is exposed: UNVERIFIED.** A Vercel
+*production* build cannot be created without credentials (the `env.ts` guard
+throws on `VERCEL_ENV=production`), so production cannot poison its own cache.
+A Vercel *preview* runs with the guard deliberately silent and can. Whether
+preview and production share a Data Cache is not answerable from this repository;
+AUDIT.md §8.2 records the three questions that would settle it.
+
 ---
 
 # Phase D — The agent society (DESIGN ONLY — awaiting sign-off)

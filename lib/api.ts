@@ -14,6 +14,22 @@ export function apiError(error: string, status = 400) {
   return NextResponse.json({ data: null, error }, { status });
 }
 
+/**
+ * AUDIT.md F-09, mitigation M2. Thrown from inside an `unstable_cache` callback
+ * to stop an empty payload being STORED — throwing is the only way to tell
+ * `unstable_cache` not to persist a value.
+ *
+ * The caller catches it and answers from an uncached read, so an empty result is
+ * still *served*; it is only refused entry to the cache. That distinction is
+ * what keeps a fresh pre-seed database rendering empty instead of erroring.
+ */
+export class EmptyPayloadError extends Error {
+  constructor(where: string) {
+    super(`Refusing to cache an empty ${where} payload.`);
+    this.name = "EmptyPayloadError";
+  }
+}
+
 export function apiZodError(err: ZodError) {
   const detail = err.issues
     .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
