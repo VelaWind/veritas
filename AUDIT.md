@@ -457,6 +457,83 @@ The four compensating revokes:
 
 Current state: no violation. Classification is *hazard*, not *defect*.
 
+**Status: RESOLVED (2026-08-11) — migration 0009.** The default is inverted:
+`alter default privileges for role postgres in schema public revoke all on
+tables from anon`. Verified behaviourally, not just in the catalog — a table
+created as `postgres` after 0009 gives `anon` `false` on SELECT, INSERT, UPDATE,
+DELETE, TRUNCATE, REFERENCES and TRIGGER, with `authenticated` SELECT `true` as
+a control. Full record, including the `supabase_admin` default that cannot be
+altered from `postgres`, in §9 and DECISIONS.md.
+
+#### F-07a — the `rDxtm` bits are Supabase platform-authored, ACCEPTED not fixed
+
+`anon` does not merely hold SELECT on the 19 readable relations. The live ACL is
+`rDxtm` — SELECT, **TRUNCATE**, REFERENCES, TRIGGER, MAINTAIN. RLS does not
+restrain TRUNCATE. This was investigated before scoping a fix, because the
+provenance decides whether a fix is possible at all.
+
+**These bits were not produced by this repository's migrations.** Three
+independent lines of evidence, all from live state:
+
+1. **`grant select` yields `r` alone — measured, not assumed.** A table created
+   as `postgres` (which post-0009 inherits nothing for `anon`), then granted
+   select:
+   ```
+   f07_bits_probe | {postgres=arwdDxtm/postgres,authenticated=arwdDxtm/postgres,
+                     service_role=arwdDxtm/postgres,anon=r/postgres}   anon_bits = r
+   ```
+   Probe dropped afterwards. Every anon grant we author is `grant select`; the
+   10 `grant all` statements across all migrations target **`service_role` every
+   time, never `anon`**, and no grant of TRUNCATE/REFERENCES/TRIGGER/MAINTAIN to
+   `anon` exists anywhere. Nor is there any revoke of INSERT/UPDATE/DELETE from
+   `anon`, so the absent `a`,`w`,`d` were never granted rather than
+   granted-then-removed.
+2. **A schema we have never written to carries the identical signature.** The
+   `postgres`-owned default ACL for `storage` tables is
+   `{… anon=arwdDxtm/postgres …}`. No migration in this repository touches
+   `storage`. The decisive case is the `supabase_admin`-owned entry for `public`
+   (`anon=arwdDxtm`): it **cannot** have come from our migrations, because
+   `postgres` is not a member of `supabase_admin` and therefore cannot execute
+   the statement that creates it. The platform demonstrably authors
+   default-ACL entries granting `anon` broad rights.
+3. **Creation date is irrelevant to the bits.** `citation_checks` was created in
+   **0008**, seven migrations after `domains` (**0001**), and its only anon
+   statement is `grant select … to anon` — which line 1 proves yields `r`. Both
+   carry the identical `rDxtm`. All 19 anon-readable relations are uniform
+   regardless of which migration created them. The extra bits arrive at
+   `CREATE TABLE` from the default ACL, not from any statement we wrote.
+
+Our own block confirms it by subtraction — `0001_core.sql:805-811` grants
+defaults of `select` to `anon`, `select, insert, update, delete` to
+`authenticated`, and `all` to `service_role`. Yet `Dxtm` appears on **both**
+`anon` and `authenticated`, two roles we granted it to neither. `0001:790-792`
+even says so: *"Supabase normally sets these via default privileges."*
+
+**`authenticated` carries the same bits on every relation — `arwdDxtm`, all 24 —
+and is the more privileged role.** It is held by real logged-in contributors,
+not anonymous visitors, so if these bits were reachable it would be the larger
+exposure of the two, not a footnote to the anon case.
+
+**Why this is closed as accepted rather than fixed:**
+
+- **Not exploitable.** PostgREST exposes no TRUNCATE verb, so there is no route
+  from an anon or authenticated API key to that privilege. Latent over-grant,
+  not a live hole.
+- **Not caused by us.** See the three evidence lines above.
+- **Not closable by us while the `supabase_admin` default stands.** That entry
+  still grants `anon` `arwdDxtm` on anything that role creates in `public`, and
+  `postgres` cannot alter it (`pg_has_role(...)` → false, `rolsuper` → false).
+  A revoke pass would clean today's relations without closing tomorrow's door.
+- **The fix costs more than the risk it removes.** Revoking would mean altering
+  grants on existing tables — the exact operation that produced the 0002 outage
+  (RLS enabled, grants misaligned, every row denied to `anon`, pages served
+  empty under HTTP 200 for weeks). Paying that risk for **no reachable**
+  reduction in exposure is a bad trade.
+
+**What is watched instead.** `scripts/smoke.ts` asserts that the
+`postgres`-owned default ACL for `public` tables contains no `anon=` entry, so a
+platform re-application of its baseline cannot silently undo 0009. See §9.
+
 ---
 
 ### F-08 — LOW (environment, not code) — Eight orphaned `next` processes were holding file locks
@@ -1081,3 +1158,70 @@ over:** environment isolation is Vercel's documented behaviour and was
 deliberately not verified live (§8.2), and tag eviction was not directly
 observed (§8.4). Neither gap is load-bearing for the mitigations themselves,
 which hold regardless of how the platform partitions its caches.
+
+---
+
+## 9. F-07 — privilege provenance and the 0009 canary
+
+### 9.1 Where the `rDxtm` bits came from
+
+Investigated before scoping a TRUNCATE fix, because provenance decides whether a
+fix is possible. Full evidence in **F-07a** above. In one line: the bits are
+**Supabase platform-authored**, proven three independent ways — a `grant select`
+probe yielding `anon=r` alone, the never-touched `storage` schema carrying the
+same `anon=arwdDxtm` signature, and `citation_checks` (0008) matching `domains`
+(0001) despite identical grant statements.
+
+Consequence for remediation: a revoke pass would alter grants on existing
+tables — the operation that caused the 0002 outage — to remove privileges that
+are **not reachable** through PostgREST, while leaving the `supabase_admin`
+default able to re-grant them on anything that role creates. Closed as
+**accepted with reasoning, not fixed**.
+
+### 9.2 The canary — 0009 cannot be silently reverted
+
+The platform authored those default-ACL entries once, so the machinery to author
+them again exists. 0009 removed `anon` from the `postgres`-owned default ACL for
+`public` tables. **If platform tooling re-applies its baseline, that entry
+returns, every subsequently created table is anon-readable again, and none of
+the other 86 smoke checks notice** — they assert that public reads still *work*,
+never that anon's rights stayed *absent*. The regression would surface only when
+someone adds a private table and finds it already public.
+
+`scripts/smoke.ts` therefore asserts, via the Management API (`pg_default_acl`
+is not in a PostgREST-exposed schema):
+
+```
+── 0009 default-privilege canary (F-07) ───────────────────────
+  ✓ F-07 canary self-test: detector sees an anon= entry where one exists (storage)
+  ✓ F-07: postgres default ACL for public tables grants anon nothing (0009 intact)
+```
+
+**Note the privilege cost, recorded rather than slipped in:** this check needs
+`SUPABASE_ACCESS_TOKEN`, a platform-admin credential strictly more privileged
+than anything else `smoke.ts` uses. Absence of the token is a **FAILURE, not a
+skip** — a canary that quietly does nothing is worse than no canary, because it
+reads as coverage.
+
+### 9.3 Negative control — the assertion demonstrably fails
+
+A guard that cannot fail is worth nothing, so the failure path is proven rather
+than assumed. `storage` is a schema this repository has never written to whose
+`postgres`-owned default genuinely contains an `anon=` entry — a real,
+same-shape positive case requiring **nothing to be granted and nothing left
+behind**. Applying the canary's exact predicate to both schemas:
+
+```
+public   -> canary PASS
+         acl = {postgres=arwdDxtm/postgres,authenticated=arwdDxtm/postgres,service_role=arwdDxtm/postgres}
+         contains anon= : false
+
+storage  -> canary FAIL
+         acl = {postgres=arwdDxtm/postgres,anon=arwdDxtm/postgres,authenticated=arwdDxtm/postgres,service_role=arwdDxtm/postgres}
+         contains anon= : true
+```
+
+That control is **wired permanently into smoke** as the self-test above, not run
+once and discarded. If the Management API changes shape, the query breaks, or
+the regexp stops matching, the self-test fails and tells us the canary has gone
+blind — rather than the canary passing because it can no longer see anything.
