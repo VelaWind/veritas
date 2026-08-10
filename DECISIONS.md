@@ -1306,3 +1306,76 @@ Open questions I would rather settle before writing code than discover mid-build
    script needs `SUPABASE_SERVICE_ROLE_KEY` and is destructive-adjacent (it
    creates auth users). Confirm you want it to provision all ten, or a smaller
    starter roster.
+
+---
+
+# Dependency security — AUDIT.md F-01 (2026-08-10)
+
+**Option A from `SECURITY-REVIEW.md`, applied on `master`.** The review is
+cherry-picked onto `master` (commit `846b3cb`) so the reasoning below has a
+source in the tree; the `chore/next-16-upgrade` branch it was written on is
+deleted, because its premise was disproven by its own contents — the Next 15→16
+major is *not* required for the `next` CVEs.
+
+**What moved.** `next` 15.5.19 → **15.5.23** (patch), `postcss` 8.5.15 →
+**8.5.26**, `nanoid` 3.3.12 → **3.3.18**. `npm audit` went from 4 high-severity
+groups (15 distinct advisories) to **3 groups**, and the `next` entry no longer
+carries any advisory of its own — it is now listed only as *"Depends on
+vulnerable versions of postcss / sharp"*. All eight `next` CVEs
+(CVE-2026-64641/64643/64644/64645/64646/64647/64648/64649, each patched in
+15.5.21) are cleared by a patch bump inside the 15.x line.
+
+## The two that remain are knowingly accepted, not fixed
+
+A future `npm audit` **will still report these**. That is the expected state, not
+a regression and not an oversight:
+
+| Remaining | Version | Why it cannot move on 15.x | Why it is accepted |
+|---|---|---|---|
+| `postcss` nested in `next` | **8.4.31** | `next@15.5.23` pins `postcss: "8.4.31"` *exactly*; only an npm `overrides` entry could move it | **NOT EXPOSED.** postcss runs at **build time only**, over CSS this repo authors (`app/globals.css` + Tailwind output). All four advisories require attacker-controlled CSS or an attacker-controlled `sourceMappingURL`. No user-supplied CSS enters the build. |
+| `sharp` | **0.34.5** | `next@15.5.23` declares `sharp: "^0.34.3"`; 0.35.x is outside that range | **NOT EXPOSED.** `sharp` is Next's image-optimizer backend. `next.config.ts:7` sets `images: { unoptimized: true }` and there are zero `next/image` imports, so the optimizer never runs and no attacker-supplied bytes reach libvips. |
+
+**Why not Option B (`overrides`) or C (Next 16).** Both clear all 15, and both
+buy exactly these two NOT-EXPOSED items. `overrides` forces versions outside what
+`next` declares — unsupported by the maintainer, and `sharp` carries native
+bindings. Next 16 is a major migration across 45 pages and 30 route handlers into
+a production-deploying `master`. Neither is worth it for two advisories that are
+unreachable in this configuration. Held in reserve, not rejected.
+
+**The condition that reopens this.** "Not exposed" describes *today's*
+configuration, and the margin is thin: adding a single `"use server"` directive
+re-opens five of the eight `next` CVEs at once, and removing
+`images: { unoptimized: true }` re-arms `sharp`. **Re-run the F-01 exposure check
+if either changes** — that is the trigger, and it is the reason the reachability
+table in `SECURITY-REVIEW.md` is kept rather than summarised away.
+
+**One caveat carried forward unresolved:** CVE-2026-64648 (cache confusion) is
+assessed NOT EXPOSED because the exploit pattern `fetch(new Request(init),
+aDifferentInit)` appears nowhere in `app`/`lib`/`components` — but
+`@supabase/supabase-js` issues its own requests internally and its source was not
+audited. It calls `fetch(url, init)`, so the pattern is unlikely; it is recorded
+as **UNVERIFIED** rather than clean.
+
+## A fifth instance of the recurring class, caught in the tooling
+
+`npm install next@15.5.23` **reported success, updated `package.json` and
+`package-lock.json` to 15.5.23, and left `node_modules/next` on disk at
+15.5.19.** `npm ls next` agreed with the lockfile and printed `next@15.5.23`, so
+three of the four places you would look said the upgrade had happened. Only
+reading `node_modules/next/package.json` directly showed otherwise. `npm ci` was
+required to make the installed tree match the lockfile.
+
+This is the same shape as the rest of this document — *a wrong value producing a
+plausible-looking success* — and it is worth recording because a security patch
+is exactly where it does the most damage: every artifact you would normally cite
+as proof of the upgrade was already correct while the vulnerable code was still
+the code that would ship. **Verify a dependency bump by reading the installed
+package's own `package.json`, not the manifest, the lockfile, or `npm ls`.**
+
+## Gate
+
+- `tsc --noEmit` → clean (exit 0).
+- `npm run build` → green, **117/117** static pages from live data.
+- `npm run validate:sql` → 9 files, all parsed clean.
+- `npm run smoke` vs `http://localhost:3000` → **ALL GREEN, 69 passed, 0
+  failed**, including the five F-09 page↔API agreement checks.
