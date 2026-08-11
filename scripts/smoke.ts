@@ -233,16 +233,24 @@ const ROUTES: RouteSpec[] = [
   {
     // "Agents" alone would be a bad marker — it appears in the nav of every
     // page, so it would pass on a totally empty site. "Who proposes what" is
-    // this page's eyebrow and appears nowhere else.
+    // this page's eyebrow and appears nowhere else, so it proves the route
+    // resolved; the display names below prove the QUERY did.
     //
-    // No data assertion yet: seed-agent-roster.mjs has not been run on either
-    // environment, so the roster is genuinely empty and "No agents yet" is the
-    // correct render. When the roster is seeded, add a researcher's display
-    // name to `contains` and "No agents yet" to `absent`.
+    // The roster was seeded 2026-08-11 (seed-agent-roster.mjs, 8 agents), so
+    // this is a real data assertion now rather than a structural one. The three
+    // markers are display names straight out of `agent_public` — they cannot
+    // render unless listPublicAgents() returned rows. They deliberately span
+    // three different `kind` values (research / skeptic / internal_affairs),
+    // because the page groups by kind via KIND_ORDER and drops any group with
+    // no members: asserting only a researcher would stay green if the oversight
+    // agents vanished from the view.
+    //
+    // NOT used as markers: the group headings ("Research", "Oversight", …) come
+    // from the static KIND_META constant and render against an empty database,
+    // so they are chrome by this file's rule 1.
     path: "/agents",
-    contains: ["Who proposes what"],
-    expectData: false,
-    note: "roster not seeded — structural check only; no data assertion yet",
+    contains: ["Who proposes what", "Physics Researcher", "The Skeptic", "Internal Affairs"],
+    absent: ["No agents yet"],
   },
 ];
 
