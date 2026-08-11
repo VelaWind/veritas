@@ -99,9 +99,15 @@ and does not check semantics, privileges, or migration ordering.
 
 ### F-09 — HIGH — A credential-free run poisons the persistent data cache, and a credentialed server then serves empty payloads with HTTP 200
 
-**Status: RESOLVED (2026-08-10)** — cause mitigated by M1/M2 (`71d50c7`),
-detection in `scripts/smoke.ts`, exposure bounded by documented environment
-isolation. Full closure record and its stated evidentiary limits: **§8.5**.
+**Status: PARTIALLY RESOLVED — scope corrected 2026-08-11.** M1/M2 (`71d50c7`)
+close this vector on the two `unstable_cache` API routes, and that closure still
+holds. What the original write-up did not say is that those two routes are not
+the only path into `.next/cache/fetch-cache`. Every ISR page reaches the same
+persistent cache through Next's **automatic fetch cache**, which no guard
+touches — and an instance was observed there on 2026-08-11. Detection in
+`scripts/smoke.ts`; exposure bounded by documented environment isolation. Full
+closure record and its stated evidentiary limits: **§8.5**. Corrected scope and
+the observed instance: **F-09b** at the end of this section.
 
 `unstable_cache` entries are written to `.next/cache/fetch-cache` keyed on the
 cache key alone. **Nothing in that key records whether credentials were present
@@ -207,7 +213,121 @@ a disagreement is a hard failure. Negative control, with the poison restored:
 ```
 
 **Not yet mitigated.** See §8 for the Vercel exposure analysis and the proposed
-mitigations, which are deliberately not implemented yet.
+mitigations, which are deliberately not implemented yet. *(That sentence, and
+the RESOLVED status this section originally carried, were written about the two
+API routes. Both predate F-09b below and neither was revised to account for it.)*
+
+---
+
+### F-09b — the same cache, reached by a path M1/M2 do not cover
+
+**Observed 2026-08-11. No mitigation implemented.**
+
+**What happened.** Immediately after the agent roster was seeded, a *credentialed*
+local `next build` prerendered `/agents` with its empty state — "No agents yet" —
+while `/agents/[name]` rendered full live data **in the same build**. Deleting
+`.next/cache` and rebuilding produced a correct index (125/125 pages). It was
+caught by the `/agents` assertion tightened from structural to real data in
+`161d878`; the structural-only check it replaced could not have seen it, because
+the page's chrome renders identically against an empty database.
+
+**Mechanism.** Supabase reads on ISR pages are ordinary `fetch` calls made by
+`@supabase/supabase-js`, and Next persists their responses in the same
+`.next/cache/fetch-cache` directory that F-09 is about. The segment's
+`revalidate` is inherited by the fetch, and **the full request URL is the key**.
+Verbatim from the cache after a clean credentialed rebuild:
+
+```
+url        : https://<project>.supabase.co/rest/v1/agent_public?select=*&order=kind.asc%2Cname.asc
+revalidate : 3600
+tags       : []
+```
+
+Two consequences follow from that key:
+
+1. **Same table, different query shape, independent freshness.** `?select=*&order=…`,
+   `?select=name`, and `?select=*&name=eq.skeptic` are three separate entries.
+   That is precisely how the index served an empty roster while the profile
+   pages and `generateStaticParams` served a populated one, in one build.
+2. **These entries carry no tags**, so `revalidateTag("graph")` /
+   `revalidateTag("stats")` (`lib/revalidation.ts:41-42`) cannot reach them.
+
+**The split, counted.** One clean credentialed build, 212 entries in
+`.next/cache/fetch-cache`:
+
+| entries | shape | written by | covered by M1/M2 |
+|---|---|---|---|
+| 2 | `url: ""`, `tags: ["stats"]` / `["graph"]` | `unstable_cache` | yes |
+| 210 | real Supabase REST URL, `tags: []` | automatic fetch cache, ISR pages | **no** |
+
+Their `revalidate` values are 208×`3600` and 2×`900` — the segment values and
+nothing else, which is what identifies the segment as the source of the caching.
+
+**Why M1's condition cannot apply.** M1 is "if `HAS_LIVE_SUPABASE` is false,
+bypass the cache". On this path that condition never produces a cacheable value
+in the first place: with no credentials `SUPABASE_URL` is the placeholder host
+(`lib/supabase/env.ts:5-6`), the fetch fails at DNS, and a failed fetch writes
+nothing. F-09's own evidence already records this — a credential-free build wrote
+**0** entries. The ISR exposure is therefore a *different failure mode* from the
+one M1 was written for: not an empty fallback computed without credentials, but
+a genuine **HTTP 200 with an empty body** cached as the legitimate result it
+syntactically is.
+
+**Why M2's condition cannot apply.** M2 throws `EmptyPayloadError` from inside
+the `unstable_cache` callback so the empty value is never stored. The automatic
+fetch cache has no callback. Next writes the response into the cache inside the
+patched `fetch`, **before any application code sees the body**; by the time
+`listPublicAgents` can count the rows and judge them empty, the entry exists.
+There is no key to vary, no callback to throw from, and no supported
+"do not store this response" signal available at the query layer. M2 is
+architecturally out of reach here, not merely unimplemented.
+
+**Scope — every call site that does a Supabase read *and* declares `revalidate`.**
+These are the pages that can cache an empty payload by this mechanism:
+
+| call site | revalidate | prerendered |
+|---|---|---|
+| `app/(public)/page.tsx:13` | 3600 | yes |
+| `app/(public)/dashboard/page.tsx:15` | 900 | yes |
+| `app/(public)/domains/page.tsx:8` | 3600 | yes |
+| `app/(public)/domains/[slug]/page.tsx:19` | 3600 | yes (SSG) |
+| `app/(public)/questions/page.tsx:10` | 3600 | yes |
+| `app/(public)/questions/[slug]/page.tsx:16` | 3600 | yes (SSG) |
+| `app/(public)/evidence/[slug]/page.tsx:19` | 3600 | yes (SSG) |
+| `app/(public)/hypotheses/[slug]/page.tsx:21` | 3600 | yes (SSG) |
+| `app/(public)/notes/page.tsx:9` | 3600 | yes |
+| `app/(public)/notes/[slug]/page.tsx:9` | 3600 | yes (SSG) |
+| `app/(public)/lab/page.tsx:9` | 3600 | yes |
+| `app/(public)/lab/[category]/page.tsx:18` | 3600 | yes (SSG) |
+| `app/(public)/agents/page.tsx:10` | 3600 | yes — **the observed instance** |
+| `app/(public)/agents/[name]/page.tsx:16` | 3600 | yes (SSG) |
+| `app/(public)/graph/page.tsx:7` | 3600 | **no — renders dynamically** |
+| `app/sitemap.ts:12` | 3600 | yes |
+
+`/graph` is the one worth reading twice: it declares `revalidate = 3600` but is
+**not** prerendered, so it renders per request while its Supabase reads are still
+served from an hour-old cache entry. Being dynamic is not protection.
+
+Out of scope by the same measurement: `/evidence`, `/hypotheses`, `/search`, and
+`/timeline` read Supabase but declare no `revalidate`, and no cache entry carries
+a `revalidate` value other than the two segment values above.
+
+**What this record does NOT claim.**
+
+- **No mitigation is implemented for the ISR path.** M1/M2 are unchanged and
+  still cover exactly the two API routes.
+- **The precise trigger of the observed staleness is not reconstructable.**
+  `.next/cache` was deleted to confirm the diagnosis before the offending entry's
+  age was captured. The mechanism and the key shape are proven; why that
+  particular entry was still being served an hour-plus after it was written is
+  not, and is not asserted here.
+- **Whether `revalidatePath()` (`lib/revalidation.ts:36-38`) evicts these
+  untagged entries was not tested.** Only `revalidateTag` is demonstrably unable
+  to reach them. Note also that no `EntityKind` covers agents, so no write path
+  revalidates `/agents` at all.
+- **Production is currently correct** — post-deploy `/agents` renders all eight
+  agents — but that is evidence the vector is not firing there right now, not
+  evidence that it is closed.
 
 ---
 
@@ -1246,12 +1366,21 @@ documented by Vercel: *"On Hobby and Pro, your projects share a single cache, so
 purging deletes the cached data for every project in your team in that
 environment."* It is not scoped to this project on those plans.
 
-### 8.5 F-09 status — RESOLVED (2026-08-10)
+### 8.5 F-09 status — PARTIALLY RESOLVED (revised 2026-08-11)
 
-- **Cause mitigated.** M1 stops a credential-free run offering a value to the
-  cache at all; M2 stops an empty-but-successful read being stored by a
-  credentialed production runtime — the vector that produced the original
-  incident. Shipped in `71d50c7`.
+> **Scope correction.** This subsection was written on 2026-08-10 and said
+> RESOLVED. It is accurate about the two `unstable_cache` API routes and wrong
+> about everything else, because it treated those two routes as the only way into
+> `.next/cache/fetch-cache`. They are not: ISR pages reach the same cache through
+> Next's automatic fetch cache, where neither M1's nor M2's condition can apply,
+> and an instance was observed on `/agents` on 2026-08-11. See **F-09b**. The
+> bullets below stand as written **for the two API routes only**.
+
+- **Cause mitigated, on the two API routes.** M1 stops a credential-free run
+  offering a value to the cache at all; M2 stops an empty-but-successful read
+  being stored by a credentialed production runtime — the vector that produced
+  the original incident. Shipped in `71d50c7`. Neither guard is reachable from
+  an ISR page, which caches its Supabase reads below the query layer (F-09b).
 - **Detection in place.** `scripts/smoke.ts` asserts page↔API agreement and
   fails on an empty payload against a seeded database, so a recurrence cannot be
   silent. Verified by negative control.
