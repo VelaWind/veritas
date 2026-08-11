@@ -1541,12 +1541,24 @@ and none of the other 86 smoke checks notice** — they assert public reads stil
 *work*, never that anon's rights stayed *absent*. It would surface only when
 someone adds a private table and finds it already public.
 
-`scripts/smoke.ts` now asserts the `postgres`-owned default ACL for `public`
-tables contains no `anon=` entry. `pg_default_acl` is not in a PostgREST-exposed
-schema, so this goes through the Management API — which means the check needs
-`SUPABASE_ACCESS_TOKEN`, **a platform-admin credential strictly more privileged
-than anything else smoke uses**. That cost is recorded rather than slipped in.
-Missing credentials is a FAILURE, not a skip.
+`scripts/verify-agents.mjs` now asserts the `postgres`-owned default ACL for
+`public` tables contains no `anon=` entry.
+
+**It lives in the privileged harness, deliberately.** `pg_default_acl` is not in
+a PostgREST-exposed schema, so the check goes through the Management API and
+needs `SUPABASE_ACCESS_TOKEN` — a platform-admin credential. It was briefly in
+`scripts/smoke.ts` and was moved, because **smoke must stay runnable on public
+credentials alone**: it is the check you want runnable from anywhere, by anyone,
+against any deployment, and requiring an admin token to run it would have raised
+the floor for every other smoke assertion too. `verify-agents.mjs` already
+requires `SUPABASE_SERVICE_ROLE_KEY` and provisions temporary admin identities,
+so a check needing platform-level access belongs there.
+
+The rule this encodes: **a harness's credential floor is set by its most
+privileged check**, so a check that needs more privilege than the harness's
+purpose warrants should move to a harness that already has it, not drag the
+whole harness up. Counts after the move: smoke **86** (public), verify-agents
+**40** (privileged). Missing credentials is a FAILURE, not a skip.
 
 **Negative-controlled, permanently.** A guard that cannot fail is worth nothing.
 `storage` is a schema this repository has never written to whose
@@ -1559,8 +1571,9 @@ public   -> canary PASS   contains anon= : false
 storage  -> canary FAIL   contains anon= : true
 ```
 
-That control is **wired into smoke as a permanent self-test**, not run once and
-discarded, because the failure mode that matters is the canary going *blind*: if
+That control is **wired into `verify-agents.mjs` as a permanent self-test**, not
+run once and discarded, because the failure mode that matters is the canary
+going *blind*: if
 the Management API changes shape or the regexp stops matching, the self-test
 fails and says so, instead of the canary passing because it can no longer see
 anything.

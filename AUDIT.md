@@ -1188,18 +1188,28 @@ the other 86 smoke checks notice** — they assert that public reads still *work
 never that anon's rights stayed *absent*. The regression would surface only when
 someone adds a private table and finds it already public.
 
-`scripts/smoke.ts` therefore asserts, via the Management API (`pg_default_acl`
-is not in a PostgREST-exposed schema):
+`scripts/verify-agents.mjs` therefore asserts, via the Management API
+(`pg_default_acl` is not in a PostgREST-exposed schema):
 
 ```
-── 0009 default-privilege canary (F-07) ───────────────────────
-  ✓ F-07 canary self-test: detector sees an anon= entry where one exists (storage)
-  ✓ F-07: postgres default ACL for public tables grants anon nothing (0009 intact)
+── F-07: 0009 default-privilege canary ──
+✓ F-07 canary self-test: detector sees an anon= entry where one exists (storage)
+✓ F-07: postgres default ACL for public tables grants anon nothing (0009 intact)
 ```
 
-**Note the privilege cost, recorded rather than slipped in:** this check needs
-`SUPABASE_ACCESS_TOKEN`, a platform-admin credential strictly more privileged
-than anything else `smoke.ts` uses. Absence of the token is a **FAILURE, not a
+**Why it lives in `verify-agents.mjs` and not in `smoke.ts`.** Reading
+`pg_default_acl` requires the Management API, and therefore
+`SUPABASE_ACCESS_TOKEN` — a **platform-admin credential**. `scripts/smoke.ts`
+must stay runnable against production on **public credentials alone**: it is the
+check you want to be able to run from anywhere, by anyone, including against a
+deployment you do not administer. Putting a privileged-token requirement in it
+would have raised the floor for running *every* smoke check, so the canary sits
+in the privileged harness instead — `verify-agents.mjs` already requires
+`SUPABASE_SERVICE_ROLE_KEY` and provisions temporary admin identities, so it is
+the right home for a check that needs platform-level access.
+
+Counts after the move: **smoke 86** (public credentials), **verify-agents 40**
+(privileged). Absence of the token in `verify-agents.mjs` is a **FAILURE, not a
 skip** — a canary that quietly does nothing is worse than no canary, because it
 reads as coverage.
 
@@ -1221,7 +1231,8 @@ storage  -> canary FAIL
          contains anon= : true
 ```
 
-That control is **wired permanently into smoke** as the self-test above, not run
-once and discarded. If the Management API changes shape, the query breaks, or
-the regexp stops matching, the self-test fails and tells us the canary has gone
-blind — rather than the canary passing because it can no longer see anything.
+That control is **wired permanently into `verify-agents.mjs`** as the self-test
+above, not run once and discarded. If the Management API changes shape, the
+query breaks, or the regexp stops matching, the self-test fails and tells us the
+canary has gone blind — rather than the canary passing because it can no longer
+see anything.

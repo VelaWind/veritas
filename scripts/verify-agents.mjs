@@ -474,8 +474,104 @@ async function run() {
  }
 }
 
+// ── F-07 canary: has migration 0009 been silently reverted? ─────────────────
+//
+// The `rDxtm` bits anon holds on existing relations are Supabase PLATFORM
+// defaults, not ours (AUDIT.md F-07a). The platform authored those default-ACL
+// entries once, so the machinery to author them again exists. 0009 removed
+// `anon` from the postgres-owned default ACL for public tables. If platform
+// tooling re-applies its baseline, that entry returns, every subsequently
+// created table is anon-readable again, and nothing else notices — smoke's
+// assertions check that public reads still WORK, never that anon's rights
+// stayed ABSENT. The regression would surface only when someone adds a private
+// table and finds it already public.
+//
+// WHY IT LIVES HERE AND NOT IN smoke.ts: pg_default_acl is not in a
+// PostgREST-exposed schema, so this needs the Management API and therefore
+// SUPABASE_ACCESS_TOKEN — a platform-admin credential. `scripts/smoke.ts` must
+// stay runnable against production on PUBLIC credentials alone, so a check
+// requiring a privileged token belongs in this harness, which already requires
+// SUPABASE_SERVICE_ROLE_KEY.
+async function f07Canary() {
+  console.log("\n── F-07: 0009 default-privilege canary ──");
+
+  let token = process.env.SUPABASE_ACCESS_TOKEN ?? "";
+  if (!token) {
+    try {
+      for (const line of readFileSync(".env.supabase.local", "utf8").split(/\r?\n/)) {
+        if (!line || line.startsWith("#") || !line.includes("=")) continue;
+        const i = line.indexOf("=");
+        if (line.slice(0, i).trim() === "SUPABASE_ACCESS_TOKEN") {
+          token = line.slice(i + 1).trim().replace(/^["']|["']$/g, "");
+        }
+      }
+    } catch { /* file absent — handled as a failure below, never as a skip */ }
+  }
+  const ref = URL_ ? new URL(URL_).hostname.split(".")[0] : "";
+
+  // Missing credentials is a FAILURE, not a skip. A canary that quietly does
+  // nothing is worse than no canary, because it reads as coverage.
+  if (!token || !ref) {
+    check(
+      "F-07 canary: platform credentials available",
+      false,
+      "set SUPABASE_ACCESS_TOKEN (or provide .env.supabase.local) — the 0009 canary cannot be skipped silently",
+    );
+    check("F-07 canary self-test: detector sees an anon= entry where one exists (storage)", false,
+      "not run — no platform credentials");
+    return;
+  }
+
+  /** postgres-owned default ACL for tables in `schema`, or null if unreachable. */
+  const defaultAcl = async (schema) => {
+    const sql =
+      "select coalesce(string_agg(d.defaclacl::text, ' '), '') as acl " +
+      "from pg_default_acl d join pg_namespace n on n.oid = d.defaclnamespace " +
+      `where n.nspname = '${schema}' and d.defaclobjtype = 'r' ` +
+      "and pg_get_userbyid(d.defaclrole) = 'postgres'";
+    try {
+      const res = await fetch(`https://api.supabase.com/v1/projects/${ref}/database/query`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ query: sql }),
+      });
+      if (!res.ok) return null;
+      const rows = await res.json();
+      return Array.isArray(rows) && rows.length > 0 ? (rows[0].acl ?? "") : "";
+    } catch {
+      return null;
+    }
+  };
+
+  // Self-test FIRST, and it is not decoration. `storage` is a schema this
+  // repository has never written to, and its postgres-owned default genuinely
+  // contains an `anon=` entry. If the detector cannot see THAT, it cannot see a
+  // real regression either, and the assertion below would pass by being blind
+  // rather than by being satisfied. This is the negative control, permanently
+  // wired in, using existing state — nothing is granted to manufacture it and
+  // nothing is left behind.
+  const storageAcl = await defaultAcl("storage");
+  check(
+    "F-07 canary self-test: detector sees an anon= entry where one exists (storage)",
+    storageAcl !== null && /\banon=/.test(storageAcl),
+    storageAcl === null
+      ? "Management API unreachable — the canary below is NOT trustworthy"
+      : `storage postgres default ACL = ${storageAcl || "(empty)"} — expected an anon= entry; detector may be blind`,
+  );
+
+  const publicAcl = await defaultAcl("public");
+  check(
+    "F-07: postgres default ACL for public tables grants anon nothing (0009 intact)",
+    publicAcl !== null && !/\banon=/.test(publicAcl),
+    publicAcl === null
+      ? "could not read pg_default_acl via the Management API"
+      : `found anon in ${publicAcl} — 0009 HAS BEEN REVERTED, every future table in public is anon-readable again`,
+  );
+}
+
 if (ready) {
   await run();
+  await f07Canary();
   console.log(`\n${fail === 0 ? "ALL GREEN" : `${fail} FAILURE(S)`} — ${pass} passed, ${fail} failed`);
   process.exitCode = fail === 0 ? 0 : 1;
 }
