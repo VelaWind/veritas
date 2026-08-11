@@ -137,21 +137,13 @@ if (typeof window === "undefined" && IS_PRODUCTION && SITE_URL_IS_NOT_PRODUCTION
 }
 
 /**
- * Sanitize a Postgres ts_headline() snippet for safe rendering. ts_headline
- * wraps matches in <b>…</b> but does NOT escape the surrounding source text,
- * which is admin-authored markdown and could contain HTML. We escape the whole
- * string, then re-enable ONLY the bold highlight markers — so <script>,
- * <img onerror=…>, and event handlers are all rendered inert while the search
- * highlight still shows. Returns a string safe for dangerouslySetInnerHTML.
+ * Re-export, so both call sites keep importing `sanitizeHeadline` from
+ * `@/lib/utils` and nothing about them changes.
+ *
+ * The implementation lives in `lib/sanitize.ts` because that module has ZERO
+ * imports and this one does not: `lib/utils.ts` imports `@/lib/supabase/env`
+ * for the F-04 guard above, and plain `node` cannot resolve that path alias —
+ * which made the XSS guard impossible to unit-test in isolation. See
+ * `lib/sanitize.ts` for the escape-order and once-only contracts.
  */
-export function sanitizeHeadline(snippet: string): string {
-  const escaped = snippet
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-  return escaped
-    .replace(/&lt;b&gt;/g, "<b>")
-    .replace(/&lt;\/b&gt;/g, "</b>");
-}
+export { sanitizeHeadline } from "@/lib/sanitize";

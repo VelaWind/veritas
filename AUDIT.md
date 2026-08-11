@@ -317,8 +317,22 @@ Everything is tested through HTTP against a live database or not at all. So:
   against malformed input, the token-overlap title score, and the threshold
   boundaries that decide `verified` vs `unresolved`. A scoring change that broke
   edge cases while leaving the two happy paths intact would ship green.
+- **`sanitizeHeadline` — RESOLVED 2026-08-11.** It now has direct unit coverage:
+  `npm run test:unit` (`scripts/test-sanitize.mjs`), **25 assertions**, plain
+  node, no framework, in the style of `smoke.ts`. It is the first unit test in
+  the repository, so the gate is now six commands rather than five. Eight
+  injection vectors are asserted inert against a whitelist invariant (strip
+  `<b>`/`</b>` and no angle bracket may survive); the deliberate carve-out is
+  pinned; and the `&` escape is asserted separately because removing it promotes
+  literal text into real markup — verified by deleting it and watching those
+  assertions fail. Writing the tests also surfaced **F-10** (unbalanced output),
+  accepted with reasoning. To make it testable at all, the function moved to a
+  zero-import `lib/sanitize.ts` and is re-exported from `lib/utils.ts`; both
+  call sites are unchanged. The paragraph below describes the state *before*
+  that work and is retained for the record.
+
 - **`lib/utils.ts`, and `sanitizeHeadline` in particular — zero coverage, and
-  this is the sharpest instance.** It is the XSS guard: it escapes a Postgres
+  this was the sharpest instance (now resolved, above).** It is the XSS guard: it escapes a Postgres
   `ts_headline()` snippet, then deliberately re-enables `<b>`/`</b>` so the
   search highlight survives (`lib/utils.ts:82-92`). That is security-relevant
   string handling with a deliberate carve-out, rendered through
@@ -609,6 +623,48 @@ to Veritas:
 ```
 
 No repository file was changed by this cleanup.
+
+---
+
+### F-10 — LOW — `sanitizeHeadline` can emit unbalanced `<b>` markup — ACCEPTED, not fixed
+
+Found 2026-08-11 by the new unit coverage (F-02), not by inspection. A literal
+`<b>` or `</b>` in the **source text** produces unbalanced output, because the
+re-enable step cannot distinguish ts_headline's own markers from a bold tag the
+author typed:
+
+```
+"<b>unclosed bold"  ->  "<b>unclosed bold"     (opens=1 closes=0)
+"<b</b>"            ->  "&lt;b</b>"            (opens=0 closes=1)
+"</b>orphan closer" ->  "</b>orphan closer"    (opens=0 closes=1)
+```
+
+**Not a security issue, and the same test run proves it.** The output still
+satisfies the invariant that nothing but `<b>`/`</b>` survives as raw markup —
+`<b>` carries no attributes and no script capability, and all eight injection
+vectors in section 1 of `scripts/test-sanitize.mjs` remain inert. The
+consequence is cosmetic: injected into a `<span>` via `dangerouslySetInnerHTML`,
+the HTML fragment parser closes an unclosed `<b>` at the container boundary and
+discards an orphan `</b>`, so at worst the remainder of one search-result line
+renders bold. (Parser behaviour reasoned from the spec, not measured in a
+browser — stated as such.)
+
+**Accepted rather than fixed, for three reasons:**
+
+1. **Barely reachable.** `ts_headline()` always emits balanced tags itself, so
+   this requires the underlying admin-authored markdown to contain a literal
+   bold tag.
+2. **No security gain.** Balancing would not close any vector; section 1 already
+   passes on every malformed input tested.
+3. **The cost lands in the wrong place.** It would add tag-counting logic to the
+   one security-critical function in the codebase, to fix a cosmetic defect.
+   Complexity added to a sanitiser is paid for in review burden forever.
+
+**Locked in rather than left to drift:** the three cases above are asserted in
+`scripts/test-sanitize.mjs` section 6, explicitly labelled *characterization —
+current behaviour, NOT desired behaviour*. If someone later balances the output
+those assertions fail by design, which is the prompt to update them and this
+finding together.
 
 ---
 
