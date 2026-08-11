@@ -26,8 +26,13 @@ export async function listPublicAgents(
     ]);
 
     if (agentsRes.error) return logQueryError("listPublicAgents", agentsRes.error, []);
-    // Stats are supplementary: a roster with no counts is still worth showing,
-    // so a stats failure logs and degrades rather than blanking the page.
+    // Stats are supplementary, and discarding the return value is what lets a
+    // roster render with no counts — but that only happens with NO live
+    // credentials. `logQueryError` throws when `HAS_LIVE_SUPABASE` is true
+    // (lib/queries/log.ts:41), so on a live deployment a stats failure does not
+    // degrade: it propagates out through the catch below, which re-throws it,
+    // and the page renders the error boundary. Degraded-roster is the
+    // no-credentials path only.
     if (statsRes.error) logQueryError("listPublicAgents:stats", statsRes.error, null);
 
     const byName = new Map(
@@ -60,6 +65,9 @@ export async function getPublicAgent(
       .select("*")
       .eq("name", name)
       .maybeSingle();
+    // Same shape as listPublicAgents above: with live credentials this throws
+    // and the profile page renders the error boundary; it falls through to
+    // `stats: null` only when there are no credentials.
     if (statsError) logQueryError("getPublicAgent:stats", statsError, null);
 
     return { ...(data as AgentPublic), stats: (stats as AgentPublicStats) ?? null };
