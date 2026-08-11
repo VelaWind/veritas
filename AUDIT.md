@@ -249,45 +249,96 @@ exploitation.
 
 ---
 
-### F-02 — HIGH — There are no automated tests, no CI, and no linting
+### F-02 — MEDIUM (was HIGH) — Nothing runs automatically, and there are no unit tests
 
-Nothing runs automatically on commit or on push. Every quality gate in this
-repository is a command a human must remember to type.
+**Re-rated 2026-08-11.** The original title — "no automated tests, no CI, and no
+linting" — is two-thirds stale. Linting now exists and is load-bearing (F-03),
+and the verification harnesses have grown to 151 assertions. What has not
+changed, and is the whole of the remaining finding, is that **none of it runs by
+itself** and **not one unit test exists**.
 
-**Evidence:**
+Severity moves HIGH → MEDIUM because the original rating assumed an unguarded
+codebase. It is no longer unguarded: a regression in a public page, a public
+grant, the agent invariants, or a lint error is now caught by something. It does
+not drop to LOW because every one of those catches depends on a human choosing
+to run it, and the coverage has a shape — integration-wide, unit-zero — that
+leaves specific, named code untested by anything at all.
 
-```
-=== STEP 6: test frameworks / test files ===
-  (no test framework in package.json dependencies/devDependencies)
-  scripts block:
-{
-  "dev": "next dev",
-  "build": "next build",
-  "start": "next start",
-  "typecheck": "tsc --noEmit",
-  "validate:sql": "node scripts/validate-sql.mjs ..."
-}
-  test files found:
-  (end of list)
-  CI config:
-  (no .github/workflows directory)
-```
+#### What exists today
 
-`find . -name "*.test.*" -o -name "*.spec.*" -o -name "__tests__"` (excluding
-`node_modules`) returned **zero** results.
+`npm run lint` exists and **fails the production build** on any error, so it
+gates deploys rather than advising (see F-03). Three harnesses run green:
 
-What *does* exist is five hand-run verification scripts, none of which is a unit
-test and four of which require a live database plus a running server:
+| Harness | Assertions | Credentials | Target |
+|---|---|---|---|
+| `scripts/smoke.ts` | **86** | public (`NEXT_PUBLIC_*` only) | any URL, incl. production |
+| `scripts/verify-agents.mjs` | **40** | `SUPABASE_SERVICE_ROLE_KEY` + `SUPABASE_ACCESS_TOKEN` | server on `:3210` |
+| `scripts/verify-suggestions.mjs` | **25** | `SUPABASE_SERVICE_ROLE_KEY` | server on `:3210` |
 
-```
-scripts/audit-pages.mjs        scripts/verify-admin.mjs
-scripts/diagnose-rls.mjs       scripts/verify-agents.mjs
-scripts/validate-sql.mjs       scripts/verify-suggestions.mjs
-```
+**151 assertions**, all verified green on 2026-08-11 (smoke against both
+localhost and production).
 
-Only `validate-sql.mjs` and `contrast.mjs` run without credentials. There is no
-test of any React component, any query function, any Zod schema, or
-`lib/citations.ts`.
+A **fourth** harness, `scripts/verify-admin.mjs`, also exists (~20 `check()`
+sites; runtime count not measured). It is excluded from the 151 deliberately and
+the reason matters for the CI question below: its final step runs
+`POST /api/contradictions/scan` against real data and **inserts rows into the
+live database**. It is a hand-run pre-deploy tool, not something to fire
+casually — which is exactly why its count was not measured for this report.
+
+Alongside these: `validate-sql.mjs` (10 files), `contrast.mjs`, and the
+diagnostic `audit-pages.mjs` / `diagnose-rls.mjs`.
+
+#### What none of it covers: there are still zero unit tests
+
+Confirmed 2026-08-11 — no test framework in `dependencies` or `devDependencies`
+(no jest, vitest, mocha, playwright, cypress, testing-library), no `*.test.*` or
+`*.spec.*` file anywhere outside `node_modules`, and no `test` script.
+
+Everything is tested through HTTP against a live database or not at all. So:
+
+- **Every React component** — zero coverage of any kind. No render test, no
+  props test, no interaction test. The graph canvas, the forms, the markdown
+  editor: exercised only insofar as a page renders without throwing.
+- **Every query-layer function** — exercised indirectly through the pages and
+  API routes that call them, never directly. Branches that a public page does
+  not reach (admin filters, error paths, the `HAS_LIVE_SUPABASE === false`
+  fallback path) are untested.
+- **`lib/validations` Zod schemas** — *partially* covered indirectly, and it is
+  worth being precise rather than alarmist: the harnesses do assert real
+  rejections (`empty rationale → 422`, `hypothesis with no assumptions → 422`,
+  `research proposal without a critique → 422`, `out-of-band confidence
+  rejected`, `reject: requires a reason (422 without notes)`). What is missing
+  is direct coverage — boundary values, optional-field combinations, and every
+  schema no harness happens to POST through.
+- **`lib/citations.ts`** — likewise partial, not absent. Four integration
+  assertions exist (`a real DOI resolves to verified`, `a fabricated reference
+  is unresolved, not rejected`, plus route and readability checks). What has no
+  coverage is the internals those assertions pass *through*: DOI extraction
+  against malformed input, the token-overlap title score, and the threshold
+  boundaries that decide `verified` vs `unresolved`. A scoring change that broke
+  edge cases while leaving the two happy paths intact would ship green.
+- **`lib/utils.ts`, and `sanitizeHeadline` in particular — zero coverage, and
+  this is the sharpest instance.** It is the XSS guard: it escapes a Postgres
+  `ts_headline()` snippet, then deliberately re-enables `<b>`/`</b>` so the
+  search highlight survives (`lib/utils.ts:82-92`). That is security-relevant
+  string handling with a deliberate carve-out, rendered through
+  `dangerouslySetInnerHTML`. **No assertion anywhere touches it** — `smoke.ts`
+  requests `/search?q=consciousness` but asserts only that rows come back, never
+  that anything is escaped. A regression that let a `<script>` through would
+  pass all 151 assertions. `formatDate`, `slugify`, `truncate`, and
+  `stripMarkdown` are equally uncovered, with lower stakes.
+
+#### The real gap: nothing runs any of it automatically
+
+There is still no `.github/workflows` directory and no CI of any kind. Every
+gate is a command a human must remember to type, so the guarantee is not "this
+repository is verified" but "this repository is verifiable by someone who
+remembers all six commands and has the credentials for four of them".
+
+And that credential split is the reason CI is not a five-minute job: `smoke`
+runs on public credentials and could gate a PR today, but `verify-agents` and
+`verify-suggestions` need `SUPABASE_SERVICE_ROLE_KEY`, which CI would have to
+hold. See **§10** for what that would actually cost.
 
 ---
 
@@ -1236,3 +1287,117 @@ above, not run once and discarded. If the Management API changes shape, the
 query breaks, or the regexp stops matching, the self-test fails and tells us the
 canary has gone blind — rather than the canary passing because it can no longer
 see anything.
+
+---
+
+## 10. F-02 — what CI would look like, and what it would cost
+
+Proposal only; no workflow file has been written. The shape is dictated by one
+fact: **the harnesses split cleanly by credential, and the split does not favour
+putting everything in CI.**
+
+### 10.1 Tier 1 — no credentials at all, safe on any PR including forks
+
+`tsc --noEmit`, `npm run lint`, `npm run validate:sql`, `node scripts/contrast.mjs`,
+and `npm run build`.
+
+The build belongs here, which is not obvious: with **no** Supabase variables set
+it still succeeds — that is the credential-free path the placeholders exist for,
+re-verified during F-04. It compiles every route, runs ESLint (fatal since
+F-03), and typechecks, while rendering empty data. It cannot catch anything
+data-dependent, but it catches everything structural, and it needs no secret.
+
+This tier is free of risk, works on fork PRs where GitHub withholds secrets, and
+would catch the majority of what actually breaks.
+
+### 10.2 Tier 2 — `smoke` on PUBLIC values, which is better than it sounds
+
+`smoke.ts` reads only `BASE_URL`, `SMOKE_TIMEOUT_MS`,
+`NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` — verified after
+the F-07 canary was moved out precisely to keep this true. The anon key is
+public by design; it is shipped in the client bundle already. So these are not
+secrets at all and can be repo *variables* rather than repo *secrets*, which
+means they survive fork PRs.
+
+That makes a real PR gate possible: build with the two `NEXT_PUBLIC_*` values,
+`next start`, run `smoke` against `localhost`. All 86 assertions, against real
+data, on values that are already public. This is the highest-value CI step
+available and it costs nothing in exposure.
+
+Two caveats worth stating before anyone builds it:
+
+- **It reads the live production database.** Read-only, anon-scoped, RLS
+  enforced — but a PR gate would put steady read traffic on production.
+- **Smoke against a Vercel preview URL will not work.** Preview deployments sit
+  behind Vercel SSO (established while attempting the F-09 probe: every request
+  returns `302 → vercel.com/sso-api`). Gating on a preview would first require a
+  Protection Bypass for Automation token — which is itself a secret, moving this
+  into tier 3. Building and serving inside the runner avoids that entirely.
+
+### 10.3 Tier 3 — the privileged harnesses, which should NOT go in CI
+
+`verify-agents` (40, needs `SUPABASE_SERVICE_ROLE_KEY` + `SUPABASE_ACCESS_TOKEN`),
+`verify-suggestions` (25, service role), `verify-admin` (~20, service role).
+
+**Recommendation: keep all three as manual pre-deploy steps.** Not because
+automating them is hard, but because three separate properties make CI the wrong
+venue *today*:
+
+1. **The secret is the whole database.** `SUPABASE_SERVICE_ROLE_KEY` bypasses
+   RLS completely — it is unrestricted read/write on every table, and it is what
+   `verify-*` uses to create and delete auth users. Today it exists in one
+   developer's `.env.local`. Putting it in GitHub Actions secrets means it is
+   also readable by *any* workflow in the repository, by anyone who can merge a
+   workflow change, and by every third-party action in the dependency chain of
+   every job that references it. That is a material expansion of blast radius,
+   not a formality, and it is not undone by rotating later — the exposure window
+   is however long it sat there. `SUPABASE_ACCESS_TOKEN` is worse in kind: it is
+   a *platform* credential that can alter project configuration, not just data.
+2. **There is one database, and these tests mutate it.** No staging project, no
+   ephemeral instance. `verify-admin` goes furthest — its last step runs
+   `POST /api/contradictions/scan` and **inserts rows into live content** (which
+   is why its assertion count is left unmeasured in F-02 rather than obtained by
+   running it). CI would mean production data mutated on a schedule set by PR
+   traffic.
+3. **They are not concurrency-safe.** The harnesses provision identities from
+   fixed identifiers — `verify-agents` derives emails from a constant
+   `SLUG_PREFIX = "vagent-"`, and `verify-admin` uses a hardcoded
+   `veritas-verify-admin@example.com`, resetting the password when the user
+   already exists. Two PRs building at once would fight over the same rows and
+   the same auth users, and the loser's cleanup would delete the winner's
+   fixtures. Fixing that is a prerequisite to automation, independent of secrets.
+
+**The precondition for ever moving them into CI is not "add the secret" — it is
+"get a disposable database."** A Supabase branch or an ephemeral project per run
+would resolve (2) and (3) at once, and would make (1) tolerable because the key
+would grant access to a throwaway instance rather than production. Until that
+exists, these stay manual, and that is a reasoned position rather than an
+absence of one.
+
+### 10.4 The gap this leaves, named rather than glossed
+
+If tiers 1–2 go into CI and tier 3 stays manual, then **the F-07 canary only
+runs when a human runs `verify-agents`**. That canary exists specifically to
+notice a *silent* platform revert of migration 0009 — a regression with no
+symptom until someone adds a private table and finds it public. A watchdog that
+fires only when someone remembers to check is a weak watchdog, and it is the
+clearest argument for eventually automating *something* privileged.
+
+The cheapest resolution, if the disposable-database work is not imminent: run
+the canary alone on a **schedule** rather than per-PR, as a job holding only
+`SUPABASE_ACCESS_TOKEN` (not the service role, which it does not need). That is
+one read-only catalog query on a timer. It still expands where a platform token
+lives, so it is a trade rather than a free win — but it is a far smaller trade
+than putting the service role in CI, and it restores the canary's whole purpose.
+
+### 10.5 Honest cost summary
+
+| Tier | Secrets needed | Fork PRs | Risk added | Recommendation |
+|---|---|---|---|---|
+| 1 — typecheck/lint/build/sql/contrast | none | ✅ works | none | **Do it** |
+| 2 — smoke (86) | none (public *variables*) | ✅ works | read load on prod | **Do it** |
+| 3 — verify-agents / suggestions / admin | service role (+ platform token) | ❌ blocked | full-DB key in CI; live mutation; races | **Keep manual** |
+| Canary only, scheduled | platform token only | n/a | one token in CI | **Consider** |
+
+Runner cost is not the constraint: tiers 1–2 are a few minutes per PR. The
+constraint is entirely about which credentials leave the developer's machine.
