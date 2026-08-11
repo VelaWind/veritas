@@ -212,10 +212,18 @@ a disagreement is a hard failure. Negative control, with the poison restored:
 6 FAILURE(S) — 62 passed, 6 failed
 ```
 
-**Not yet mitigated.** See §8 for the Vercel exposure analysis and the proposed
-mitigations, which are deliberately not implemented yet. *(That sentence, and
-the RESOLVED status this section originally carried, were written about the two
-API routes. Both predate F-09b below and neither was revised to account for it.)*
+**Mitigation status — PARTIALLY RESOLVED, and that is the only status this
+finding has.** Everything above this line concerns the two `unstable_cache` API
+routes. On those, M1/M2 are implemented and hold (`71d50c7`), and the Vercel
+exposure analysis behind them is §8. On the ISR pages — same cache, different
+path — **nothing is implemented**. Scope and the observed instance: **F-09b**,
+immediately below.
+
+*(Superseded text: this paragraph replaced a standing "Not yet mitigated" line
+that predated M1/M2 and was never revised. Read together with the RESOLVED
+header this section carried until 2026-08-11, the finding asserted two
+contradictory statuses at once. It now has one, stated in three places: the
+finding header, F-09b, and §8.5.)*
 
 ---
 
@@ -1330,7 +1338,7 @@ including "page renders 76 nodes, API returns 0"). "Can no longer be created by
 a credential-free run" is proven; "can no longer exist" is not, and is not
 claimed — which is why §8.4's recovery lever matters.
 
-### 8.4 The recovery lever — verified reachable on production
+### 8.4 The recovery lever — verified reachable, for the tagged entries only
 
 Because question 3 means poison outlives a redeploy, on-demand revalidation is
 the primary remediation path, so it was exercised **before** any deliberate
@@ -1360,6 +1368,42 @@ revalidation propagates to all regions within 300ms"* — and would only be
 directly provable against poison that genuinely exists, which is the thing we
 declined to create.
 
+**Scope correction (2026-08-11): this lever reaches the tagged entries only.**
+`POST /api/revalidate {"tags":["graph","stats"]}` calls `revalidateTag`, and tags
+exist only on entries written by `unstable_cache` — **2** of the 212 entries in a
+freshly built cache (F-09b). The other **210**, written by the automatic fetch
+cache while ISR pages render, carry `tags: []`. `revalidateTag` cannot reach them
+at all, by construction rather than by accident. So what §8.4 verified is the
+remedy for the two API routes, **not a general remedy for F-09**, and the
+sentence in §8.5 calling it "the recovery lever for any entry that predates
+[M1/M2]" was overstated for the same reason.
+
+What would be needed for the other 210 — **none of it tested**:
+
+- **`revalidatePath(path)`.** `POST /api/revalidate` already accepts `paths`, and
+  `lib/revalidation.ts:36-38` already calls it for ISR pages on every admin
+  write. Next documents path revalidation as invalidating the cached data for
+  that route, which *should* include the fetch entries made while rendering it.
+  **UNVERIFIED.** Never exercised against a known-stale entry, and it inherits
+  §8.4's original objection: proving eviction requires poison that genuinely
+  exists, which is the thing we declined to create. Note also that no
+  `EntityKind` in `lib/revalidation.ts:17-25` maps to agents, so no write path
+  revalidates `/agents` at all.
+- **A full Data Cache purge** — the dashboard lever below, cache layer *Runtime
+  and Data Cache*. The only listed option that certainly clears untagged entries,
+  and the bluntest. **UNVERIFIED** on this project, and it carries the
+  cross-project hazard documented below.
+- **Discarding the build cache and redeploying.** Demonstrated to work *locally*:
+  deleting `.next/cache` and rebuilding is what fixed the stale `/agents` index
+  (F-09b). The Vercel equivalent is a redeploy with the build cache disabled.
+  **UNVERIFIED** on Vercel — and note this is the one lever §8's question 3
+  concluded a plain redeploy does *not* provide, since `.next/cache` is restored
+  by default.
+
+Until one of these is exercised against a real stale entry, the honest position
+is that F-09 has a **verified** recovery lever for 2 entries and an **unverified**
+one for 210.
+
 **Backup lever.** Dashboard purge: project → **CDN** → **Caches** → **Purge
 cache** → *All content* → cache layer *Runtime and Data Cache*. One hazard,
 documented by Vercel: *"On Hobby and Pro, your projects share a single cache, so
@@ -1381,19 +1425,33 @@ environment."* It is not scoped to this project on those plans.
   being stored by a credentialed production runtime — the vector that produced
   the original incident. Shipped in `71d50c7`. Neither guard is reachable from
   an ISR page, which caches its Supabase reads below the query layer (F-09b).
-- **Detection in place.** `scripts/smoke.ts` asserts page↔API agreement and
-  fails on an empty payload against a seeded database, so a recurrence cannot be
-  silent. Verified by negative control.
-- **Exposure bounded.** Preview→production is closed by Vercel's documented
-  environment isolation (§8.2); production→production is closed on the write
-  path by M1/M2, with `POST /api/revalidate` verified as the recovery lever for
-  any entry that predates them (§8.4).
+- **Detection in place, and it is what caught F-09b.** `scripts/smoke.ts` asserts
+  page↔API agreement and fails on an empty payload against a seeded database, so
+  a recurrence cannot be silent. Verified by negative control. The ISR instance
+  was caught the same way, by an assertion tightened from structural to real data
+  (`161d878`) — detection generalised to the ISR path even though the mitigations
+  did not.
+- **Exposure bounded on the API routes; not bounded on the ISR pages.**
+  Preview→production is closed by Vercel's documented environment isolation
+  (§8.2). Production→production is closed on the write path by M1/M2 **for the
+  two API routes only**. `POST /api/revalidate` is verified reachable, but it
+  recovers the 2 tagged entries only — `revalidateTag` cannot reach the 210
+  untagged ISR entries at all, and no lever that would has been tested (§8.4).
 
-**Resolved on documentation, with two limits recorded rather than smoothed
-over:** environment isolation is Vercel's documented behaviour and was
-deliberately not verified live (§8.2), and tag eviction was not directly
-observed (§8.4). Neither gap is load-bearing for the mitigations themselves,
-which hold regardless of how the platform partitions its caches.
+**One status, three places.** This finding is **PARTIALLY RESOLVED**: mitigated
+on the two `unstable_cache` API routes, unmitigated on the ISR pages. That is
+stated at the finding header, at the end of the F-09 evidence, and here — a
+reader landing at any of the three gets the same answer.
+
+**Limits recorded rather than smoothed over:** environment isolation is Vercel's
+documented behaviour and was deliberately not verified live (§8.2); tag eviction
+was not directly observed (§8.4); recovery for the 210 untagged entries is
+**UNVERIFIED** by every candidate lever (§8.4); and the precise trigger of the
+F-09b instance is unrecoverable, because `.next/cache` was deleted to confirm the
+diagnosis before the offending entry's age was captured. The first two are not
+load-bearing for M1/M2, which hold regardless of how the platform partitions its
+caches. The last two are load-bearing for F-09b, and nothing here should be read
+as a fix for it.
 
 ---
 

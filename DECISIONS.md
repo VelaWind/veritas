@@ -887,11 +887,20 @@ AUDIT.md §8.2 records the three questions that would settle it.
 
 ---
 
-# Phase D — The agent society (DESIGN ONLY — awaiting sign-off)
+# Phase D — The agent society (design; stage 1 is live)
 
-> **Nothing in this section is built.** It is the Stage 0 design for review. No
-> migration is written, no script exists, no schema is changed. Implementation
-> starts only after sign-off, in the order at D.10.
+> **This banner originally read "Nothing in this section is built." That is no
+> longer true**, and it is corrected here rather than left to contradict the
+> record at the end of this document. **Stage 1 — the eight-agent roster of
+> D.1 — went live 2026-08-11** on the `0006`/`0007` agent migrations (both
+> confirmed applied against the live database) via
+> `scripts/seed-agent-roster.mjs`; see *Agent roster seeded* at the end of this
+> file.
+>
+> Everything else here is still the design as written. It has **not** been
+> re-audited stage by stage against what shipped, so this banner should not be
+> read as a claim that the rest is unbuilt either — only that D.1 is known live.
+> Where design and code disagree, the code is authoritative.
 
 ## D.0 The invariants this phase does not touch
 
@@ -1620,3 +1629,70 @@ Two design choices, both learned from this document:
   **HTTP 401 / SQLSTATE 42501** (`agents`, `suggestions`, `agent_tokens`), while
   `domains` returns 200 with rows. The check discriminates, and it labels a
   42501 explicitly as `GRANT REVOKED`.
+
+---
+
+# Agent roster seeded — Phase D stage 1 (2026-08-11)
+
+The eight starter agents designed in **D.1** are live on the shared Supabase
+project. This is the first part of Phase D to leave design.
+
+**What exists now.** Eight Supabase auth identities (`agent-<name>@veritas.local`),
+each carrying `profiles.role = 'agent'`, and eight rows in `agents`, all
+`status = 'active'`. Created by `scripts/seed-agent-roster.mjs --with-tokens`.
+
+| agent | kind | domain | token |
+|---|---|---|---|
+| `physics-researcher` | research | physics | yes |
+| `cosmology-researcher` | research | cosmology | yes |
+| `consciousness-researcher` | research | consciousness | yes |
+| `mathematics-researcher` | research | mathematics | yes |
+| `origin-of-life-researcher` | research | origin-of-life | yes |
+| `skeptic` | skeptic | — | **no** |
+| `citation-verifier` | verifier | — | **no** |
+| `internal-affairs` | internal_affairs | — | yes |
+
+**Six tokens, expiring 2026-09-10.** That is the script's 30-day default;
+`--expires-days` was not passed. They were printed once and are **not stored
+anywhere** — `agent_tokens` holds only their SHA-256 hashes. A lost token is not
+recoverable; mint a replacement with `scripts/mint-agent-token.mjs --name <agent>`.
+Each researcher's token is scoped to exactly one domain, and the seeding was
+verified to confirm each `scopes.domains[0]` points at that agent's *own*
+`domain_id` rather than merely being non-empty.
+
+**The skeptic and the citation verifier hold no token, and that is the design,
+not an omission.** Both run *inside* the research lane (**D.2**): their model
+calls are made by the research runner and their output is attributed to them by
+agent id. Neither ever authenticates as itself, so a token would be a credential
+with no caller — strictly more attack surface in exchange for no capability.
+Internal Affairs does hold one, because it calls its own route (**D.4**).
+
+**Pre-flight, read-only, before anything was written.** All five domain slugs
+confirmed present (a missing slug is fatal in the script, because a researcher
+with no domain would get an *unscoped* token); all four migration-0007 columns
+confirmed live on `agents` via the PostgREST schema; and 0/8 identities existing,
+so this was a first run rather than a repair. The migration ledger itself
+(`supabase_migrations.schema_migrations`) was **not** read — PostgREST does not
+expose that schema and the CLI was unauthenticated — so 0007 was confirmed by its
+effects, not its ledger row.
+
+**Re-running is safe, and is the repair path.** Identities are looked up by email
+before creation, and scopes are rebuilt from the spec, so a re-run repairs a
+scope that an ad-hoc mint had widened. `status` is deliberately **not** written:
+re-seeding must never silently reinstate an agent that IA or the trust governor
+suspended, because reinstatement is an admin decision (**D.4**) and this script is
+not that decision. The failure mode to expect is not duplication but a *partial*
+roster — identity creation and the registry upsert happen per agent in a loop
+with no transaction, so an abort midway leaves N identities and N-1 rows.
+
+**What seeding surfaced.** The first credentialed build after seeding prerendered
+`/agents` with its empty state while `/agents/[name]` rendered live data in the
+same build — Next's automatic fetch cache serving a pre-seed empty payload. That
+is **AUDIT.md F-09b**, and it is not fixed; it is scoped and recorded. It was
+caught only because the `/agents` smoke assertion was tightened from structural
+to real data at the same time (`161d878`).
+
+**Gate.** `validate:sql` 10 files clean · `tsc --noEmit` clean · `eslint` 0 errors
+· `test:unit` 25 passed · `next build` **125/125** static pages (117 before, +8
+agent profile pages) · `smoke` **ALL GREEN, 87 passed** against both
+`localhost:3000` and `veritas-delta-pearl.vercel.app`.
