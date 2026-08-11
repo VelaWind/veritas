@@ -26,8 +26,14 @@ export const HAS_LIVE_SUPABASE =
  * NODE_ENV=production, including the credential-free local build that this
  * file's placeholders exist to support; NEXT_PHASE lets us exempt it while
  * still catching a self-hosted `next start` running on placeholders.
+ *
+ * EXPORTED so other build-time guards reuse this exact definition rather than
+ * re-deriving it. A second, subtly different copy of this logic is how one
+ * guard ends up firing on preview builds or staying silent on production ones;
+ * `lib/utils.ts` imports this for the NEXT_PUBLIC_SITE_URL guard (AUDIT.md
+ * F-04). If the rules below change, they change for every guard at once.
  */
-const IS_PRODUCTION =
+export const IS_PRODUCTION =
   process.env.VERCEL_ENV === "production" ||
   (!process.env.VERCEL &&
     process.env.NODE_ENV === "production" &&

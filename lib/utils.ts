@@ -1,5 +1,6 @@
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
+import { IS_PRODUCTION } from "@/lib/supabase/env";
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -68,8 +69,72 @@ export function stripMarkdown(text: string): string {
     .trim();
 }
 
-export const SITE_URL =
-  process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000";
+/**
+ * Canonical site URL. Feeds `sitemap.xml`, `robots.txt`, `metadataBase`, and
+ * per-hypothesis OpenGraph URLs — all of which are baked at build time.
+ *
+ * `.trim()` and `||` rather than `??`: an env var set to an empty string is
+ * "present" as far as `??` is concerned, so the old form let `""` through and
+ * `new URL("")` then threw somewhere far less legible than here.
+ */
+const RAW_SITE_URL = process.env.NEXT_PUBLIC_SITE_URL?.trim();
+
+export const SITE_URL = RAW_SITE_URL || "http://localhost:3000";
+
+/** Unset, blank, or still pointing at a dev host. */
+const SITE_URL_IS_NOT_PRODUCTION =
+  !RAW_SITE_URL || /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/i.test(RAW_SITE_URL);
+
+/**
+ * Refuse to build production with a localhost canonical URL (AUDIT.md F-04).
+ *
+ * Same shape, and the same production test, as the credential guard in
+ * `lib/supabase/env.ts` — `IS_PRODUCTION` is imported from there rather than
+ * re-derived, so the two guards can never disagree about what "production"
+ * means. That matters more than it looks: `VERCEL_ENV` is the only honest
+ * signal on Vercel, and `NEXT_PHASE` is what exempts the credential-free local
+ * build. A hand-rolled second copy would drift.
+ *
+ * Why this needs a guard at all: unlike a bad database URL, this one is
+ * completely silent. Every page still renders, every query still works, the
+ * build succeeds — and `sitemap.xml`, `robots.txt` and every OG tag ship
+ * pointing at `http://localhost:3000`. Search engines and social unfurlers are
+ * the only things that notice, and they do not report back. It is the same
+ * failure shape as the outage that produced the guard below: a wrong value
+ * producing a plausible-looking success.
+ *
+ * These values are inlined at build time, so a wrong one cannot be corrected at
+ * runtime — only a rebuild fixes it. Failing the build is the only place this
+ * can be caught.
+ *
+ * Server-only, for the same reason as the credential guard: this module is
+ * imported by client components (`cn` is used almost everywhere), and an
+ * unguarded module-load throw would fire in a visitor's browser instead of in
+ * the build.
+ */
+if (typeof window === "undefined" && IS_PRODUCTION && SITE_URL_IS_NOT_PRODUCTION) {
+  throw new Error(
+    [
+      "Refusing to build production with a non-production NEXT_PUBLIC_SITE_URL.",
+      "",
+      RAW_SITE_URL
+        ? `NEXT_PUBLIC_SITE_URL is "${RAW_SITE_URL}", which is a local dev host.`
+        : 'NEXT_PUBLIC_SITE_URL is unset or empty, so it fell back to the\ndevelopment default "http://localhost:3000".',
+      "",
+      "This value is baked into sitemap.xml, robots.txt, metadataBase and every",
+      "OpenGraph URL at build time. Shipping it would publish a sitemap full of",
+      "localhost links and OG tags that unfurl to nothing — silently, because",
+      "the site itself renders perfectly and nothing logs an error.",
+      "",
+      "Set NEXT_PUBLIC_SITE_URL to the canonical origin for this deployment",
+      "(e.g. https://veritas-delta-pearl.vercel.app) and rebuild. NEXT_PUBLIC_*",
+      "values are inlined at build time, so this cannot be corrected at runtime.",
+      "",
+      "Local development and preview builds are unaffected — this check applies",
+      "only to production.",
+    ].join("\n"),
+  );
+}
 
 /**
  * Sanitize a Postgres ts_headline() snippet for safe rendering. ts_headline
