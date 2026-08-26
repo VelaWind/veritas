@@ -1560,7 +1560,18 @@ would catch the majority of what actually breaks.
 the F-07 canary was moved out precisely to keep this true. The anon key is
 public by design; it is shipped in the client bundle already. So these are not
 secrets at all and can be repo *variables* rather than repo *secrets*, which
-means they survive fork PRs.
+keeps them out of the secret store entirely.
+
+**Correction (2026-08-27).** An earlier version of this paragraph claimed that
+being variables rather than secrets means they *survive fork PRs*. That is
+false, and it is now confirmed false from GitHub's own Actions settings page,
+Variables tab: "They are not passed to workflows that are triggered by a pull
+request from a fork." Variables are withheld from fork-triggered runs exactly
+as secrets are. The consequence is recorded in `.github/workflows/ci.yml`: on a
+fork PR, tier 1 runs normally and tier 2 fails at its required-variables guard
+with all three values empty. That is the safe direction — a loud failure rather
+than a green run on placeholder values — but it means tier 2 is a gate for
+branches in this repository, not for fork contributions.
 
 That makes a real PR gate possible: build with the two `NEXT_PUBLIC_*` values,
 `next start`, run `smoke` against `localhost`. All 86 assertions, against real

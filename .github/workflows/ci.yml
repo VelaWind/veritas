@@ -1,0 +1,255 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CI — AUDIT.md §10, tiers 1 and 2 only.
+#
+# Tier 1 (`checks`)  — no credentials of any kind. Safe on fork PRs.
+# Tier 2 (`smoke`)   — builds and serves the app inside the runner, then runs
+#                      scripts/smoke.ts against localhost. It uses the two
+#                      NEXT_PUBLIC_* Supabase values, which are **not secrets**:
+#                      they are inlined into the client bundle on every deploy
+#                      and are already public. They are therefore repository
+#                      VARIABLES (`vars.*`), never secrets.
+#
+# ON FORK PRs — CONFIRMED, NO LONGER AN ASSUMPTION. GitHub does **not** pass
+# repository variables to a workflow triggered by a pull request from a fork.
+# The Actions settings page says it verbatim on the Variables tab: "They are
+# not passed to workflows that are triggered by a pull request from a fork."
+# Variables are withheld exactly like secrets; `vars.*` buys tier 2 nothing on
+# a fork. (An earlier reading of AUDIT.md §10.2 said the opposite — that
+# variables "survive fork PRs". That sentence was wrong and has been corrected.)
+#
+# What that means in practice: on a fork PR, tier 1 runs and passes as usual,
+# and tier 2 fails at the "Require the public Supabase variables" step with all
+# three values empty. That is the SAFE direction and it is deliberate. The
+# alternative — letting the job continue on placeholders — is a green run that
+# verified nothing while every page rendered its empty state, which is the exact
+# failure shape this repository exists to not repeat. So: a red X on a fork PR
+# means "the data-dependent gate could not run here", not "the PR is broken".
+# Read the run, then verify the branch locally or from a maintainer-owned
+# branch. Do not relax the guard to make forks green.
+#
+# TIER 3 IS DELIBERATELY ABSENT. `verify-agents`, `verify-suggestions` and
+# `verify-admin` need SUPABASE_SERVICE_ROLE_KEY / SUPABASE_ACCESS_TOKEN. Those
+# must NOT enter this repository in any form — see AUDIT.md §10.3 for the three
+# reasons (the key is the whole database; there is one database and these tests
+# mutate it; they are not concurrency-safe). The precondition for automating
+# them is a disposable database, not a secret.
+#
+# NOTHING IN THIS FILE MAY REFERENCE `secrets.*` EXCEPT THE IMPLICIT
+# GITHUB_TOKEN. If a future edit needs a secret, it belongs in tier 3, which
+# means it does not belong here.
+#
+# Note on what tier 2 reads: smoke asserts against the LIVE PRODUCTION database,
+# read-only and anon-scoped under RLS (§10.2). `needs: checks` and
+# `cancel-in-progress` below exist to keep that read traffic proportionate.
+# ─────────────────────────────────────────────────────────────────────────────
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per ref. A superseded push cancels its predecessor, which matters
+# here because tier 2 puts read traffic on the production database.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # smoke.ts needs native TypeScript type stripping (Node 22.18+ / 24), so it
+  # runs with no ts-node, no tsx, and no added dependency. Pinned to the major
+  # the gate is actually run on locally.
+  NODE_VERSION: "24"
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # TIER 1 — zero secrets, zero variables. Runs on any PR including forks.
+  # ───────────────────────────────────────────────────────────────────────────
+  checks:
+    name: Tier 1 — static checks + credential-free build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck (tsc --noEmit)
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm run test:unit
+
+      - name: Validate SQL
+        run: npm run validate:sql
+
+      # scripts/contrast.mjs prints its verdict but ALWAYS exits 0 — it counts
+      # warnings and never sets an exit code. Left as a bare step it would be a
+      # check that cannot fail, which this repository treats as worth nothing
+      # (smoke.ts: "a check that cannot fail is worth nothing"). The grep below
+      # is the actual gate. The script is intentionally not modified here.
+      - name: Contrast audit (WCAG AA)
+        run: |
+          set -o pipefail
+          node scripts/contrast.mjs | tee contrast.out
+          if grep -q "below threshold" contrast.out; then
+            echo "::error::contrast.mjs reported colours below the WCAG AA threshold"
+            exit 1
+          fi
+
+      # No Supabase variables are set for this step, deliberately. The build
+      # must succeed with none: lib/supabase/env.ts falls back to placeholder
+      # values, and NEXT_PHASE=phase-production-build exempts the production
+      # guards. It compiles every route, lints (fatal since F-03) and
+      # typechecks while rendering empty data — so it catches everything
+      # structural and nothing data-dependent. Verified locally: exit 0, 39
+      # static pages instead of 125 (generateStaticParams returns [] with no
+      # data), which is the expected credential-free shape.
+      - name: Build (credential-free)
+        run: npm run build
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # TIER 2 — public values only, as repository VARIABLES. Builds, serves, smokes.
+  # ───────────────────────────────────────────────────────────────────────────
+  smoke:
+    name: Tier 2 — build, serve, smoke (87 checks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Tier 1 is the cheap filter. Gating on it keeps a structurally broken PR
+    # from putting read traffic on the production database.
+    needs: checks
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # A missing variable must FAIL, not silently degrade. Without this, an
+      # unset NEXT_PUBLIC_SUPABASE_URL would fall through to the placeholder
+      # host, every query would fail at DNS, every page would render its empty
+      # state — and the run would report green having verified nothing. That is
+      # the exact shape of the two-month outage this repository exists to not
+      # repeat, and the same rule smoke.ts applies to its own credentials.
+      #
+      # This step is also where a FORK PR stops — see the fork note in the file
+      # header. GitHub withholds repository variables from fork-triggered runs
+      # (confirmed on the Actions → Variables settings page), so all three
+      # arrive empty and this fails by design. Do not soften it into a skip.
+      - name: Require the public Supabase variables
+        env:
+          SUPABASE_URL: ${{ vars.NEXT_PUBLIC_SUPABASE_URL }}
+          ANON_KEY: ${{ vars.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          SITE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL }}
+        run: |
+          missing=""
+          if [ -z "$SUPABASE_URL" ]; then missing="$missing NEXT_PUBLIC_SUPABASE_URL"; fi
+          if [ -z "$ANON_KEY" ];     then missing="$missing NEXT_PUBLIC_SUPABASE_ANON_KEY"; fi
+          if [ -z "$SITE_URL" ];     then missing="$missing NEXT_PUBLIC_SITE_URL"; fi
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository variable(s):$missing"
+            echo "Set them at Settings → Secrets and variables → Actions → Variables tab."
+            echo "These are VARIABLES, not secrets: all three are inlined into the"
+            echo "client bundle on every deploy and are already public."
+            echo "If this is a pull request from a FORK, that is expected: GitHub does"
+            echo "not pass repository variables to fork-triggered runs. Tier 1 still"
+            echo "covers the structural checks; tier 2 must be run from a branch in"
+            echo "this repository. See the fork note in .github/workflows/ci.yml."
+            exit 1
+          fi
+          if printf '%s' "$SUPABASE_URL" | grep -q "placeholder"; then
+            echo "::error::NEXT_PUBLIC_SUPABASE_URL is the placeholder host — the smoke would verify nothing."
+            exit 1
+          fi
+          echo "All three public variables are present."
+
+      # NEXT_PUBLIC_SITE_URL is required here and is NOT optional, which is not
+      # obvious. It is inlined at build time, and at `next start` the F-04 guard
+      # in lib/utils.ts is armed (NODE_ENV=production, no VERCEL, NEXT_PHASE
+      # unset ⇒ IS_PRODUCTION true). With it unset or pointing at localhost,
+      # every DYNAMICALLY rendered route throws at request time. Measured
+      # locally with a localhost value baked in: /agents 200 (prerendered, served
+      # from disk) but /hypotheses, /evidence, /timeline, /search and /graph all
+      # 500, and smoke fails. Prerendered pages hide the problem; the dynamic
+      # ones do not.
+      - name: Build
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ vars.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ vars.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          NEXT_PUBLIC_SITE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL }}
+        run: npm run build
+
+      - name: Start the production server
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ vars.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ vars.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          NEXT_PUBLIC_SITE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL }}
+        run: |
+          npm start > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 60); do
+            if curl -sf -o /dev/null http://localhost:3000/agents; then
+              echo "Server ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Server did not become ready within 60s"
+          cat server.log
+          exit 1
+
+      # smoke.ts reads BASE_URL, SMOKE_TIMEOUT_MS, and the two NEXT_PUBLIC_*
+      # values — the last two for the F-07 anon-GRANT assertions, which query
+      # PostgREST directly. There is no .env.local in CI, and smoke treats
+      # missing credentials as a FAILURE rather than a skip, so they must be
+      # passed explicitly here.
+      - name: Smoke against localhost
+        env:
+          BASE_URL: http://localhost:3000
+          SMOKE_TIMEOUT_MS: "45000"
+          NEXT_PUBLIC_SUPABASE_URL: ${{ vars.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ vars.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+        run: |
+          set -o pipefail
+          npm run smoke 2>&1 | tee smoke.out
+
+      # Ratchet, not a pin. `npm run smoke` already fails the job on any failed
+      # assertion; this catches the other direction — a green run that quietly
+      # checks FEWER things than it used to, e.g. an assertion deleted or a
+      # route spec dropped. Raise the floor when assertions are added.
+      - name: Assert the assertion count has not regressed
+        run: |
+          passed=$(grep -oE '([0-9]+) passed' smoke.out | tail -1 | grep -oE '[0-9]+')
+          echo "smoke reported ${passed:-0} passing assertions (floor: 87)"
+          if [ -z "$passed" ] || [ "$passed" -lt 87 ]; then
+            echo "::error::smoke ran ${passed:-0} assertions, expected at least 87 — did a check get dropped?"
+            exit 1
+          fi
+
+      - name: Server log (on failure)
+        if: failure()
+        run: cat server.log || true
+
+      - name: Stop the server
+        if: always()
+        run: |
+          if [ -f server.pid ]; then kill "$(cat server.pid)" 2>/dev/null || true; fi
