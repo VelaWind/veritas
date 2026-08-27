@@ -524,3 +524,61 @@ export interface ApiEnvelope<T> {
   data: T | null;
   error: string | null;
 }
+
+// ─── Council (§D.3, migration 0010) ──────────────────────────────────────────
+// Both tables are PUBLIC: the transcript is the transparency artifact of Phase
+// D. The queue stays private — what an agent argued is public record, what it
+// has proposed and not yet had accepted is not.
+
+export type CouncilRole = "advocate" | "skeptic" | "verifier" | "synthesizer";
+
+/** No "majority wins" path. A split is a result, not a failure to decide. */
+export type CouncilOutcome = "consensus" | "split" | "no_verdict";
+
+export type CouncilStatus = "running" | "complete" | "aborted";
+
+export interface Council {
+  id: string;
+  /** Constrained to hypothesis | question by a CHECK; carries no FK (polymorphic). */
+  subject_type: "hypothesis" | "question";
+  subject_id: string;
+  subject_slug: string;
+  subject_title: string;
+  status: CouncilStatus;
+  rounds_run: number;
+  outcome: CouncilOutcome | null;
+  /** Each role's final position, in that role's own voice. */
+  vote: Partial<Record<CouncilRole, string>> | null;
+  verdict: string;
+  /** Null until the verdict is wired to the propose route — see DECISIONS §D.3. */
+  suggestion_id: string | null;
+  model: string;
+  /** Non-empty whenever status is 'aborted' (enforced by a CHECK). */
+  abort_reason: string;
+  started_at: string;
+  completed_at: string | null;
+}
+
+export interface CouncilTurn {
+  id: string;
+  council_id: string;
+  round: number;
+  seq: number;
+  role: CouncilRole;
+  agent_id: string | null;
+  agent_name: string;
+  content: string;
+  /** Stored apart from content because the next round's prompt is built from it. */
+  reasoning: string;
+  /**
+   * True when this turn argued from a transcript the context budget had already
+   * trimmed. Without it, a late turn that never saw the opening arguments is
+   * indistinguishable from one that did.
+   */
+  context_truncated: boolean;
+  created_at: string;
+}
+
+export interface CouncilWithTurns extends Council {
+  turns: CouncilTurn[];
+}

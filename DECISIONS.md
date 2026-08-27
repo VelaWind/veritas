@@ -1884,3 +1884,153 @@ it is provisioned, and it was invisible when the plan only said "token".
 has not. Provisioning is `node scripts/seed-agent-roster.mjs --with-tokens`,
 which needs `SUPABASE_SERVICE_ROLE_KEY` and creates one new auth user. Tokens
 print once and are not recoverable.
+
+---
+
+# Council runner and transcript page — Phase D stage 3 (2026-08-28)
+
+`scripts/run-council.mjs` and `/council/[id]` are built. Four roles argue a claim
+over N rounds and every turn is written to `council_turns` as it happens; the
+transcript renders publicly.
+
+**Stopped deliberately short of the queue.** The verdict is written to
+`councils.verdict` / `.outcome` / `.vote` and goes no further.
+`councils.suggestion_id` stays null, no council needs the `council` identity or a
+token, and nothing this stage produces can reach `suggestions`. Wiring the
+verdict to the propose route is the next step, held back so the transcript was
+working before anything reached the queue.
+
+## The context budget, proven rather than asserted
+
+`scripts/agent-lib/council.mjs` holds `buildTranscriptContext(turns, budget)` as
+a **pure function**, separate from the runner, because a budget that lives
+inside a loop is a budget nobody tests.
+
+- Per-turn output is capped at 400 tokens (`--max-turn-tokens`).
+- Prior turns are selected **newest-first** until the budget is reached: when it
+  binds, what survives is what the turn is actually answering.
+- Selected turns are then rendered **chronologically** — a debate read backwards
+  is not a debate.
+- `[earlier turns truncated]` goes into the prompt, and `context_truncated` is
+  written on any turn that argued from a trimmed transcript.
+
+**A budget with a floor of one turn.** The newest turn is always included, even
+when it alone exceeds the budget. A turn that cannot see the argument
+immediately before it is not participating in a council, and an empty transcript
+would be a worse failure than overshooting a soft cap. Stated here because it
+means the budget is a target, not a hard ceiling.
+
+**Direct exercise of the function**, four turns of ~400 estimated tokens each:
+
+```
+budget=100000 -> included=4 omitted=0 truncated=false  marker=false
+budget=   900 -> included=2 omitted=2 truncated=true   marker=true
+budget=   450 -> included=1 omitted=3 truncated=true   marker=true
+budget=     0 -> included=1 omitted=3 truncated=true   marker=true   (floor)
+render order: advocate -> skeptic -> verifier -> synthesizer
+kept under tight budget: verifier, synthesizer            (newest-first)
+```
+
+**And a real council run at `--context-budget 200`, so truncation had to occur:**
+
+```
+r1 advocate      306 tok out · context 0/0 turns
+r1 skeptic       292 tok out · context 1/1 turns
+r1 verifier      242 tok out · context 1/2 turns  ⟨TRUNCATED, 1 dropped⟩
+r1 synthesizer   220 tok out · context 1/3 turns  ⟨TRUNCATED, 2 dropped⟩
+r2 advocate      247 tok out · context 1/4 turns  ⟨TRUNCATED, 3 dropped⟩
+…
+r2 synthesizer   241 tok out · context 1/7 turns  ⟨TRUNCATED, 6 dropped⟩
+```
+
+Read back from `council_turns` **as anon**, `context_truncated` was `false` on
+the first two turns and `true` on the remaining six — false where nothing was
+dropped, true where something was. The same council at the default 6000-token
+budget used ~2120 tokens across 8 turns and truncated **nothing**, which is the
+contrast that makes the flag meaningful rather than decorative.
+
+## Abort is a state, and it was made to happen
+
+The `councils_abort_has_reason` CHECK refuses an `aborted` row with an empty
+reason, so every give-up path has to say why. Proven by forcing a failure after
+the council row was already open (`VERITAS_LLM_MODEL=no-such-model-exists`):
+
+```
+8a43e76d  time-is-emergent  aborted  outcome=null  rounds=0
+          reason="LLM HTTP 404: model 'no-such-model-exists' not found"
+```
+
+`SIGINT`/`SIGTERM` take the same path. **What this cannot cover, and does not
+pretend to:** a hard kill (SIGKILL, power loss) runs no code at all, so a stale
+`running` council is a real possibility. The CHECK constrains what a runner
+*writes*; it cannot constrain a runner that never gets to write.
+
+Running out of model budget is deliberately **not** an abort. §D.3 lists "ran
+out of rounds or budget" as `no_verdict` on a **complete** council: the rounds
+that ran are real, and recording them as an error would misdescribe them.
+
+## Trust boundary — wider than the research runner, and why
+
+`councils` and `council_turns` are admin-write under RLS, so the runner writes
+with the **service role**, the same boundary as `seed-agent-roster.mjs`. The read
+half is deliberately *not* service-role: grounding material is read with the
+**anon** key, so a council argues from exactly what a visitor can see and a draft
+hypothesis cannot leak into a public transcript. When the verdict is wired to the
+queue it must go through the propose **route** with the scoped `council` token —
+the part that touches `suggestions` gets least privilege, not this.
+
+## The page
+
+`/council/[id]` — public, ISR, no auth. Subject, outcome badge, verdict, each
+role's final position, then the transcript by round with both `content` and the
+`reasoning` passed forward (in a disclosure, since it is the working, not the
+argument). Where `context_truncated` is true the turn carries a visible
+`[earlier turns truncated]` marker: a reader comparing rounds needs to know a
+turn did not see every earlier argument before reading it as a reply to them.
+
+`split` is styled `--signal-mid`, not `--signal-weak`. A council that ended apart
+produced a real result, and colouring it as an error would teach the reader the
+opposite of what this phase is for. `no_verdict` is grey for the same reason
+`unknown` is grey elsewhere: not knowing is not being wrong.
+
+One markup detail worth keeping: the round heading is `{\`Round ${round}\`}`, not
+`Round {round}`. JSX splits the latter into two text nodes and emits
+`Round <!-- -->1`, so the page would not literally contain "Round 1" for a reader
+searching it — or for a smoke assertion. That is how it was caught.
+
+## What is on the live site, and what was removed
+
+**Kept:** one genuine council — `dark-matter-is-modified-gravity`, 2 rounds,
+8 turns, outcome `split`, 0 truncated.
+
+**Deleted after they had served their purpose:** the `--context-budget 200`
+council and the forced-abort council. Both were verified to render correctly
+first (the tiny-budget one showed the truncation marker on all six affected
+turns; the aborted one showed its Aborted section and reason). They were then
+removed because a deliberately crippled budget and a deliberately broken model
+config are test artifacts, not deliberations, and leaving them public would
+misrepresent what the site contains. Deleting the councils cascaded their turns
+away, as designed: `council_turns` went from 24 rows to 8.
+
+The consequence, stated rather than hidden: **no public council currently
+exercises the truncation marker**, because the default budget does not bind at
+this transcript length. The marker is covered by the direct function exercise and
+by the render check above, not by a standing assertion.
+
+## Gate
+
+`smoke` is **87 → 93**: `councils` and `council_turns` join the F-07 keep-public
+list (they are the first public tables created after 0009, so they are where a
+forgotten explicit GRANT would surface first), plus four assertions on
+`/council/[id]`. That page's id is a runtime uuid, so unlike every other page
+spec it **discovers** its target — it asks the public API for the newest complete
+council and renders that, making it a real-data assertion twice over. A missing
+council fails rather than skips, by the same rule as the F-07 credential check.
+
+`validate:sql` 11 files clean · `tsc --noEmit` clean · `eslint` 0 errors ·
+`test:unit` 25 passed · `next build` **126/126** (125 before, +1 council page) ·
+`smoke` **93 passed**.
+
+**Not covered by a repeatable test:** the budget function is proven by a one-off
+probe, not by a unit test in `test:unit`. `buildTranscriptContext` is pure and
+would be cheap to cover there; it is not done here.

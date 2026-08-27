@@ -35,7 +35,8 @@ kept proposing. The check now asserts both halves of the new contract.
 
 ### Where stage 3 stands
 
-**The schema is live. The runner is not.**
+**Schema, runner, and transcript page are live. The verdict does not reach the
+queue yet, and that is the deliberate stop-point.**
 
 `0010_council.sql` was applied 2026-08-27 — `councils` and `council_turns`, both
 public, plus the enums, the anon grants, and a trigger that enforces the
@@ -43,18 +44,35 @@ deviation-4 shape in Postgres. (It is **0010**, not the `0009_council.sql` this
 section used to name: 0009 went to the F-07 default-privileges fix, so IA becomes
 0011. DECISIONS §D.6 is corrected.)
 
-Still to build: `run-council.mjs` driving advocate → skeptic → verifier →
-synthesizer with reasoning shared between rounds, `/council/[id]` transcripts,
-and the verdict landing as an ordinary pending suggestion. Two decisions already
-made and worth not re-litigating: a council convened on a **question** proposes
-against that question's most contested hypothesis (the B.9 deviation-4 shape, so
-`apply_suggestion()` stays untouched — now enforced by
+`scripts/run-council.mjs` drives advocate → skeptic → verifier → synthesizer over
+`--rounds N` (default 2), writing each turn as it happens, and `/council/[id]`
+renders the transcript publicly. One genuine council is live:
+`dark-matter-is-modified-gravity`, 2 rounds, 8 turns, outcome `split`.
+
+**The verdict stops at `councils.verdict`.** `suggestion_id` stays null, no
+council needs the `council` identity or a token, and nothing this stage produces
+can reach `suggestions`. Wiring it to the propose route is the next step.
+
+**The context budget is proven, not asserted.** `buildTranscriptContext` is a
+pure function in `scripts/agent-lib/council.mjs`, exercised directly and then run
+for real at `--context-budget 200` so truncation had to occur:
+`context_truncated` came back `false` on the two turns where nothing was dropped
+and `true` on the other six, while the same council at the default 6000-token
+budget truncated nothing. Note it is a budget with a **floor of one turn** — the
+newest turn is always included even if it alone exceeds the budget, because a
+turn that cannot see the argument before it is not in a debate.
+
+**Abort was made to happen, not assumed.** Forcing a model failure after the
+council row was open produced `status='aborted'` with a non-empty
+`abort_reason`, as the CHECK requires. What it cannot cover: a hard kill runs no
+code, so a stale `running` council remains possible. Running out of model budget
+is deliberately `no_verdict` on a **complete** council, not an abort.
+
+Two decisions already made and worth not re-litigating: a council convened on a
+**question** proposes against that question's most contested hypothesis (the B.9
+deviation-4 shape, so `apply_suggestion()` stays untouched — now enforced by
 `trg_councils_verdict_shape`, not by convention), and the transcript passed
-between rounds is **budgeted** — per-turn output capped, prior turns included
-newest-first with an explicit truncation marker — because 4 roles × 3 rounds
-silently overflows a 32k local context and the failure looks like reasoning.
-`council_turns.context_truncated` records when a turn argued from a truncated
-transcript, so that budget is auditable rather than invisible.
+between rounds is budgeted, as above.
 
 **The schema is now covered by tests; the runner's promises are not.**
 `verify-agents` is **43/43**, having gained the three D.9 assertions that do not
@@ -66,10 +84,23 @@ hypothesis-targeted link as well as rejecting an evidence-targeted one, because
 a check that only asserts the rejection would pass just as well against a
 trigger that rejected everything.
 
-**What is still unasserted:** D.9 #5 — that a council verdict lands as `pending`
-only, credited to `council`, changing no hypothesis row. That one needs the
-runner, and cannot be written before it. `smoke` stays 87/87 and asserts nothing
-about councils, correctly: there is no `/council/[id]` page yet.
+`smoke` is **87 → 93**: `councils` and `council_turns` join the F-07 keep-public
+list, plus four assertions on `/council/[id]`. That page's id is a runtime uuid,
+so unlike every other page spec it **discovers** its target — it asks the public
+API for the newest complete council and renders that. A missing council fails
+rather than skips.
+
+**What is still unasserted:**
+
+- **D.9 #5** — that a council verdict lands as `pending` only, credited to
+  `council`, changing no hypothesis row. It needs the verdict wired to the queue,
+  which is deliberately not done yet.
+- **The context budget has no repeatable test.** It is proven by a one-off probe
+  and a real run, not by a case in `test:unit`. `buildTranscriptContext` is pure
+  and would be cheap to cover there.
+- **No public council exercises the truncation marker.** The default budget does
+  not bind at this transcript length, and the deliberately-tiny-budget council
+  used to prove it was deleted rather than left on a public site.
 
 The `council` agent identity is **added to `scripts/seed-agent-roster.mjs` but
 not yet seeded** — via the seed script, not a migration, consistent with "more

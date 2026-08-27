@@ -552,6 +552,11 @@ async function main(): Promise<void> {
     "timeline_events", "research_notes", "simulations", "simulation_runs",
     "graph_edges", "citation_checks", "dashboard_stats", "agent_public",
     "agent_public_stats",
+    // Added by 0010. Public because the deliberation is the transparency
+    // artifact of Phase D — and since 0010 was the first migration to create a
+    // public table after 0009 revoked anon's default grant, these two are
+    // exactly where a forgotten explicit GRANT would surface first.
+    "councils", "council_turns",
   ];
 
   let sbUrl = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
@@ -604,6 +609,91 @@ async function main(): Promise<void> {
           body.includes("42501") ? "  <- GRANT REVOKED (SQLSTATE 42501)" : ""
         }`,
       );
+    }
+  }
+
+  // ─── /council/[id] — the transcript renders (§D.3) ────────────────────────
+  //
+  // The id is a runtime uuid, so unlike every other page spec this one has to
+  // DISCOVER its target: it asks the public API for the newest complete council
+  // and then renders that. Which means the assertion is real data twice over —
+  // the row has to exist, and the page has to show what the row says.
+  //
+  // A missing council is a FAILURE, not a skip, by the same rule as the F-07
+  // credentials above: a check that quietly does nothing when it cannot run
+  // reports ALL GREEN having checked nothing. If this fires on a fresh
+  // database, run `node scripts/run-council.mjs --hypothesis <slug>`.
+  console.log("\n── /council/[id] — a real transcript renders ─────────────────");
+
+  if (!sbUrl || !sbKey) {
+    check("council: anon credentials available", false, "same credentials as the F-07 block above");
+  } else {
+    let council: {
+      id: string;
+      subject_title: string;
+      outcome: string | null;
+      rounds_run: number;
+    } | null = null;
+    let detail = "";
+    try {
+      const res = await fetch(
+        `${sbUrl.replace(/\/$/, "")}/rest/v1/councils` +
+          `?select=id,subject_title,outcome,rounds_run&status=eq.complete` +
+          `&order=started_at.desc&limit=1`,
+        {
+          headers: { apikey: sbKey, Authorization: `Bearer ${sbKey}` },
+          signal: AbortSignal.timeout(TIMEOUT_MS),
+        },
+      );
+      const rows = (await res.json()) as unknown;
+      if (Array.isArray(rows) && rows.length > 0) council = rows[0];
+      else detail = `HTTP ${res.status}, ${Array.isArray(rows) ? "0 rows" : "unexpected body"}`;
+    } catch (err) {
+      detail = err instanceof Error ? err.message : String(err);
+    }
+
+    check(
+      "council: a complete council exists to render",
+      council !== null,
+      council ? "" : `${detail} — run scripts/run-council.mjs to create one`,
+    );
+
+    if (council) {
+      const path = `/council/${council.id}`;
+      const res = await get(path);
+      if (res.error || res.status !== 200) {
+        check(`${path} — 200`, false, res.error ?? `got ${res.status}`);
+      } else {
+        const body = decode(res.body);
+        const boundary = GLOBAL_ABSENT.filter((m) => body.includes(m));
+        check(
+          `${path} — no error boundary`,
+          boundary.length === 0,
+          boundary.length ? `rendered: "${boundary[0]}" (with HTTP 200)` : "",
+        );
+
+        // "Council transcript" is this page's eyebrow and appears nowhere else,
+        // so it proves the route resolved. The subject title and "Round 1" come
+        // out of `councils` and `council_turns` respectively — neither can
+        // render unless BOTH queries returned rows, which is the pair of anon
+        // grants 0010 had to add explicitly.
+        const markers = ["Council transcript", council.subject_title, "Round 1"];
+        const missing = markers.filter((m) => !body.includes(m));
+        check(
+          `${path} — content`,
+          missing.length === 0,
+          missing.length ? `missing marker(s): ${missing.map((m) => `"${m}"`).join(", ")}` : "",
+        );
+
+        check(
+          `${path} — no empty state`,
+          !body.includes("No turns recorded"),
+          body.includes("No turns recorded") ? "rendered the empty transcript state" : "",
+        );
+        console.log(
+          `      ↳ ${council.id} — outcome ${council.outcome}, ${council.rounds_run} rounds`,
+        );
+      }
     }
   }
 
