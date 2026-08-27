@@ -107,7 +107,10 @@ persistent cache through Next's **automatic fetch cache**, which no guard
 touches — and an instance was observed there on 2026-08-11. Detection in
 `scripts/smoke.ts`; exposure bounded by documented environment isolation. Full
 closure record and its stated evidentiary limits: **§8.5**. Corrected scope and
-the observed instance: **F-09b** at the end of this section.
+the observed instance: **F-09b** at the end of this section, where the ISR path
+is now **ACCEPTED WITH REASONING** (2026-08-27): the guard that would have
+covered it was evaluated and declined, and detection moved to a scheduled
+production smoke.
 
 `unstable_cache` entries are written to `.next/cache/fetch-cache` keyed on the
 cache key alone. **Nothing in that key records whether credentials were present
@@ -229,7 +232,13 @@ finding header, F-09b, and §8.5.)*
 
 ### F-09b — the same cache, reached by a path M1/M2 do not cover
 
-**Observed 2026-08-11. No mitigation implemented.**
+**Status: ACCEPTED WITH REASONING — 2026-08-27.** Observed 2026-08-11. No
+mitigation is implemented, and after evaluating the alternative none is planned:
+the guard that was proposed cannot do the thing it is named for, and the change
+that *would* close the class is a caching-architecture decision rather than a
+mitigation, deferred on its own terms below. What has changed is detection —
+`.github/workflows/production-smoke.yml` runs the smoke against production every
+30 minutes. Residual risk is stated at the end of this section.
 
 **What happened.** Immediately after the agent roster was seeded, a *credentialed*
 local `next build` prerendered `/agents` with its empty state — "No agents yet" —
@@ -270,6 +279,21 @@ Two consequences follow from that key:
 
 Their `revalidate` values are 208×`3600` and 2×`900` — the segment values and
 nothing else, which is what identifies the segment as the source of the caching.
+
+**This is not the F-09 failure mode, and the distinction decides the remedy.**
+F-09 is a *credential* fault: an empty fallback computed with no credentials and
+stored under the key a healthy run would use — a value that was **false when it
+was written**. F-09b is not that. The `/agents` entry was written by a
+*credentialed* read of a table that was genuinely empty at that moment, before
+the roster was seeded. It was **true when it was written**, and it became wrong
+only because reality moved and the cached copy did not. This is a staleness
+fault wearing an emptiness costume.
+
+M2's principle is "refuse to store a value we can prove is false". Here there
+was nothing false to prove at write time, so that principle does not extend to
+this path — it has no purchase on it. Any remedy that works by inspecting the
+payload is reading the one signal that carries no information: an empty body is
+identical whether the table is empty or the entry is old.
 
 **Why M1's condition cannot apply.** M1 is "if `HAS_LIVE_SUPABASE` is false,
 bypass the cache". On this path that condition never produces a cacheable value
@@ -322,8 +346,10 @@ a `revalidate` value other than the two segment values above.
 
 **What this record does NOT claim.**
 
-- **No mitigation is implemented for the ISR path.** M1/M2 are unchanged and
-  still cover exactly the two API routes.
+- **No mitigation is implemented for the ISR path, and as of 2026-08-27 none is
+  planned.** M1/M2 are unchanged and still cover exactly the two API routes. The
+  guard proposed for this path was evaluated and declined — see "Option A"
+  below for why, and for what was chosen instead.
 - **The precise trigger of the observed staleness is not reconstructable.**
   `.next/cache` was deleted to confirm the diagnosis before the offending entry's
   age was captured. The mechanism and the key shape are proven; why that
@@ -336,6 +362,112 @@ a `revalidate` value other than the two segment values above.
 - **Production is currently correct** — post-deploy `/agents` renders all eight
   agents — but that is evidence the vector is not firing there right now, not
   evidence that it is closed.
+
+**Option A — a query-layer guard — considered and DECLINED (2026-08-27).**
+
+The proposal: refuse to return an empty result on a live connection, so an empty
+payload never becomes a cached page — M2's principle extended to the automatic
+fetch path. Declined for three reasons, in descending order of how fatal they
+are.
+
+1. **It cannot stop the write.** Next persists the response inside its patched
+   `fetch`, before `@supabase/supabase-js` resolves the body, so by the time
+   `listPublicAgents` (`lib/queries/agents.ts:20`) can count rows the entry
+   already exists. A throw at the query layer prevents a bad *page*; it does not
+   prevent a bad *entry*. The entry then survives for its full `revalidate`, and
+   every regeneration inside that window re-reads it and throws again. The guard
+   would be named for something it does not do.
+2. **It cannot distinguish true-empty from stale.** Both are HTTP 200 with `[]`.
+   There is no marker in the response and none available at the query layer. The
+   only way to disambiguate is a second, *uncached* read — which requires the
+   no-store client described below, at which point the guard is redundant with
+   the thing that actually fixes it, having paid double reads on every empty
+   result to reach the same answer.
+3. **It breaks pre-seed builds, on all fourteen ISR call sites.** With
+   credentials present and an unseeded database, every site in the scope table
+   above throws during prerender and `next build` fails — an unseeded instance
+   could not be deployed at all. M2 escaped exactly this by catching
+   `EmptyPayloadError` and answering from an uncached read (§8.3), and that
+   escape hatch does not exist here. Note the recursion: the situation that
+   *created* F-09b — a build against a database that was empty and then got
+   seeded — is precisely the situation in which the guard breaks a legitimate
+   build.
+
+**The one variant that would close the class is not a guard, and is deferred.**
+Passing `cache: "no-store"` to the Supabase client's `fetch`
+(`lib/supabase/public.ts:10` already accepts a `global.fetch`) sits *above*
+Next's patched fetch and is the only point with real leverage. It works by
+removing the stacking of two caches with independent keys and lifetimes, which is
+the entire mechanism: the observed symptom — an empty index and populated
+`[name]` pages in one build — is only expressible because
+`?select=*&order=…` and `?select=*&name=eq.x` are separate entries that can
+differ in age. With page-level ISR alone, one build is one snapshot, and no
+payload ever has to be judged.
+
+That is a **caching-architecture change, not a mitigation**: it makes every
+prerender and every regeneration a live read. It is deferred as its own decision
+rather than folded into F-09b, and it is gated on an unverified premise — see the
+open measurements below.
+
+**Correction — CI does not shorten detection for this class (2026-08-27).**
+
+When `.github/workflows/ci.yml` shipped it was asserted that smoke running
+automatically on every push meant a recurrence could not stay hidden for long.
+That is **false for F-09b**, and saying so plainly is worth more than leaving the
+claim tidy. Tier 2 builds inside the runner from a fresh checkout, and nothing
+restores `.next/cache` — `actions/setup-node`'s `cache: npm` covers `~/.npm`
+only. So the runner's fetch cache is **empty at the start of every run** and is
+repopulated from the live database seconds before smoke reads it. A cold fetch
+cache cannot reproduce warm-fetch-cache staleness: the runner never holds the
+state that *is* the bug. CI models the application; it does not model the cache.
+
+What CI does buy, not inflated into more than it is: a *code* regression that
+empties a payload is caught in about three minutes, and the assertions are
+exercised on every push so they cannot quietly rot. Neither of those is F-09b.
+
+The environment that carries `.next/cache` across builds is production, so the
+detector has to run there, on a clock. That is
+`.github/workflows/production-smoke.yml` — every 30 minutes against the deployed
+origin, public variables only, a missing variable a hard failure. Thirty minutes
+is half the 3600s revalidate, so any exposure window of that length contains at
+least two sample points and worst-case detection latency is 30 minutes. Before
+this, detection latency was "whenever a human remembers to run it", which is
+what actually caught the 2026-08-11 instance and is not a control.
+
+**Open measurements — both UNVERIFIED, with what would settle each.**
+
+- **Does `revalidatePath()` evict untagged fetch entries?** `revalidateTag`
+  demonstrably cannot reach them (`tags: []`), while `lib/revalidation.ts:36-38`
+  already calls `revalidatePath` for ISR pages on every admin write — so the
+  lever may already exist and merely be unproven. **What would settle it:**
+  create a genuinely stale entry — read a table through an ISR page, mutate that
+  table out of band so the cached body is known-wrong, call `revalidatePath` for
+  the route, and re-request inside the original revalidate window. A changed body
+  on the first request proves eviction; an unchanged one proves the lever does
+  not reach these entries. This inherits §8.4's standing objection that proving
+  eviction requires poison that genuinely exists — cheap to satisfy on a local
+  tree, which is where it should be done.
+- **Does `cache: "no-store"` keep a `revalidate` segment prerendered?** The
+  no-store variant is worth much less if opting a fetch out of the data cache
+  also forces its segment dynamic, because it would then trade an hour of
+  staleness for a live database read on every visitor request rather than on
+  every regeneration. **What would settle it:** set it on `publicClient` in a
+  scratch branch, run `next build`, and read the route table — the affected pages
+  must still print as static/ISR and the static page count must hold at 125. If
+  they go dynamic, the variant is a substantially more expensive proposal than it
+  appears, and the deferral above becomes a rejection.
+
+**Residual risk, accepted.** A visitor arriving inside an exposure window sees a
+page rendering its empty state — "No agents yet" — under HTTP 200, with correct
+chrome, correct navigation, and no error anywhere. That is the two-month-outage
+shape at smaller scale, which is why this is *accepted with reasoning* rather
+than dismissed as minor. The expected bound is the segment's 3600s, but that is
+an expectation, not a proof: the observed entry was still being served an
+hour-plus after it was written, and the trigger was never reconstructed.
+Recovery stays the weakest part — `revalidateTag` cannot reach these entries at
+all, and every candidate lever for the other 210 is unverified (§8.4). What is
+now true that was not before: the window is sampled every 30 minutes instead of
+never.
 
 ---
 
@@ -1430,7 +1562,10 @@ environment."* It is not scoped to this project on those plans.
   a recurrence cannot be silent. Verified by negative control. The ISR instance
   was caught the same way, by an assertion tightened from structural to real data
   (`161d878`) — detection generalised to the ISR path even though the mitigations
-  did not.
+  did not. **Where that detection has to run is not arbitrary:** `ci.yml` builds
+  with a cold fetch cache and structurally cannot reproduce this, so the ISR
+  detector is `.github/workflows/production-smoke.yml`, against production, every
+  30 minutes. See the correction in F-09b.
 - **Exposure bounded on the API routes; not bounded on the ISR pages.**
   Preview→production is closed by Vercel's documented environment isolation
   (§8.2). Production→production is closed on the write path by M1/M2 **for the
@@ -1439,9 +1574,11 @@ environment."* It is not scoped to this project on those plans.
   untagged ISR entries at all, and no lever that would has been tested (§8.4).
 
 **One status, three places.** This finding is **PARTIALLY RESOLVED**: mitigated
-on the two `unstable_cache` API routes, unmitigated on the ISR pages. That is
-stated at the finding header, at the end of the F-09 evidence, and here — a
-reader landing at any of the three gets the same answer.
+on the two `unstable_cache` API routes, unmitigated on the ISR pages — where, as
+of 2026-08-27, the residual risk is **ACCEPTED WITH REASONING** (F-09b) rather
+than simply outstanding. Accepted is not resolved, and F-09b says what is being
+lived with. That is stated at the finding header, at the end of the F-09
+evidence, and here — a reader landing at any of the three gets the same answer.
 
 **Limits recorded rather than smoothed over:** environment isolation is Vercel's
 documented behaviour and was deliberately not verified live (§8.2); tag eviction
@@ -1577,6 +1714,13 @@ That makes a real PR gate possible: build with the two `NEXT_PUBLIC_*` values,
 `next start`, run `smoke` against `localhost`. All 86 assertions, against real
 data, on values that are already public. This is the highest-value CI step
 available and it costs nothing in exposure.
+
+**One thing it does not buy, recorded here because it was briefly assumed to.**
+This gate cannot detect F-09b. The runner builds from a fresh checkout with no
+`.next/cache` restored, so its fetch cache is always cold and warm-cache
+staleness cannot arise in it at all. That detector is a different workflow —
+`.github/workflows/production-smoke.yml`, on a clock, against production. Full
+correction in F-09b.
 
 Two caveats worth stating before anyone builds it:
 

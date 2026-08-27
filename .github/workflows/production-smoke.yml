@@ -1,0 +1,139 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# PRODUCTION SMOKE — the detector for F-09b, on a fixed interval.
+#
+# WHY THIS FILE EXISTS, stated bluntly because the alternative was believed for
+# a while: **CI does not detect F-09b.** `ci.yml` tier 2 builds inside the
+# runner from a fresh checkout, and nothing restores `.next/cache`, so its fetch
+# cache is empty at the start of every run and is repopulated from the live
+# database seconds before smoke reads it. A runner with an empty fetch cache
+# cannot reproduce warm-fetch-cache staleness — that is the entire mechanism of
+# F-09b (AUDIT.md → F-09b). CI models the application; it does not model the
+# cache state that is the bug.
+#
+# Production is the environment that *does* carry `.next/cache` across deploys.
+# So the detector has to run against production, on a clock, which is what this
+# workflow is. It builds nothing: `scripts/smoke.ts` is an HTTP client, so this
+# is checkout + install + smoke against the deployed origin.
+#
+# INTERVAL — every 30 minutes, chosen against the 3600s revalidate.
+# Thirteen of the fourteen ISR call sites declare `revalidate = 3600`
+# (AUDIT.md → F-09b scope table), so a stale entry's own window is one hour.
+# Sampling at half that period means **any** 3600s exposure window contains at
+# least two sample points, and worst-case detection latency is 30 minutes
+# against a previously unbounded "whenever a human remembers to run it".
+# Fifteen minutes would double the cost for a strictly smaller gain; sixty
+# could align with the window and miss a sub-hour exposure entirely.
+#
+# Two caveats on that guarantee, neither of which changes the choice:
+#   - GitHub documents that scheduled workflows "may be delayed during periods
+#     of high loads", so the 30-minute period is a target, not a contract. The
+#     two-samples-per-window property degrades gracefully; it does not invert.
+#   - GitHub disables scheduled workflows in a repository with no activity for
+#     60 days. If this stops running, that is the first thing to check.
+#
+# COST ON PRODUCTION: 48 runs/day, each ~30 page/API requests plus 13 PostgREST
+# grant reads, all anon-scoped and read-only. Negligible against the concern
+# recorded in AUDIT.md §10.2 about putting read traffic on the live database.
+#
+# CREDENTIALS: public values only, exactly as tier 2 — the same three repository
+# VARIABLES, never secrets. A missing variable is a FAILURE, not a skip, for the
+# same reason it is in tier 2: a run that smokes a placeholder host and reports
+# green is worse than no run at all.
+# ─────────────────────────────────────────────────────────────────────────────
+name: Production smoke
+
+on:
+  schedule:
+    # Every 30 minutes — see the interval justification above.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A scheduled run that overlaps its predecessor means production is answering
+# slower than the interval, which is itself worth knowing — but two concurrent
+# smokes would double the read traffic and confuse the failure attribution. The
+# newer run wins.
+concurrency:
+  group: production-smoke
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "24"
+
+jobs:
+  smoke:
+    name: Smoke production (87 checks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # Same semantics as ci.yml tier 2, and for the same reason. The extra
+      # check here is the localhost one: NEXT_PUBLIC_SITE_URL is this workflow's
+      # TARGET, not just a build input, so a localhost value would point the
+      # smoke at a server that does not exist in the runner and fail confusingly
+      # — or worse, at something that answers. The regex mirrors
+      # SITE_URL_IS_NOT_PRODUCTION in lib/utils.ts:85-86.
+      - name: Require the public Supabase variables
+        env:
+          SUPABASE_URL: ${{ vars.NEXT_PUBLIC_SUPABASE_URL }}
+          ANON_KEY: ${{ vars.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          SITE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL }}
+        run: |
+          missing=""
+          if [ -z "$SUPABASE_URL" ]; then missing="$missing NEXT_PUBLIC_SUPABASE_URL"; fi
+          if [ -z "$ANON_KEY" ];     then missing="$missing NEXT_PUBLIC_SUPABASE_ANON_KEY"; fi
+          if [ -z "$SITE_URL" ];     then missing="$missing NEXT_PUBLIC_SITE_URL"; fi
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository variable(s):$missing"
+            echo "Set them at Settings → Secrets and variables → Actions → Variables tab."
+            echo "These are VARIABLES, not secrets: all three are inlined into the"
+            echo "client bundle on every deploy and are already public."
+            exit 1
+          fi
+          if printf '%s' "$SUPABASE_URL" | grep -q "placeholder"; then
+            echo "::error::NEXT_PUBLIC_SUPABASE_URL is the placeholder host — the grant checks would verify nothing."
+            exit 1
+          fi
+          if printf '%s' "$SITE_URL" | grep -qiE '^https?://(localhost|127\.0\.0\.1|\[::1\])(:|/|$)'; then
+            echo "::error::NEXT_PUBLIC_SITE_URL is a local dev host ($SITE_URL) — there is nothing to smoke."
+            exit 1
+          fi
+          echo "Smoking $SITE_URL"
+
+      # BASE_URL is the deployed origin, so this asserts against the cache state
+      # that actually exists in production — including its fetch cache, which is
+      # the thing ci.yml structurally cannot see.
+      - name: Smoke production
+        env:
+          BASE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL }}
+          SMOKE_TIMEOUT_MS: "45000"
+          NEXT_PUBLIC_SUPABASE_URL: ${{ vars.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ vars.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+        run: |
+          set -o pipefail
+          npm run smoke 2>&1 | tee smoke.out
+
+      # Identical ratchet to ci.yml tier 2: `npm run smoke` fails the job on any
+      # failed assertion, and this catches the other direction — a green run
+      # that quietly checks FEWER things than it used to. Raise both floors
+      # together when assertions are added.
+      - name: Assert the assertion count has not regressed
+        run: |
+          passed=$(grep -oE '([0-9]+) passed' smoke.out | tail -1 | grep -oE '[0-9]+')
+          echo "smoke reported ${passed:-0} passing assertions (floor: 87)"
+          if [ -z "$passed" ] || [ "$passed" -lt 87 ]; then
+            echo "::error::smoke ran ${passed:-0} assertions, expected at least 87 — did a check get dropped?"
+            exit 1
+          fi
