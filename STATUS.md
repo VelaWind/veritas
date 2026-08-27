@@ -90,17 +90,36 @@ so unlike every other page spec it **discovers** its target — it asks the publ
 API for the newest complete council and renders that. A missing council fails
 rather than skips.
 
-**What is still unasserted:**
+**The budget now has a repeatable test.** `scripts/test-council-budget.mjs` is
+its own file in `test:unit` (**25 + 31 = 56 passed**): 31 assertions over
+`buildTranscriptContext`, no fixtures, no live database, no model. It was
+**mutation-tested** — `council.mjs` was broken five ways (dropped `reverse()`,
+oldest-first selection, no one-turn floor, `truncated` pinned true, pinned
+false) and every mutation was caught.
+
+**The truncation marker now has a live example.** Two public councils, and the
+contrast is the point:
+
+| council | subject | outcome | truncated |
+|---|---|---|---|
+| `22c63a47` | `dark-matter-is-modified-gravity` | `split` | 0 of 8 |
+| `b9d8f7e4` | `life-began-rna-world` | `consensus` | 6 of 8 |
+
+`smoke` is **93 → 95**, asserting that a public council *has* a truncated turn
+and that the marker renders on its page. The marker appears 12 times on
+`b9d8f7e4` and 0 times on `22c63a47`, so the assertion discriminates rather than
+matching page chrome.
+
+**What is still unasserted or missing:**
 
 - **D.9 #5** — that a council verdict lands as `pending` only, credited to
   `council`, changing no hypothesis row. It needs the verdict wired to the queue,
   which is deliberately not done yet.
-- **The context budget has no repeatable test.** It is proven by a one-off probe
-  and a real run, not by a case in `test:unit`. `buildTranscriptContext` is pure
-  and would be cheap to cover there.
-- **No public council exercises the truncation marker.** The default budget does
-  not bind at this transcript length, and the deliberately-tiny-budget council
-  used to prove it was deleted rather than left on a public site.
+- **`councils` does not record the context budget a run used.** `b9d8f7e4` ran at
+  `--context-budget 600`, not the 6000 default, and nothing on the page or in the
+  row says so — the marker is honest about *what* happened and silent about
+  *why*, which makes a deliberately-bounded council look like the normal case.
+  Fixing it means a `context_budget` column and a migration; not done.
 
 The `council` agent identity is **added to `scripts/seed-agent-roster.mjs` but
 not yet seeded** — via the seed script, not a migration, consistent with "more

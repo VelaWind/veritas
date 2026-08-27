@@ -2034,3 +2034,92 @@ council fails rather than skips, by the same rule as the F-07 credential check.
 **Not covered by a repeatable test:** the budget function is proven by a one-off
 probe, not by a unit test in `test:unit`. `buildTranscriptContext` is pure and
 would be cheap to cover there; it is not done here.
+
+---
+
+# Council follow-ups — the budget gets a test, the marker gets real data (2026-08-28)
+
+Two gaps recorded at the end of the previous entry, both now closed.
+
+## 1. `buildTranscriptContext` is unit-tested — `test:unit` 25 → 56
+
+`scripts/test-council-budget.mjs`, its own file, wired into `test:unit`
+alongside `test-sanitize.mjs`. **31 assertions**, no fixtures, no live database,
+no model — which is the whole reason the budget lives in its own module rather
+than inside the runner loop.
+
+Covered: the five budget levels; newest-first *selection*; chronological
+*render* order; the one-turn floor; the marker appearing **iff** something was
+dropped; and the empty-turns case.
+
+Two choices in the test worth naming:
+
+- **The fixtures are sized to the real cap.** Each turn is ~400 estimated
+  tokens, matching `--max-turn-tokens`. A budget tested only against toy turns
+  is not tested against its own job.
+- **Some assertions are properties, not table rows.** `included` never decreases
+  as the budget increases; round numbers are non-decreasing across a two-round
+  transcript. A table of expected numbers passes for a function that returns the
+  right counts by luck; the monotonicity checks do not.
+
+**The suite was mutation-tested rather than trusted for being green.**
+`council.mjs` was broken five ways and restored from git each time. Every
+mutation was caught:
+
+| Mutation | Caught by |
+|---|---|
+| drop the chronological `reverse()` | round numbers non-decreasing |
+| select oldest-first instead of newest-first | the floor overshoots the budget |
+| remove the one-turn floor | a single over-budget turn is kept |
+| always report `truncated = true` | nothing dropped → no marker |
+| never report `truncated` | marker/omission-count assertions |
+
+A green test suite that survives no mutation is a suite that asserts nothing;
+this one was checked against that, not assumed clear of it.
+
+## 2. The truncation marker now has a live example, and an assertion
+
+The previous entry recorded that **no public council exercised the marker**,
+because the default budget does not bind at this transcript length. Closed by
+running a second council at `--context-budget 600` — small enough to bind, not
+so small that a turn cannot see the one before it.
+
+Two public councils now, and the contrast is the point:
+
+| council | subject | outcome | turns | truncated |
+|---|---|---|---|---|
+| `22c63a47` | `dark-matter-is-modified-gravity` | `split` | 8 | **0** |
+| `b9d8f7e4` | `life-began-rna-world` | `consensus` | 8 | **6** |
+
+Both council outcomes that a finished debate can reach are now represented on
+the public site, and one of them renders the marker.
+
+`smoke` **93 → 95**: one assertion that a public council *has* a truncated turn,
+and one that the `[earlier turns truncated]` marker renders on its page. It
+deliberately targets a council selected by `context_truncated=eq.true` rather
+than reusing the newest-complete council from the block above, so the two stay
+independent — the marker assertion must not start silently passing on a council
+that never truncated.
+
+**Checked for discrimination, not just for green:** the marker appears 12 times
+on `b9d8f7e4` (6 turns × 2, SSR markup plus the RSC payload) and **0 times** on
+`22c63a47`. An assertion that fires on both would be testing page chrome.
+
+## The gap this leaves, stated rather than papered over
+
+**`councils` does not record the context budget the run used.** A reader looking
+at `b9d8f7e4` sees six truncated turns and has no way to tell that it ran at
+`--context-budget 600` rather than the 6000 default — the row stores `model` but
+not the budget, so the marker is honest about *what happened* and silent about
+*why*. On the live site this makes a deliberately-bounded council look like the
+normal case.
+
+Fixing it means a column (`context_budget int`) on `councils` and a migration,
+which is not done here. It is recorded as a known limitation rather than
+resolved, and the two councils are described accurately in this file meanwhile.
+
+## Gate
+
+`validate:sql` 11 files clean · `tsc --noEmit` clean · `eslint` 0 errors ·
+`test:unit` **25 + 31 = 56 passed** · `next build` **127/127** (126 before, +1
+council page) · `smoke` **95 passed**.

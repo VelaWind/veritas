@@ -8,7 +8,7 @@
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test:unit": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/test-sanitize.mjs",
+    "test:unit": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/test-sanitize.mjs && node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/test-council-budget.mjs",
     "smoke": "node scripts/smoke.ts",
     "validate:sql": "node scripts/validate-sql.mjs supabase/migrations/0001_core.sql supabase/migrations/0002_fix_rls.sql supabase/migrations/0003_suggestions.sql supabase/migrations/0004_proposer_provenance.sql supabase/migrations/0005_agent_role.sql supabase/migrations/0006_agents.sql supabase/migrations/0007_agent_roster.sql supabase/migrations/0008_critiques_citations.sql supabase/migrations/0009_default_privileges.sql supabase/migrations/0010_council.sql supabase/seed.sql"
   },

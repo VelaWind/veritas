@@ -695,6 +695,58 @@ async function main(): Promise<void> {
         );
       }
     }
+
+    // ── The truncation marker, against real data ──────────────────────────
+    //
+    // The context budget is unit-tested as a pure function, but that proves
+    // only that it RETURNS truncated=true. This is the other half: that the
+    // flag survives into Postgres and reaches a reader. A council whose late
+    // turns never saw the opening arguments looks exactly like one that did,
+    // unless this marker renders — which is the whole reason the column exists.
+    //
+    // Targets a council that HAS a truncated turn rather than reusing the
+    // newest-complete one above, so the two assertions stay independent: the
+    // default budget does not bind on a short council, and this must not
+    // silently start passing on one that never truncated.
+    let truncCouncilId: string | null = null;
+    let truncDetail = "";
+    try {
+      const res = await fetch(
+        `${sbUrl.replace(/\/$/, "")}/rest/v1/council_turns` +
+          `?select=council_id&context_truncated=eq.true&limit=1`,
+        {
+          headers: { apikey: sbKey, Authorization: `Bearer ${sbKey}` },
+          signal: AbortSignal.timeout(TIMEOUT_MS),
+        },
+      );
+      const rows = (await res.json()) as unknown;
+      if (Array.isArray(rows) && rows.length > 0) {
+        truncCouncilId = (rows[0] as { council_id: string }).council_id;
+      } else {
+        truncDetail = `HTTP ${res.status}, ${Array.isArray(rows) ? "no truncated turns" : "unexpected body"}`;
+      }
+    } catch (err) {
+      truncDetail = err instanceof Error ? err.message : String(err);
+    }
+
+    check(
+      "council: a public council has a truncated turn",
+      truncCouncilId !== null,
+      truncCouncilId
+        ? ""
+        : `${truncDetail} — run scripts/run-council.mjs --context-budget 600 to create one`,
+    );
+
+    if (truncCouncilId) {
+      const path = `/council/${truncCouncilId}`;
+      const res = await get(path);
+      const body = res.error ? "" : decode(res.body);
+      check(
+        `${path} — the [earlier turns truncated] marker renders`,
+        res.status === 200 && body.includes("[earlier turns truncated]"),
+        res.error ?? (res.status !== 200 ? `got ${res.status}` : "marker absent from the page"),
+      );
+    }
   }
 
   console.log(
