@@ -6,9 +6,15 @@
 // It is idempotent: re-running reuses identities, refreshes charters, and never
 // duplicates a row. It does NOT mint tokens unless you pass --with-tokens.
 //
-// The eight starter agents (DECISIONS §D.1, design-review answer 4). Expertise
+// The starter agent roster (DECISIONS §D.1, design-review answer 4). Expertise
 // lives in the charter (which becomes the system prompt) plus the domain scope —
 // there is one model underneath all of them.
+//
+// Eight were seeded 2026-08-11. `council` was added for Phase D stage 3 and is
+// the ninth: it is added HERE rather than in migration 0010, because identities
+// are seed data, not schema ("more domains later by seed, not migration").
+// Re-running this script is the way to provision it — see the idempotency note
+// above; the eight existing rows are reused, not duplicated.
 //
 // Usage:
 //   node scripts/seed-agent-roster.mjs [--with-tokens] [--expires-days 30]
@@ -41,6 +47,37 @@ const OVERSIGHT_SCOPES = {
   max_pending: 5,
   max_per_run: 1,
   max_per_hour: 10,
+  throttle_divisor: 4,
+};
+
+// The council is the one unscoped agent that DOES propose, so its caps are the
+// real bound rather than a nominal one — read them as load-bearing, not as a
+// copy of OVERSIGHT_SCOPES that happens to match.
+//
+// `domains: []` is deliberate and is the credential widening stage 3 asks for.
+// Every researcher token is pinned to exactly one domain because a physics
+// agent proposing about consciousness is out of its expertise. A council has no
+// such home: it convenes on whatever hypothesis is contested, which may be any
+// of them, so a domain-pinned token would not merely be awkward — it would be
+// wrong for what the identity is.
+//
+// Precisely: this is not the first UNSCOPED token — internal-affairs has held
+// one since 2026-08-11, because OVERSIGHT_SCOPES is also `domains: []`. It is
+// the first unscoped token belonging to an agent that PROPOSES into
+// suggestions, and an unscoped token skips the domain branch of
+// enforce_agent_quota() entirely. What still bounds it: DECISIONS, "Council
+// identity — the one credential widening stage 3 asks for".
+//
+// max_per_run: 1 is not a throttle, it is the shape of the object: a council
+// run produces exactly one verdict. max_per_hour: 5 is a backstop rather than a
+// schedule — a local 2-round council is 10–20 minutes, so five in an hour is
+// already unreachable; the cap exists for the case where that assumption stops
+// holding (a cloud provider, a shorter council) and nobody revisits this file.
+const COUNCIL_SCOPES = {
+  domains: [],
+  max_pending: 5,
+  max_per_run: 1,
+  max_per_hour: 5,
   throttle_divisor: 4,
 };
 
@@ -170,12 +207,43 @@ const ROSTER = [
       "sustained pattern of them is a finding. Say plainly when an agent is doing " +
       "fine — an auditor who only ever reports problems is not measuring anything.",
   },
+  {
+    name: "council",
+    display_name: "The Council",
+    kind: "council",
+    domain: null,
+    scopes: COUNCIL_SCOPES,
+    charter:
+      "You convene when a claim is contested enough to be worth arguing over, " +
+      "and you speak for the deliberation rather than for any side of it. Four " +
+      "roles argue — advocate, skeptic, verifier, synthesizer — over a bounded " +
+      "number of rounds, and you write up what the argument actually produced.\n\n" +
+      "Record disagreement; do not resolve it by force. There is no majority " +
+      "rule here and no casting vote. If the roles ended split, say so, give " +
+      "each position as its holder would state it, and write what each side " +
+      "would need to SEE to change its mind — that is the useful artifact, and " +
+      "a manufactured consensus destroys it. If the council ran out of rounds " +
+      "without converging, that is 'no verdict', and no verdict is an honest " +
+      "answer.\n\n" +
+      "Your verdict is a proposal, not a ruling. It enters the same queue as " +
+      "everything else, pending, and a human decides. When you were convened on " +
+      "a question rather than a hypothesis, you propose against that question's " +
+      "most contested hypothesis and you say so in your rationale, naming the " +
+      "hypothesis you chose and why — the reader must never have to guess which " +
+      "claim your verdict actually edits.\n\n" +
+      "Cite the transcript. Every claim in your write-up should be traceable to " +
+      "a turn someone took, because the transcript is public and a verdict that " +
+      "does not follow from it is the one thing that would make this whole " +
+      "exercise theatre.",
+  },
 ];
 
 // The skeptic and the citation verifier run INSIDE the research lane (their
 // model calls are made by the research runner, and their output is attributed to
 // them by id). They never authenticate, so they get no token. IA does — it calls
-// its own route.
+// its own route. So does the council: it posts its verdict through the ordinary
+// propose route as itself, which is what makes enforce_agent_quota() find it by
+// profile_id and cap it like any other proposer.
 const NEEDS_TOKEN = new Set([
   "physics-researcher",
   "cosmology-researcher",
@@ -183,18 +251,43 @@ const NEEDS_TOKEN = new Set([
   "mathematics-researcher",
   "origin-of-life-researcher",
   "internal-affairs",
+  "council",
 ]);
 
 if (dryRun) {
   console.log("\nDRY RUN — nothing will be written.\n");
+  console.log(
+    `  ${"agent".padEnd(28)} ${"kind".padEnd(17)} ${"domain".padEnd(16)} ` +
+      `${"token".padEnd(9)} scope`,
+  );
   for (const a of ROSTER) {
+    // Print the token SCOPE, not just whether a token is minted. An unscoped
+    // credential is the thing worth seeing in a plan before it is provisioned,
+    // and it is invisible if the plan only says "token".
+    const scope = a.scopes
+      ? (a.scopes.domains ?? []).length === 0
+        ? "UNSCOPED (all domains) — explicit"
+        : "pinned (explicit)"
+      : a.domain
+        ? `pinned → ${a.domain}`
+        : "UNSCOPED (all domains) — oversight default";
     console.log(
-      `  ${a.name.padEnd(28)} ${a.kind.padEnd(17)} ${(a.domain ?? "—").padEnd(16)} ${
-        NEEDS_TOKEN.has(a.name) ? "token" : "no token"
-      }`,
+      `  ${a.name.padEnd(28)} ${a.kind.padEnd(17)} ${(a.domain ?? "—").padEnd(16)} ` +
+        `${(NEEDS_TOKEN.has(a.name) ? "token" : "no token").padEnd(9)} ${scope}`,
     );
   }
-  console.log(`\n  ${ROSTER.length} agents.\n`);
+  const widened = ROSTER.filter(
+    (a) => NEEDS_TOKEN.has(a.name) && !a.domain,
+  ).map((a) => a.name);
+  console.log(`\n  ${ROSTER.length} agents.`);
+  if (widened.length) {
+    console.log(
+      `  ${widened.length} hold an UNSCOPED token: ${widened.join(", ")}. ` +
+        `Bounded by caps + kind, not by domain.\n`,
+    );
+  } else {
+    console.log("");
+  }
   process.exit(0);
 }
 
@@ -267,10 +360,15 @@ for (const spec of ROSTER) {
   // mint may have widened. `status` is deliberately NOT written: re-seeding must
   // never silently reinstate an agent that IA or the trust governor suspended
   // (D.4 — reinstatement is admin-only, and this script is not that decision).
+  // An explicit spec.scopes wins, so an identity whose caps are load-bearing
+  // (the council) states them itself instead of inheriting the oversight
+  // defaults by the accident of having no domain.
   const domainId = spec.domain ? domainBySlug.get(spec.domain) : null;
-  const scopes = spec.domain
-    ? { ...RESEARCH_SCOPES, domains: [domainId] }
-    : { ...OVERSIGHT_SCOPES };
+  const scopes = spec.scopes
+    ? { ...spec.scopes }
+    : spec.domain
+      ? { ...RESEARCH_SCOPES, domains: [domainId] }
+      : { ...OVERSIGHT_SCOPES };
 
   const { data: agentRow, error: agentErr } = await service
     .from("agents")

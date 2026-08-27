@@ -33,32 +33,57 @@ The 0007 gate earned its keep: it caught a real regression. The Phase B probe
 disabled an agent by writing `enabled: false`, which 0007 made inert — the agent
 kept proposing. The check now asserts both halves of the new contract.
 
-### Where stage 3 picks up
+### Where stage 3 stands
 
-The design (DECISIONS §D.3) is signed off and unchanged. Council needs
-`0009_council.sql` (`councils`, `council_turns`, both public), a
-`run-council.mjs` driving advocate → skeptic → verifier → synthesizer with
-reasoning shared between rounds, `/council/[id]` transcripts, and the verdict
-landing as an ordinary pending suggestion. Two decisions already made and worth
-not re-litigating: a council convened on a **question** proposes against that
-question's most contested hypothesis (the B.9 deviation-4 shape, so
-`apply_suggestion()` stays untouched), and the transcript passed between rounds
-is **budgeted** — per-turn output capped, prior turns included newest-first with
-an explicit truncation marker — because 4 roles × 3 rounds silently overflows a
-32k local context and the failure looks like reasoning.
+**The schema is live. The runner is not.**
 
-A `council` agent identity does not exist yet. It is not one of the eight, so
-stage 3 adds it **via the seed script, not a migration** — consistent with
-"more domains later by seed".
+`0010_council.sql` was applied 2026-08-27 — `councils` and `council_turns`, both
+public, plus the enums, the anon grants, and a trigger that enforces the
+deviation-4 shape in Postgres. (It is **0010**, not the `0009_council.sql` this
+section used to name: 0009 went to the F-07 default-privileges fix, so IA becomes
+0011. DECISIONS §D.6 is corrected.)
+
+Still to build: `run-council.mjs` driving advocate → skeptic → verifier →
+synthesizer with reasoning shared between rounds, `/council/[id]` transcripts,
+and the verdict landing as an ordinary pending suggestion. Two decisions already
+made and worth not re-litigating: a council convened on a **question** proposes
+against that question's most contested hypothesis (the B.9 deviation-4 shape, so
+`apply_suggestion()` stays untouched — now enforced by
+`trg_councils_verdict_shape`, not by convention), and the transcript passed
+between rounds is **budgeted** — per-turn output capped, prior turns included
+newest-first with an explicit truncation marker — because 4 roles × 3 rounds
+silently overflows a 32k local context and the failure looks like reasoning.
+`council_turns.context_truncated` records when a turn argued from a truncated
+transcript, so that budget is auditable rather than invisible.
+
+**Known gap, stated rather than left to be discovered:** the migration is live
+ahead of its tests. `verify-agents` (40/40) and `smoke` (87/87) both pass and
+both assert **nothing** about `councils` — their counts are unchanged from the
+stage-2 gate for exactly that reason. The D.9 council assertions (#5, plus the
+anon-can-read / anon-cannot-write pair the new tables now need) are unwritten.
+
+The `council` agent identity is **added to `scripts/seed-agent-roster.mjs` but
+not yet seeded** — via the seed script, not a migration, consistent with "more
+domains later by seed". `--dry-run` shows 9 agents. See the actions below.
 
 ### ⚠ Other actions that are yours
 
-- **Run `scripts/seed-agent-roster.mjs --with-tokens`** — not yet run. Needs
-  `SUPABASE_SERVICE_ROLE_KEY`; creates **eight Supabase auth users** + profiles +
-  registry rows. `--dry-run` prints the plan and writes nothing. Only six of the
-  eight get tokens: the skeptic and citation-verifier run inside the research
-  lane and never authenticate. Until this runs, `/agents` renders its empty
-  state — the schema is live but the roster is not seeded.
+- **Re-run `scripts/seed-agent-roster.mjs --with-tokens`** to provision the
+  ninth identity, `council`. The eight from stage 1 were seeded 2026-08-11 and
+  are reused by email lookup, not duplicated — this run creates **one** new
+  Supabase auth user and mints **one** new token. Needs
+  `SUPABASE_SERVICE_ROLE_KEY`; `--dry-run` prints the plan and writes nothing.
+  Two things to know before you run it:
+  - **The council's token is unscoped (`scopes.domains: []`)** — it is the first
+    identity that can propose into `suggestions` in *any* domain. That is
+    structural, not an oversight: a council convenes on whichever hypothesis is
+    contested. What still bounds it is written up in DECISIONS, *Council
+    identity*. The `--dry-run` output now prints each agent's scope, so the
+    widening is visible in the plan.
+  - **Re-running does not reinstate anyone.** `status` is deliberately never
+    written, so an agent IA or the trust governor suspended stays suspended.
+  - The six stage-1 tokens **expire 2026-09-10** and are unrecoverable; mint
+    replacements with `scripts/mint-agent-token.mjs --name <agent>`.
 - **Optional:** set `VERITAS_CROSSREF_MAILTO` to join Crossref's polite pool.
   No API key; Crossref and OpenAlex are both free and keyless.
 

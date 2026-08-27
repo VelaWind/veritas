@@ -1198,18 +1198,24 @@ joined with `councils` so verdicts appear alongside. Deliberately **no new
 described in B.9 deviation 3, and the councils table already carries everything
 needed to render the entry.
 
-## D.6 Schema summary — four migrations, applied with `supabase db push`
+## D.6 Schema summary — four migrations (0007, 0008, 0010, 0011), applied with `supabase db push`
 
 The CLI is linked, so these apply directly; no dashboard paste (unlike 0003/0004).
 One migration per implementation stage, so each commit is independently
 verifiable.
 
-| Migration | Adds |
-|---|---|
-| `0007_agent_roster.sql` | enums `agent_kind`, `agent_status`; `agents` columns (`display_name`, `kind`, `charter`, `domain_id`, `status`); derive trigger for `enabled`; **replaces** `recompute_agent_trust()` and `enforce_agent_quota()`; `agent_incidents`; views `agent_public`, `agent_public_stats`; grants |
-| `0008_critiques_citations.sql` | enums `critique_verdict`, `citation_status`; `suggestion_critiques`; `citation_checks`; `propose_with_critique()`; RLS + grants |
-| `0009_council.sql` | enums `council_role`, `council_outcome`; `councils`, `council_turns`; public SELECT policies; grants |
-| `0010_internal_affairs.sql` | enum `audit_severity`; `agent_audits`; `ia_apply_sanction()`; RLS + grants |
+**Numbering corrected 2026-08-27.** This table originally read `0009_council` /
+`0010_internal_affairs`. `0009` was taken by the F-07 default-privileges fix
+(2026-08-11), which is not a Phase D stage but landed between them, so council
+became `0010` and IA becomes `0011`. Applied status below is live, not planned.
+
+| Migration | Status | Adds |
+|---|---|---|
+| `0007_agent_roster.sql` | applied | enums `agent_kind`, `agent_status`; `agents` columns (`display_name`, `kind`, `charter`, `domain_id`, `status`); derive trigger for `enabled`; **replaces** `recompute_agent_trust()` and `enforce_agent_quota()`; `agent_incidents`; views `agent_public`, `agent_public_stats`; grants |
+| `0008_critiques_citations.sql` | applied | enums `critique_verdict`, `citation_status`; `suggestion_critiques`; `citation_checks`; `propose_with_critique()`; RLS + grants |
+| *`0009_default_privileges.sql`* | applied | *not Phase D* — AUDIT F-07; revokes `anon`'s default privilege on future tables. Consequence for everything below: a new public table now needs an **explicit** anon grant |
+| `0010_council.sql` | applied | enums `council_role`, `council_outcome`; `councils`, `council_turns`; public SELECT policies; `assert_council_verdict_shape()` + trigger; explicit anon grants; guard blocks |
+| `0011_internal_affairs.sql` | not built | enum `audit_severity`; `agent_audits`; `ia_apply_sanction()`; RLS + grants |
 
 **No `ALTER TYPE … ADD VALUE` anywhere in Phase D.** Every enum above is a *new*
 type, which Postgres permits creating and using in the same transaction — the
@@ -1288,7 +1294,7 @@ Plus the standing gates at every commit: `validate:sql`, `tsc --noEmit`,
 
 Order, one commit and one migration per stage, gates green at each:
 **1.** 0007 + roster seed + `/agents` profiles → **2.** 0008 + skeptic lane +
-citation verifier → **3.** 0009 + council → **4.** 0010 + IA → **5.** site
+citation verifier → **3.** 0010 + council → **4.** 0011 + IA → **5.** site
 features (b), (c), (d).
 
 Open questions I would rather settle before writing code than discover mid-build:
@@ -1696,3 +1702,145 @@ to real data at the same time (`161d878`).
 · `test:unit` 25 passed · `next build` **125/125** static pages (117 before, +8
 agent profile pages) · `smoke` **ALL GREEN, 87 passed** against both
 `localhost:3000` and `veritas-delta-pearl.vercel.app`.
+
+---
+
+# Council schema live — Phase D stage 3 (migration 0010, 2026-08-27)
+
+`0010_council.sql` is applied to the shared Supabase project. This is the schema
+half of stage 3; the runner (`run-council.mjs`), `/council/[id]`, and the
+verify-agents assertions are not built yet.
+
+**Numbering.** §D.6 reserved `0009_council.sql` for this. 0009 was taken by the
+F-07 default-privileges fix, so council is **0010** and Internal Affairs becomes
+**0011**. The §D.6 table has been corrected in place; the design it describes is
+unchanged.
+
+**What landed.** Enums `council_role` (advocate/skeptic/verifier/synthesizer) and
+`council_outcome` (consensus/split/no_verdict); public tables `councils` and
+`council_turns`; RLS public-read + admin-write; explicit anon grants; two guard
+blocks that raise rather than warn.
+
+**Three choices the design left open, decided here.**
+
+- `subject_type` is `node_type` + a CHECK, not a third enum — the shape
+  `suggestions.target_type` already uses. `status` is text + CHECK, the shape
+  `agent_incidents.kind` uses. Both keep the migration to the two enums §D.6
+  names, and Phase D still contains no `ALTER TYPE … ADD VALUE`.
+- `subject_id` carries **no foreign key**, because the subject is polymorphic
+  (hypothesis or question) and Postgres has no polymorphic FK. Deleting the
+  subject therefore **orphans** the council instead of cascading it away. That
+  is the wanted direction: the transcript is a public record of what was argued,
+  and deleting a claim should not silently erase the debate about it.
+  `subject_slug` and `subject_title` are denormalized so an orphan still renders.
+  The cost is real and is stated rather than hidden: referential integrity on
+  that column is the runner's job, and nothing in Postgres checks it.
+- Three CHECKs exist specifically against soft failures: an `aborted` council
+  must carry a non-empty `abort_reason`, a `complete` one must have an
+  `outcome`, and `round >= 1`. An aborted row with no reason reads as "nothing
+  happened" when something did — the exact shape this file is a catalogue of.
+
+**The deviation-4 shape is now enforced in Postgres, not in the runner.** A
+council convened on a question proposes against that question's most contested
+hypothesis (§D.3, B.9 deviation 4) so that `apply_suggestion()` stays untouched.
+That was a convention any single commit could have forgotten.
+`trg_councils_verdict_shape` now raises `23514` if a council is linked to a
+suggestion whose `target_type` is not `hypothesis`. It is `security definer`
+because it reads `suggestions`, which is admin-only under RLS — a check that
+silently passes for a caller who merely cannot *see* the row would be worse than
+no check. Without it the failure would surface deep inside `apply_suggestion()`
+at approval time, long after the run that produced it.
+
+**`council_turns.context_truncated`.** The settled context budget caps per-turn
+output and feeds prior turns newest-first until a budget is reached, with an
+`[earlier turns truncated]` marker in the prompt. That marker lives in a prompt
+string that is never stored. Without this column a round-3 turn that never saw
+round 1 is indistinguishable from one that did — which would look like reasoning
+and would not be. It is the part of the budget decision that has to be durable in
+order to be auditable at all.
+
+**This is the first migration to create a public table after 0009**, which
+revoked `anon`'s default privilege on future tables. The `grant select … to anon`
+lines here are therefore load-bearing in a way the equivalent lines in 0007/0008
+were not: without them RLS says yes, the grant says no, every row is denied, and
+the page renders empty with HTTP 200 — the 0002 failure exactly. 0010 carries its
+own F-07-style guard rather than extending 0009's keep-public list, because 0009
+has been applied and its file is the record of what ran. Both guards fired on the
+push:
+
+```
+NOTICE: D.3: anon SELECT confirmed on councils, council_turns.
+NOTICE: D.3: verdict-shape trigger installed (deviation-4 shape enforced in Postgres).
+```
+
+**Verified after the push.** `verify-agents.mjs` **40/40** against the live
+database, and `smoke` **87/87** against `veritas-delta-pearl.vercel.app`. Both
+counts are unchanged, which is the honest reading: **neither script asserts
+anything about `councils` yet.** The D.9 council assertions (#5, and the
+anon-read / anon-cannot-write pair) are still to be written, and the migration is
+live ahead of them. `migration list` also confirmed 0001–0009 in the remote
+ledger — the first time that ledger has been readable, since the roster seeding
+had to confirm 0007 by its effects with the CLI unauthenticated.
+
+## Council identity — the one credential widening stage 3 asks for
+
+The `council` agent is **not** one of the eight seeded on 2026-08-11. It is added
+via `scripts/seed-agent-roster.mjs`, not a migration, because identities are seed
+data ("more domains later by seed, not migration"). It is the ninth roster entry,
+and re-running the script provisions it: the existing eight are reused by email
+lookup, not duplicated.
+
+**Its token is unscoped (`scopes.domains: []`), and that is structural rather
+than convenient.** Every researcher token is pinned to exactly one domain, and
+the seeding was checked to confirm each `scopes.domains[0]` is that agent's *own*
+`domain_id`. A council has no home domain: it convenes on whichever hypothesis is
+contested, which may be any of them. Pinning it to one domain would not merely be
+awkward — it would make the identity unable to do the thing it exists for, and
+the workaround (mint five domain-pinned council tokens, or re-scope on each run)
+is strictly worse: more credentials, and a scope that changes under you.
+
+**Correction to the pre-push note.** Calling this "wider than anything currently
+minted" was wrong, and the seed script's own dry-run caught it.
+`internal-affairs` has held an **unscoped** token since 2026-08-11 — the
+oversight default is `domains: []`. The accurate claim is narrower: the council
+is the first identity with an unscoped token that **proposes into
+`suggestions`**. IA's unscoped token is not the same exposure, because IA's work
+goes through a capability-narrow route; but it is *not* nil either, since an
+unscoped token bypasses the domain branch of `enforce_agent_quota()` entirely
+(`if jsonb_array_length(v_domains) > 0`), so IA could in principle propose in any
+domain. That is a pre-existing property of the oversight default, noted here
+because this is where it was noticed. It is not fixed here.
+
+**What still bounds the council, with the domain check gone:**
+
+- **It cannot approve.** `apply_suggestion()` keeps its `is_admin()` self-guard,
+  and the approve route rejects agent tokens (`verify-agents`: *"agent token
+  cannot reach the approve route → 401"*). Its verdict is `pending` like
+  everything else, and a human decides.
+- **The quota trigger still fires on it in full.** `enforce_agent_quota()` finds
+  it by `profile_id`, re-stamps `agent_name` so the identity cannot be spoofed,
+  and applies `max_pending: 5` / `max_per_hour: 5` / `max_per_run: 1`. Losing the
+  domain branch loses one of five checks, not the trigger.
+- **Its caps are stated explicitly rather than inherited.** `COUNCIL_SCOPES` is
+  its own constant, not a reuse of `OVERSIGHT_SCOPES` that happens to match: the
+  oversight caps are documented as *nominal* because those agents do not propose,
+  and the council does. `max_per_run: 1` is the shape of the object — one council
+  run, one verdict. `max_per_hour: 5` is a backstop, not a schedule: a local
+  2-round council is 10–20 minutes, so five an hour is already unreachable, and
+  the cap is there for when that assumption stops holding.
+- **The verdict's target is constrained in Postgres** by
+  `trg_councils_verdict_shape`, above.
+- **`status` still governs it.** IA can throttle or suspend the council exactly
+  as it can any other agent, and the derive trigger makes suspension fail-safe.
+- **It is subject to its own trust governor.** `recompute_agent_trust()` treats
+  it like any proposer: five decided proposals below 20% approval and it
+  suspends itself, admin-only to reinstate.
+
+**The dry-run now prints the scope, not just whether a token is minted.** An
+unscoped credential is exactly the thing that should be visible in a plan before
+it is provisioned, and it was invisible when the plan only said "token".
+
+**Not yet seeded.** `--dry-run` has been run and shows 9 agents; the real seed
+has not. Provisioning is `node scripts/seed-agent-roster.mjs --with-tokens`,
+which needs `SUPABASE_SERVICE_ROLE_KEY` and creates one new auth user. Tokens
+print once and are not recoverable.
