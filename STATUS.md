@@ -56,11 +56,20 @@ silently overflows a 32k local context and the failure looks like reasoning.
 `council_turns.context_truncated` records when a turn argued from a truncated
 transcript, so that budget is auditable rather than invisible.
 
-**Known gap, stated rather than left to be discovered:** the migration is live
-ahead of its tests. `verify-agents` (40/40) and `smoke` (87/87) both pass and
-both assert **nothing** about `councils` — their counts are unchanged from the
-stage-2 gate for exactly that reason. The D.9 council assertions (#5, plus the
-anon-can-read / anon-cannot-write pair the new tables now need) are unwritten.
+**The schema is now covered by tests; the runner's promises are not.**
+`verify-agents` is **43/43**, having gained the three D.9 assertions that do not
+need a council to have run: anon can read both tables (the live counterpart to
+0010's guard — since 0009 a new table inherits no anon grant), anon can write
+neither, and `trg_councils_verdict_shape` rejects a non-hypothesis link with
+`23514`. The third is negative-controlled — it asserts the trigger *accepts* a
+hypothesis-targeted link as well as rejecting an evidence-targeted one, because
+a check that only asserts the rejection would pass just as well against a
+trigger that rejected everything.
+
+**What is still unasserted:** D.9 #5 — that a council verdict lands as `pending`
+only, credited to `council`, changing no hypothesis row. That one needs the
+runner, and cannot be written before it. `smoke` stays 87/87 and asserts nothing
+about councils, correctly: there is no `/council/[id]` page yet.
 
 The `council` agent identity is **added to `scripts/seed-agent-roster.mjs` but
 not yet seeded** — via the seed script, not a migration, consistent with "more

@@ -7,12 +7,17 @@
 //   → admin approves → created node + timeline credit the AGENT → caps enforced
 //   (pending cap, hourly cap, domain scope) → bad tokens / disabled agent rejected.
 //
+// It has since grown Phase D blocks: the skeptic lane and citation verifier
+// (0008), the public agent projection (0007), and the council schema (0010) —
+// the last of these covering the three D.9 assertions that do not need the
+// council runner to exist.
+//
 // Requires migrations 0005 + 0006 applied and a dev/prod server running
 // (BASE_URL, default http://localhost:3210). If the agents table is missing it
 // reports BLOCKED (exit 2) rather than a failure. Provisions a temp admin + a
 // temp agent, then removes every artifact.
 import { readFileSync } from "node:fs";
-import { randomBytes, createHash } from "node:crypto";
+import { randomBytes, createHash, randomUUID } from "node:crypto";
 
 for (const line of readFileSync(".env.local", "utf8").split(/\r?\n/)) {
   if (!line || line.startsWith("#") || !line.includes("=")) continue;
@@ -174,7 +179,7 @@ const hypBody = (slug, title, domainId) => ({
   critique: PROBE_CRITIQUE,
 });
 
-const created = { hypotheses: [], evidence: [], sources: [], suggestions: [], agents: [], users: [] };
+const created = { hypotheses: [], evidence: [], sources: [], suggestions: [], agents: [], users: [], councils: [] };
 let admin, agent;
 
 async function run() {
@@ -438,6 +443,105 @@ async function run() {
     }
   }
 
+  // ── Phase D stage 3: the council schema (0010) ──────────────────────────────
+  // The three D.9 assertions that do not need the council runner. The third is
+  // the one that matters: it is the only proof that the deviation-4 shape is
+  // ENFORCED rather than merely intended.
+  {
+    const anonC = createClient(URL_, ANON, { auth: { persistSession: false, autoRefreshToken: false } });
+
+    // Two probe suggestions, written as a HUMAN so enforce_agent_quota returns
+    // before any cap applies, and differing ONLY in target_type — that single
+    // difference is the whole negative control.
+    const mkSuggestion = async (targetType) => {
+      const { data, error } = await service.from("suggestions").insert({
+        target_type: targetType,
+        operation: "create",
+        payload: {},
+        rationale: `${SLUG_PREFIX}council-probe`,
+        proposed_by: admin.userId,
+        actor_type: "human",
+      }).select("id").single();
+      if (error) throw new Error(`probe suggestion (${targetType}): ${error.message}`);
+      created.suggestions.push(data.id);
+      return data.id;
+    };
+    const sHyp = await mkSuggestion("hypothesis");
+    const sEvid = await mkSuggestion("evidence");
+
+    // subject_id deliberately carries no FK (0010: the subject is polymorphic),
+    // so a probe uuid is legitimate here rather than a shortcut around one.
+    const subjectId = created.hypotheses[0] ?? randomUUID();
+    const mkCouncil = (suggestionId) => ({
+      subject_type: "hypothesis",
+      subject_id: subjectId,
+      subject_slug: `${SLUG_PREFIX}council-probe`,
+      subject_title: "probe",
+      status: "running",
+      model: "probe",
+      suggestion_id: suggestionId,
+    });
+
+    // (3) The trigger must DISCRIMINATE, so both halves are asserted: accept the
+    // hypothesis-targeted link, reject the evidence-targeted one with 23514.
+    // Asserting only the rejection would pass just as well if the trigger
+    // rejected everything, which would be a different bug wearing this one's
+    // result.
+    const { data: goodC, error: goodErr } =
+      await service.from("councils").insert(mkCouncil(sHyp)).select("id").single();
+    if (goodC?.id) created.councils.push(goodC.id);
+    const { data: badC, error: badErr } =
+      await service.from("councils").insert(mkCouncil(sEvid)).select("id").single();
+    if (badC?.id) created.councils.push(badC.id);      // only reachable if the shape is NOT enforced
+    check(
+      "council: verdict-shape trigger enforces the deviation-4 shape (23514)",
+      !goodErr && Boolean(goodC?.id) && badErr?.code === "23514",
+      `hypothesis-link=${goodErr ? `REJECTED ${goodErr.code}` : "accepted"}, ` +
+        `evidence-link=${badErr ? `rejected ${badErr.code}` : "ACCEPTED — shape not enforced"}`,
+    );
+
+    // A real turn, so the read assertion below proves a KNOWN row is reachable
+    // rather than proving that an empty table is not an error.
+    let turnId = null;
+    if (goodC?.id) {
+      const { data: t } = await service.from("council_turns").insert({
+        council_id: goodC.id, round: 1, seq: 1, role: "advocate",
+        agent_name: "probe", content: "probe", reasoning: "probe",
+      }).select("id").single();
+      turnId = t?.id ?? null;
+    }
+
+    // (1) The live counterpart to 0010's guard block. Since 0009, a new table
+    // inherits NO anon grant, so this is what proves the explicit grants landed.
+    // It reads the probe rows BACK BY ID: an empty result would not distinguish
+    // "readable but empty" from "readable and denied", and the 0002 failure is
+    // exactly the one that looks like an empty success.
+    const { data: cRead, error: cErr } =
+      await anonC.from("councils").select("id").eq("id", goodC?.id ?? randomUUID());
+    const { data: tRead, error: tErr } =
+      await anonC.from("council_turns").select("id").eq("id", turnId ?? randomUUID());
+    check(
+      "public: anon can read councils and council_turns",
+      !cErr && !tErr && (cRead ?? []).length === 1 && (tRead ?? []).length === 1,
+      cErr?.code ?? tErr?.code ?? `councils=${cRead?.length}, council_turns=${tRead?.length}`,
+    );
+
+    // (2) Read-only means read-only: anon's grant is SELECT alone, and the
+    // admin-write policy stands behind it.
+    const { data: wcData, error: wc } = await anonC.from("councils").insert(mkCouncil(null)).select("id");
+    const { data: wtData, error: wt } = await anonC.from("council_turns").insert({
+      council_id: goodC?.id ?? randomUUID(), round: 9, seq: 9, role: "advocate", content: "probe",
+    }).select("id");
+    for (const row of wcData ?? []) created.councils.push(row.id);   // only if the write got through
+    check(
+      "public: anon cannot write councils or council_turns",
+      Boolean(wc) && Boolean(wt),
+      `councils=${wc ? `blocked ${wc.code}` : "INSERTED"}, ` +
+        `council_turns=${wt ? `blocked ${wt.code}` : "INSERTED"}`,
+    );
+    if ((wtData ?? []).length) await service.from("council_turns").delete().eq("id", wtData[0].id);
+  }
+
   // ── Trust governor recomputed on decision ───────────────────────────────────
   // One approved (above) → trust should be 100 over a single decided suggestion.
   const { data: agentRow } = await service.from("agents").select("trust").eq("id", agent.agentId).single();
@@ -456,6 +560,11 @@ async function run() {
     await service.from("evidence").delete().eq("id", id);
   }
   for (const id of created.sources) await service.from("sources").delete().eq("id", id);
+  // Councils before suggestions: council_turns cascade from councils, and the
+  // suggestion FK is `on delete set null`, so a leftover council would survive
+  // its probe suggestion and sit in a PUBLIC table pointing at nothing.
+  for (const id of created.councils) await service.from("councils").delete().eq("id", id);
+  await service.from("councils").delete().like("subject_slug", `${SLUG_PREFIX}%`);
   await service.from("hypotheses").delete().like("slug", `${SLUG_PREFIX}%`);
   await service.from("evidence").delete().like("slug", `${SLUG_PREFIX}%`);
   for (const id of created.agents) {

@@ -1775,12 +1775,52 @@ NOTICE: D.3: verdict-shape trigger installed (deviation-4 shape enforced in Post
 
 **Verified after the push.** `verify-agents.mjs` **40/40** against the live
 database, and `smoke` **87/87** against `veritas-delta-pearl.vercel.app`. Both
-counts are unchanged, which is the honest reading: **neither script asserts
-anything about `councils` yet.** The D.9 council assertions (#5, and the
-anon-read / anon-cannot-write pair) are still to be written, and the migration is
-live ahead of them. `migration list` also confirmed 0001–0009 in the remote
-ledger — the first time that ledger has been readable, since the roster seeding
-had to confirm 0007 by its effects with the CLI unauthenticated.
+counts were unchanged at that point, which was the honest reading: neither script
+asserted anything about `councils`, and the migration was live ahead of its
+tests. That is addressed immediately below. `migration list` also confirmed
+0001–0009 in the remote ledger — the first time that ledger has been readable,
+since the roster seeding had to confirm 0007 by its effects with the CLI
+unauthenticated.
+
+### The council assertions — verify-agents 40 → 43 (2026-08-28)
+
+The three D.9 assertions that do not require the council runner to exist:
+
+1. **anon CAN read `councils` and `council_turns`.** The live counterpart to
+   0010's guard block. Since 0009 a new table inherits no anon grant, so this is
+   what proves the explicit grants landed rather than the migration merely
+   claiming they did. It reads the probe rows **back by id**: an empty result
+   would not distinguish "readable but empty" from "readable and denied", and the
+   0002 failure is precisely the one that looks like an empty success.
+2. **anon can write neither.** The anon grant is SELECT alone and the
+   admin-write policy stands behind it; both inserts are refused.
+3. **`trg_councils_verdict_shape` rejects a non-hypothesis link with `23514`.**
+   This is the only proof the deviation-4 shape is *enforced* rather than
+   intended, so it is **negative-controlled**: it asserts the trigger accepts a
+   hypothesis-targeted link *and* rejects an evidence-targeted one, differing in
+   nothing but `target_type`. Asserting only the rejection would pass equally
+   well against a trigger that rejected everything — a different bug wearing this
+   one's green result.
+
+The assertion was checked against the live schema rather than trusted for being
+green. Probing the three cases directly:
+
+```
+link → suggestion.target_type=hypothesis : ACCEPTED
+link → suggestion.target_type=evidence   : REJECTED code=23514
+link → (none)                            : ACCEPTED   (an unlinked council is not blocked)
+```
+
+Probe rows are removed in the `finally` block — councils **before** suggestions,
+because `council_turns` cascades from `councils` while the suggestion FK is
+`on delete set null`, so a leftover council would outlive its probe suggestion
+and sit in a **public** table pointing at nothing. Verified after a full run:
+`councils` and `council_turns` both back to 0 rows.
+
+**Still unasserted: D.9 #5** — that a verdict lands `pending` only, credited to
+`council`, changing no hypothesis row. It needs the runner and cannot be written
+before it. `smoke` stays 87/87 and asserts nothing about councils, correctly:
+there is no `/council/[id]` page yet.
 
 ## Council identity — the one credential widening stage 3 asks for
 
