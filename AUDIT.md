@@ -736,6 +736,109 @@ failing result.
 
 ---
 
+### F-11 — MEDIUM — `propose_with_critique` is a security-definer RLS bypass reachable by any signed-in user
+
+Found 2026-08-28 while writing the grants for migration 0011. Verified against
+the live database with a proof of concept; every artifact created was removed.
+
+**The function.** `supabase/migrations/0008_critiques_citations.sql:72-108`
+declares `propose_with_critique(...)` `security definer`. It takes
+`p_proposed_by uuid` and `p_agent_name text` **from the caller** and inserts
+into `suggestions` with `actor_type = 'agent'`. Its grants
+(`0008:110-117`) are:
+
+```sql
+revoke execute on function propose_with_critique(...) from public, anon;
+grant  execute on function propose_with_critique(...) to service_role;
+```
+
+`authenticated` is not revoked, and `0001_core.sql:815` sets a default privilege
+granting EXECUTE on functions to `anon, authenticated, service_role`. So
+`authenticated` retains EXECUTE. Live catalog (`pg_proc.proacl` joined to
+`pg_namespace`, re-read 2026-09-04):
+
+```
+fn      propose_with_critique(p_target_type node_type, p_operation suggestion_operation,
+                              p_target_id uuid, p_payload jsonb, p_rationale text,
+                              p_proposed_by uuid, p_agent_name text, p_critic_name text,
+                              p_verdict critique_verdict, p_body text, p_findings jsonb)
+secdef  true
+owner   postgres
+acl     {postgres=X/postgres,authenticated=X/postgres,service_role=X/postgres}
+        anon=false   auth=true   svc=true
+```
+
+The `revoke ... from public, anon` at `0008:110` is why PUBLIC and `anon` are
+absent. `authenticated=X/postgres` is there because nothing ever revoked it and
+`0001:815` granted it by default — the entry is an inherited default made
+explicit at CREATE time, not a deliberate grant anyone wrote.
+
+**Why the RLS on `suggestions` does not stop it.** The insert policy requires a
+proposer to be themselves:
+
+```
+contributor insert own   INSERT   check=((proposed_by = auth.uid()) AND (status = 'pending'...))
+```
+
+A `security definer` function runs as its owner (`postgres`), so that policy is
+not evaluated for the insert it performs. The function is the bypass.
+
+**Proof of concept, live.** A brand-new user at the *default* role — not a
+researcher, not an admin, not an agent — with a real agent's `profile_id`:
+
+```
+attacker profiles.role = 'public'
+
+── direct INSERT into suggestions, WITH a valid in-scope domain_id ──
+  REFUSED (42501) new row violates row-level security policy for table "suggestions"
+
+── same payload via the RPC ──
+  ALLOWED id=cdfcff05-… agent_name=physics-researcher status=pending
+```
+
+The direct path is refused by RLS; the function accepts it. `agent_name` on the
+forged row is `physics-researcher` — the caller passed `"x"`, and
+`enforce_agent_quota` re-stamped it from the registry, so the forgery is
+*better* attributed than the attacker asked for. A `suggestion_critiques` row is
+written alongside it in the same transaction.
+
+**What it can and cannot do.**
+
+- **Cannot** change the public map. The row is `pending`; `apply_suggestion()`
+  keeps its `is_admin()` self-guard, so approval is still a human decision.
+- **Cannot** exceed the victim agent's caps — `enforce_agent_quota` fires
+  normally, including the domain-scope check.
+- **Can** put agent-attributed content in front of an admin reviewer. Provenance
+  is one of the things a reviewer weighs, and here it is forgeable.
+- **Can** exhaust a chosen agent's quota: `max_pending` (20) and `max_per_hour`
+  (30) are per-agent, so ~20 forged rows make that agent's own proposals fail
+  with `53400` until an admin clears the queue. That is a targeted denial of
+  service against one agent, requiring no privilege beyond a free account.
+
+**The one real barrier is obscurity, not authorization.** The attack needs the
+agent's `profile_id`, which is deliberately absent from every public surface —
+`agent_public` projects `name, display_name, kind, charter, status, domain_slug,
+domain_name, created_at` and nothing else, and `verify-agents.mjs` asserts that
+(*"agent_public leaks no trust / scopes / profile_id"*). Confirmed live during
+this test. But a uuid that must stay secret for an authorization boundary to
+hold is not an authorization boundary. It leaks through any future view, API
+route, admin screenshot, or error message that includes it.
+
+**Severity — MEDIUM, and why not either neighbour.** Not HIGH: nothing reaches
+the published map, and the map is what this project's guarantees are about. Not
+LOW: it is a genuine RLS bypass, it is reachable by anyone who can sign up, and
+the quota-exhaustion path disables a real agent without touching a knowledge
+table.
+
+**Fix.** One line — `revoke execute on function propose_with_critique(...) from
+authenticated;` — but it is a symptom of the class in §11, so it is proposed in
+**§11.7** as step 2 of one migration rather than patched alone. §11.8 records
+that the only legitimate caller reaches it as `service_role`
+(`app/api/agent/suggestions/route.ts:89` via `requireAgent`), so the revoke costs
+the application nothing.
+
+---
+
 ### F-06 — LOW — `VERITAS_CROSSREF_MAILTO` is read by code but absent from `.env.example`
 
 Introduced in Phase D stage 2. Missing it is harmless (it only forfeits
@@ -1799,3 +1902,351 @@ than putting the service role in CI, and it restores the canary's whole purpose.
 
 Runner cost is not the constraint: tiers 1–2 are a few minutes per PR. The
 constraint is entirely about which credentials leave the developer's machine.
+
+---
+
+## 11. Function EXECUTE surface (2026-08-28)
+
+F-11 is one instance of a class, so the whole surface was enumerated. Every
+figure below comes from the live catalog or from a live test, not from reading
+the migrations.
+
+**Re-verified 2026-09-04**, before the fix in 11.7 was proposed and before 0011
+was cleared to ship. Every figure below still holds against the live catalog
+(PostgreSQL 17.6, read as `postgres`) except one, which is corrected in place in
+11.3 and marked there. Nothing in this section writes.
+
+### 11.1 The open default
+
+`0009_default_privileges.sql` closed the default privilege that granted `anon`
+SELECT on future **tables**. `0001_core.sql:815` set the same kind of default for
+**functions**, and 0009 did not touch it. Live `pg_default_acl`, owner
+`postgres`, schema `public`:
+
+```
+objtype 'r' (tables)    -> {postgres=arwdDxtm/postgres,authenticated=arwdDxtm/postgres,service_role=arwdDxtm/postgres}
+objtype 'f' (functions) -> {postgres=X/postgres,anon=X/postgres,authenticated=X/postgres,service_role=X/postgres}
+                                                ^^^^^^^^^^^^^^ still granted
+objtype 'S' (sequences) -> {postgres=rwU/postgres,anon=rU/postgres,authenticated=rU/postgres,service_role=rU/postgres}
+```
+
+`anon` was removed from the tables entry by 0009 and remains on the functions
+entry. On top of that, PostgreSQL's own default grants EXECUTE to `PUBLIC` on
+every new function. So a new function is executable by everyone unless a
+migration explicitly revokes it — and 22 of the 28 functions in `public` are
+PUBLIC-executable today.
+
+### 11.2 Method
+
+- Inventory and ACLs: `pg_proc` joined to `pg_namespace`, with
+  `has_function_privilege()` per role.
+- PUBLIC detection: `exists (select 1 from unnest(proacl) a where a::text like '=%')`
+  — PUBLIC's ACL entry has an **empty grantee**. A first attempt matched `'%=X/%'`
+  and produced a false positive on every `anon=X/…` entry; the figures here are
+  from the corrected test.
+- Breakage tests: run inside `begin; … rollback;` against the live database,
+  using `set local role anon` — nothing was left changed.
+
+### 11.3 The 18 trigger functions have no attack surface
+
+15 are `security definer`. **17** of the 18 are PUBLIC/anon-executable by ACL —
+not all 18, as this section said on 2026-08-28. `assert_council_verdict_shape()`
+was already closed by `0010_council.sql:235`, and the earlier count missed it.
+The 22-of-28 figure in 11.1 was and remains correct. None of the 18 is reachable,
+for two independent reasons, both tested:
+
+**They cannot be called directly.**
+
+```
+select public.log_hypothesis_insert();
+ERROR:  0A000: trigger functions can only be called as triggers
+```
+
+**PostgREST does not expose them.** As `anon` against `/rest/v1/rpc/…`:
+
+```
+log_hypothesis_insert   HTTP 404 {"code":"PGRST202", …}
+enforce_agent_quota     HTTP 404 {"code":"PGRST202", …}
+handle_new_user         HTTP 404 {"code":"PGRST202", …}
+```
+
+**And revoking EXECUTE does not stop them firing** — the privilege is checked at
+`CREATE TRIGGER`, not per row:
+
+```
+begin;
+  revoke execute on function public.touch_updated_at() from public, anon, authenticated, service_role;
+  revoke execute on function public.log_hypothesis_update() from public, anon, authenticated, service_role;
+  update public.hypotheses set popularity = popularity where id = (select id from public.hypotheses limit 1);
+  -> "update succeeded with trigger EXECUTE revoked"
+rollback;
+```
+
+So the 17 open grants are **noise, not risk**. They are worth revoking for
+hygiene — so that a future audit of this table has 10 rows to reason about
+instead of 28 — but no finding is filed against them.
+
+Enumerated per function, because the open default makes this a class rather than
+a summary. "Holds EXECUTE" is live state on 2026-09-04. The third column is the
+same three-part answer for every row above the last three — *not callable
+(`0A000`), not routed by PostgREST, and revoking would not stop it firing* — so
+what actually varies is what the definer context would reach if any of that were
+untrue.
+
+| Trigger function | Def | Holds EXECUTE | Intended? | If called by a role that should not have it |
+|---|---|---|---|---|
+| `enforce_agent_quota()` | SECDEF | PUBLIC, anon, auth, svc | No — inherited | On `suggestions`: enforces caps and domain scope and re-stamps `agent_name` from the registry. Would be the highest-value target here; all three barriers hold. |
+| `guard_role_change()` | SECDEF | PUBLIC, anon, auth, svc | No — inherited | On `profiles`: the privilege-escalation guard on `role`. Same three barriers. |
+| `handle_new_user()` | SECDEF | PUBLIC, anon, auth, svc | No — inherited | On `auth.users`: creates the `profiles` row. Same three barriers. |
+| `on_agent_suggestion_decided()` | SECDEF | PUBLIC, anon, auth, svc | No — inherited | On `suggestions`: drives the trust recompute. Same three barriers. |
+| `on_evidence_linked()` | SECDEF | PUBLIC, anon, auth, svc | No — inherited | On `hypothesis_evidence`. Same three barriers. |
+| `on_evidence_unlinked()` | SECDEF | PUBLIC, anon, auth, svc | No — inherited | On `hypothesis_evidence`. Same three barriers. |
+| `log_confidence_change()` | SECDEF | PUBLIC, anon, auth, svc | No — inherited | On `hypotheses`: writes `confidence_history`. Same three barriers. |
+| `log_hypothesis_insert()` | SECDEF | PUBLIC, anon, auth, svc | No — inherited | On `hypotheses`. Same three barriers. |
+| `log_hypothesis_update()` | SECDEF | PUBLIC, anon, auth, svc | No — inherited | On `hypotheses`. Same three barriers. |
+| `log_contradiction_change()` | SECDEF | PUBLIC, anon, auth, svc | No — inherited | On `contradictions`. Same three barriers. |
+| `log_evidence_insert()` | SECDEF | PUBLIC, anon, auth, svc | No — inherited | On `evidence`. Same three barriers. |
+| `log_note_published()` | SECDEF | PUBLIC, anon, auth, svc | No — inherited | On `research_notes`. Same three barriers. |
+| `log_question_insert()` | SECDEF | PUBLIC, anon, auth, svc | No — inherited | On `questions`. Same three barriers. |
+| `log_simulation_completed()` | SECDEF | PUBLIC, anon, auth, svc | No — inherited | On `simulation_runs`. Same three barriers. |
+| `assert_council_verdict_shape()` | SECDEF | svc only | **Yes** | On `councils`. The one trigger function already closed (`0010_council.sql:235`), and its trigger still fires — barrier three demonstrated in production rather than in a rolled-back test. |
+| `derive_agent_enabled()` | invoker | PUBLIC, anon, auth, svc | No — inherited | On `agents`: derives `enabled` from `status`. Security **invoker**, so it carries no privilege the caller lacks even hypothetically. |
+| `enforce_active_rationale()` | invoker | PUBLIC, anon, auth, svc | No — inherited | On `hypotheses`. Security invoker; no privilege of its own. |
+| `touch_updated_at()` | invoker | PUBLIC, anon, auth, svc | No — inherited | On six tables (`agents`, `evidence`, `hypotheses`, `questions`, `research_notes`, `suggestions`). Security invoker; no privilege of its own. |
+
+### 11.4 The 10 callable functions
+
+`svc` = `service_role`, `auth` = `authenticated`. "Holds EXECUTE" is live state.
+
+| Function | Def | Holds EXECUTE | Intended? | If called by a role that should not have it |
+|---|---|---|---|---|
+| `is_admin()` | SECDEF | PUBLIC, anon, auth, svc | **Yes — and required** | Returns `false` for `anon` (`auth.uid()` is null). Reads no row the caller could not reach. **Must not be revoked** — see 11.5. |
+| `global_search(text,int)` | invoker | PUBLIC, anon, auth, svc | Yes (`0001:828`) | Security **invoker**, so the caller's RLS applies; it can return nothing the caller could not select directly. No bypass. |
+| `suggested_confidence(uuid)` | invoker | PUBLIC, anon, auth, svc | Yes (`0001:829`) | Security **invoker**. Same reasoning. No bypass. |
+| `increment_popularity(uuid)` | SECDEF | PUBLIC, anon, auth, svc | Yes (`0001:830`) | Anon can increment any hypothesis's `popularity` without limit and with no rate limit anywhere. Consequence is bounded to that one denormalized counter: **`popularity` is not a trustworthy metric and should not be read as one.** No other column is reachable. |
+| `apply_suggestion(uuid,text)` | SECDEF | auth, svc | Yes | Self-guards `is_admin()` on the first line and raises `42501` otherwise, so a non-admin `authenticated` caller gets nothing. Asserted by `verify-agents.mjs` (*"agent token cannot reach the approve route → 401"*). No exposure. |
+| `is_contributor()` | SECDEF | PUBLIC, anon, auth, svc | **Over-granted** | Returns `false` for `anon`; no data exposure, so this is hygiene rather than a finding. Revoking `anon`/PUBLIC breaks **nothing**, and not merely because a test passed: the only policy in `public` that references it is `suggestions."contributor insert own"`, a WITH CHECK on **INSERT**, and `anon` holds neither INSERT nor SELECT on `suggestions`. So it is never on an anon code path at all — which is a stronger statement than 11.5 can make about `is_admin()`. `authenticated` must keep it: that policy is evaluated as the caller. |
+| `recompute_agent_trust(uuid)` | SECDEF | auth, svc | **Over-granted** | Only caller is the `on_agent_suggestion_decided` trigger, which needs no EXECUTE (11.3). An `authenticated` caller can force a recompute for any profile id. The value is derived from real `suggestions` rows, so it **cannot be fabricated** — but it can force a trust-floor suspension early, before the decision that would have triggered it. LOW. |
+| `refresh_dashboard_stats()` | SECDEF | auth, svc | Yes, but **guard fails open** | Guard is `if auth.uid() is not null and not is_admin() then raise`. A caller with a **null** `auth.uid()` — i.e. `anon` — skips it entirely. Anon has no EXECUTE today, so the **grant is the only thing keeping anon out**; the in-function guard would not. |
+| `scan_contradictions()` | SECDEF | auth, svc | Yes, but **guard fails open** | Same guard shape, and this one **writes** to `contradictions`. Same conclusion: the grant is the whole defence. |
+| `propose_with_critique(…)` | SECDEF | auth, svc | **No — see F-11** | An RLS bypass: `p_proposed_by` is caller-supplied and the definer context skips the `contributor insert own` policy. Proven live with a `profiles.role = 'public'` account. |
+
+### 11.5 `is_admin()` must keep its `anon` grant — the 0002 shape, again
+
+Revoking EXECUTE from `anon` breaks anonymous reads on four relations, because
+their RLS policies evaluate `is_admin()` for every caller:
+
+```
+begin; revoke execute on function public.is_admin() from anon, public;
+       set local role anon; select count(*) from public.<rel>; rollback;
+
+  hypotheses        BREAKS  permission denied for function is_admin
+  graph_nodes       BREAKS  permission denied for function is_admin
+  profiles          BREAKS  permission denied for function is_admin
+  research_notes    BREAKS  permission denied for function is_admin
+  (17 other anon-readable relations: ok)
+```
+
+That is `/`, `/hypotheses`, `/graph` and `/notes` — a large part of the public
+site — failing exactly the way 0002 did.
+
+**The 17 that pass are not proof of safety.** 16 anon-readable relations carry an
+`is_admin()` policy (`citation_checks`, `contradictions`, `councils`,
+`council_turns`, `domains`, `evidence`, `graph_edges`, `hypothesis_evidence`,
+`questions`, `simulations`, `simulation_runs`, `sources`, …) and most of them
+survive the revoke — presumably because the planner satisfied a permissive
+`using (true)` policy first and never evaluated the other branch. That is a
+**planner-dependent short-circuit, not a guarantee**: the same query could
+evaluate `is_admin()` after a statistics change. Treat the four as a lower
+bound, and `is_admin()`'s `anon` grant as load-bearing.
+
+### 11.6 Does closing the function default break anything?
+
+**No.** `ALTER DEFAULT PRIVILEGES` affects only objects created *after* it runs,
+and **every existing function already carries an explicit ACL**:
+
+```
+select count(*) filter (where proacl is null) as null_acl, count(*) as total
+  from pg_proc … where nspname='public';
+  -> {"null_acl": 0, "total": 28}
+```
+
+So `global_search`, `suggested_confidence`, `increment_popularity` and
+`is_admin` keep the grants they hold today — each is an explicit
+`anon=X/postgres` entry, not an inherited default:
+
+```
+is_admin  {=X/postgres,postgres=X/postgres,anon=X/postgres,authenticated=X/postgres,service_role=X/postgres}
+```
+
+This is the same argument 0009 made for tables, and it should carry the same
+verification block: assert those four are still anon-executable *after* the
+change rather than assuming it.
+
+**The cost is operational, and it is real.** Once the default is closed, every
+future function that `anon` or `authenticated` legitimately needs must carry an
+explicit `GRANT`. The dangerous case is a helper called inside an RLS policy: a
+new `is_admin()`-like function with no grant would produce 11.5's failure — empty
+pages, HTTP 200 — and the migration that added it would look correct. Any
+migration adding such a helper must grant it and assert the grant.
+
+### 11.7 The proposed fix — one migration, `0012_function_privileges.sql`
+
+**Not written. Proposed here for approval first**, because it changes a default
+that every future migration inherits.
+
+**Shape: exactly 0009's, one object type over.** Close the default with an
+explicit `FOR ROLE`, then revoke what is already over-granted, then verify that
+what must keep working still does.
+
+```sql
+-- 1. Close the default. FOR ROLE postgres is explicit for 0009's reason:
+--    without it the statement binds to the CURRENT role and can be a no-op that
+--    reads like a fix. postgres owns all 28 functions in public (live check).
+--    PUBLIC is in the revoke list because PostgreSQL's own built-in default
+--    grants EXECUTE to PUBLIC on every new function; revoking anon and
+--    authenticated alone would leave the default wide open through PUBLIC.
+--    service_role is kept: it is the server's role, every function is meant to
+--    be callable by it, and it holds an explicit grant on all 28 today anyway.
+alter default privileges for role postgres in schema public
+  revoke execute on functions from public, anon, authenticated;
+
+-- 2. F-11. The one finding, and the only line here that closes a live bypass.
+revoke execute on function propose_with_critique(
+  node_type, suggestion_operation, uuid, jsonb, text, uuid, text, text,
+  critique_verdict, text, jsonb) from authenticated;
+
+-- 3. The second over-grant from 11.4. Its only caller is a trigger, which needs
+--    no EXECUTE; no application code calls it (grep of app/, lib/, scripts/).
+revoke execute on function recompute_agent_trust(uuid) from authenticated;
+
+-- 4. Hygiene, not risk (11.4). authenticated is KEPT - the suggestions INSERT
+--    policy evaluates is_contributor() as the caller.
+revoke execute on function is_contributor() from public, anon;
+
+-- 5. The 17 open trigger functions (11.3). Noise, not risk: revoking EXECUTE
+--    does not stop a trigger firing, which was tested under rollback and is
+--    demonstrated in production by assert_council_verdict_shape.
+revoke execute on function enforce_agent_quota()          from public, anon, authenticated;
+revoke execute on function guard_role_change()            from public, anon, authenticated;
+revoke execute on function handle_new_user()              from public, anon, authenticated;
+revoke execute on function on_agent_suggestion_decided()  from public, anon, authenticated;
+revoke execute on function on_evidence_linked()           from public, anon, authenticated;
+revoke execute on function on_evidence_unlinked()         from public, anon, authenticated;
+revoke execute on function log_confidence_change()        from public, anon, authenticated;
+revoke execute on function log_contradiction_change()     from public, anon, authenticated;
+revoke execute on function log_evidence_insert()          from public, anon, authenticated;
+revoke execute on function log_hypothesis_insert()        from public, anon, authenticated;
+revoke execute on function log_hypothesis_update()        from public, anon, authenticated;
+revoke execute on function log_note_published()           from public, anon, authenticated;
+revoke execute on function log_question_insert()          from public, anon, authenticated;
+revoke execute on function log_simulation_completed()     from public, anon, authenticated;
+revoke execute on function derive_agent_enabled()         from public, anon, authenticated;
+revoke execute on function enforce_active_rationale()     from public, anon, authenticated;
+revoke execute on function touch_updated_at()             from public, anon, authenticated;
+```
+
+**What it must NOT contain.** No `revoke execute on all functions in schema
+public` followed by re-grants. That is the 0002 shape — revoke everything,
+re-grant from memory, discover in production which one was forgotten — and
+0009's header exists to say so. Every revoke above names one function.
+
+**Untouched, deliberately:** `is_admin()` (11.5 — load-bearing for `anon`),
+`global_search`, `suggested_confidence`, `increment_popularity` (the public
+site), `apply_suggestion`, `scan_contradictions`, `refresh_dashboard_stats`
+(called as `authenticated` — see 11.8).
+
+**Verification block**, in 0009's style — each guard asserts a promise the
+migration makes:
+
+1. `anon` still holds EXECUTE on `is_admin`, `global_search`,
+   `suggested_confidence`, `increment_popularity`.
+2. `authenticated` still holds EXECUTE on `apply_suggestion`,
+   `scan_contradictions`, `refresh_dashboard_stats`, `is_contributor`,
+   `is_admin`.
+3. `service_role` still holds EXECUTE on all 10 callable functions.
+4. `anon` and `authenticated` hold EXECUTE on **neither** `propose_with_critique`
+   nor `recompute_agent_trust`.
+5. `pg_default_acl` for `defaclobjtype='f'`, owner `postgres`, schema `public`
+   contains no `anon=`, no `authenticated=` and no PUBLIC (`=X/`) entry.
+
+Guard 1 is the F-07/0002 guard: if it ever fails, the site serves empty pages
+with HTTP 200 and nothing else reports it.
+
+### 11.8 Does the close break anything? — the per-caller answer
+
+11.6 answers this from the catalog: **no**, because all 28 functions carry an
+explicit ACL (`count(*) filter (where proacl is null)` -> `0`), so nothing in
+existence today inherits anything from the default being closed. That argument
+covers the default. It does not cover the revokes in steps 2-5, so those were
+checked against every call site instead.
+
+The distinction that decides each row: `requireAgent()` builds its client with
+`createAdminClient()` (`lib/api.ts:127`), so agent routes call as
+**`service_role`**; `requireUser()` / `requireAdmin()` use `createClient()`
+(`lib/api.ts:46,76`), so admin routes call as **`authenticated`**; the query
+layer and client components call as **`anon`**.
+
+| Function | Called from | Calls as | Effect of the proposed change |
+|---|---|---|---|
+| `global_search` | `lib/queries/search.ts:11`, `scripts/audit-pages.mjs:105` | anon | **None** — not touched; explicit `anon=X` retained. |
+| `suggested_confidence` | `lib/queries/hypotheses.ts:136` | anon | **None** — not touched. |
+| `increment_popularity` | `components/ViewTracker.tsx:16`, `lib/queries/hypotheses.ts:153` | anon | **None** — not touched. |
+| `is_admin` | RLS policies on 15 anon-readable relations; `scripts/diagnose-rls.mjs:64` | anon | **None** — not touched (11.5). |
+| `apply_suggestion` | `app/api/suggestions/[id]/approve/route.ts:29` | authenticated (`requireAdmin`) | **None** — `authenticated` retained. |
+| `scan_contradictions` | `app/api/contradictions/scan/route.ts:13` | authenticated (`requireAdmin`) | **None** — retained. The route comment ("runs under the admin's session so the security-definer function's internal guard also passes") makes this grant deliberate. |
+| `refresh_dashboard_stats` | `app/api/stats/route.ts:52` | authenticated (`requireAdmin`) | **None** — retained. |
+| `is_contributor` | no call site; one INSERT WITH CHECK on `suggestions` | authenticated | **None** — `authenticated` retained, and `anon` cannot reach that policy. |
+| `propose_with_critique` | `app/api/agent/suggestions/route.ts:89` | **service_role** (`requireAgent`) | **None to the app.** The only legitimate caller never used the `authenticated` grant. Closes F-11. |
+| `recompute_agent_trust` | `on_agent_suggestion_decided` trigger only | — | **None** — triggers do not check EXECUTE. |
+| the 17 trigger functions | their triggers | — | **None** — 11.3, three independent barriers. |
+
+So no legitimate caller anywhere loses a privilege it uses. The revokes remove
+only capability that no code path exercises.
+
+**The cost is future, and it is real** — restated from 11.6 because it is the
+reason this needs approval rather than review. After this, every new function
+`anon` or `authenticated` legitimately needs must carry an explicit `GRANT`, and
+the dangerous case is a new helper called inside an RLS policy: it would fail the
+way 11.5 describes, as empty pages with HTTP 200, and the migration that added it
+would read as correct. Any migration adding such a helper must grant **and**
+assert the grant.
+
+### 11.9 Residuals this migration cannot, or should not, close
+
+Recorded rather than hidden, in 0009 section 2's style.
+
+1. **`supabase_admin`'s default ACL.** `pg_default_acl` holds a second functions
+   entry for schema `public`, owned by `supabase_admin`:
+   `{postgres=X/supabase_admin,anon=X/supabase_admin,authenticated=X/supabase_admin,service_role=X/supabase_admin}`.
+   Any function `supabase_admin` creates in `public` is anon-executable, and
+   `ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin` cannot run as `postgres`
+   (not a member, not superuser). Identical to 0009's table residual and equally
+   latent: `supabase_admin` owns 0 of the 28 functions.
+2. **0009 closed the table default for `anon` only.** The live entry is
+   `{postgres=arwdDxtm/postgres,authenticated=arwdDxtm/postgres,service_role=arwdDxtm/postgres}`
+   — every future table in `public` is still granted **ALL** to `authenticated`
+   by default. RLS contains that for a table that enables RLS; a future table
+   that forgets to is readable and writable by any signed-in account. Same class,
+   different object type, and out of scope for a migration about functions -
+   raised here so it is on the record rather than rediscovered later.
+3. **The sequence default is untouched:**
+   `objtype 'S' -> {postgres=rwU/postgres,anon=rU/postgres,authenticated=rU/postgres,service_role=rU/postgres}`.
+   `anon` can read every future sequence's current value. Low consequence, same
+   class, not fixed here.
+
+### 11.10 Ordering against 0011
+
+0011's `revoke execute on function ia_apply_sanction(...) from public, anon,
+authenticated` stays, and stays load-bearing. Migrations apply in filename order,
+so on any fresh database 0011 runs **before** 0012 and creates
+`ia_apply_sanction` while the default is still open — its own revoke is the only
+thing standing between a visitor and `agents.status` at that moment. Pushed
+together against the live database, the same order holds.
+
+What does need amending is one sentence of prose. 0011's grants comment says the
+functions default "is still open today", which stops being true the moment 0012
+applies; it should point forward to 0012 rather than state an open condition as
+permanent. That is a comment edit, not a behaviour change, and 0011's
+verification block already asserts its revoke took effect regardless of what the
+default does.
