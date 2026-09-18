@@ -958,9 +958,86 @@ exposure of the two, not a footnote to the anon case.
   empty under HTTP 200 for weeks). Paying that risk for **no reachable**
   reduction in exposure is a bad trade.
 
-**What is watched instead.** `scripts/smoke.ts` asserts that the
-`postgres`-owned default ACL for `public` tables contains no `anon=` entry, so a
-platform re-application of its baseline cannot silently undo 0009. See §9.
+**What is watched instead.** `f07Canary()` in `scripts/verify-agents.mjs`
+asserts that the `postgres`-owned default ACL for `public` tables contains no
+`anon=` entry, so a platform re-application of its baseline cannot silently undo
+0009. (Not `scripts/smoke.ts`, as this paragraph previously said: `pg_default_acl`
+is not PostgREST-exposed, so the check needs a platform credential and `smoke`
+must stay runnable on public credentials alone.) It watches the `anon` half only
+— see F-12. See §9.
+
+---
+
+### F-12 — LOW — `ALTER DEFAULT PRIVILEGES` grants `authenticated` ALL on every future table
+
+The same class as F-07 and F-11, one role over. 0009 inverted the table default
+for `anon` and stopped there, so the `postgres`-owned default ACL for `public`
+tables is now:
+
+```
+{postgres=arwdDxtm/postgres,authenticated=arwdDxtm/postgres,service_role=arwdDxtm/postgres}
+```
+
+Every table created in `public` from here on is granted **ALL** to
+`authenticated` — SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER,
+MAINTAIN — before any migration writes a single policy.
+
+**The grant has two halves with different provenance, and only one is ours.**
+
+- **`arwd` is ours and is closable.** `supabase/migrations/0001_core.sql:808-809`
+  says so literally:
+  ```sql
+  alter default privileges in schema public
+    grant select, insert, update, delete on tables to authenticated;
+  ```
+  It is the exact counterpart of the `anon` statement two lines above it that
+  0009 revoked, and it was left standing.
+- **`Dxtm` is platform-authored and is the accepted F-07a residual.** We grant
+  `authenticated` four verbs; the live default carries eight. The extra bits
+  arrive from Supabase's own baseline, by the three proofs in F-07a.
+
+**Why this is not a live defect.** All **23** tables in `public` enable RLS —
+verified by counting `enable row level security` across all twelve migrations
+against every `create table`, 23 for 23, with no exceptions. RLS with no
+permissive policy for `authenticated` denies the row, so the `arwd` half is
+contained everywhere it currently applies. Classification is *hazard*, not
+*defect*, in F-07's own words.
+
+**What the hazard actually is, stated more exactly than "RLS contains it."**
+
+1. **RLS contains `arwd` only for a table that remembers to enable it.** A future
+   migration that ships a `public` table without `enable row level security` is
+   fully readable *and writable* by any signed-in account — not read-only, as in
+   the F-07 case, and not by anonymous visitors, but by every holder of a real
+   session. 0003, 0006, 0007, 0008, 0010 and 0011 each remembered; the default
+   requires that they keep remembering.
+2. **RLS does not contain `Dxtm` at all, even when enabled.** TRUNCATE is not
+   subject to row-level security in PostgreSQL. A future table that does
+   everything right still hands `authenticated` a verb RLS cannot restrain. This
+   is not reachable through PostgREST, which exposes no TRUNCATE verb — that is
+   why F-07a accepted it — but the acceptance was reasoned about *existing*
+   relations, and it silently extends to every table not yet written.
+
+**The existing canary does not watch this.** `f07Canary()` in
+`scripts/verify-agents.mjs:604-678` asserts only that the `public` default ACL
+contains no `anon=` entry. It already fetches the entire ACL string — the
+`authenticated=arwdDxtm` above is *in the value it reads* — and passes anyway,
+because nothing looks at it. Whatever a fix costs, the detection does not: it is
+a second assertion over a string the harness has already retrieved.
+
+**Status: OPEN — recorded, not fixed (2026-09-18).** Deliberately not remediated
+in this pass. This is a known state rather than a discovery, which is the point
+of writing it down: a future `\dp` or `pg_default_acl` audit showing
+`authenticated=arwdDxtm` should resolve to this entry.
+
+**Severity reasoning, since it is a judgement call.** LOW matches F-07's
+treatment of the identical shape — zero current violations, nothing reachable
+today. It is the *upper* end of LOW rather than the middle, because the blast
+radius when it trips exceeds F-07's in two directions at once: write rather than
+read, and a real session rather than an anonymous one. **It becomes MEDIUM the
+day a `public` table ships without RLS**, and nothing in the gates would report
+that day — there is no assertion anywhere that every table in `public` has
+`relrowsecurity` set.
 
 ---
 
@@ -2223,13 +2300,11 @@ Recorded rather than hidden, in 0009 section 2's style.
    `ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin` cannot run as `postgres`
    (not a member, not superuser). Identical to 0009's table residual and equally
    latent: `supabase_admin` owns 0 of the 28 functions.
-2. **0009 closed the table default for `anon` only.** The live entry is
-   `{postgres=arwdDxtm/postgres,authenticated=arwdDxtm/postgres,service_role=arwdDxtm/postgres}`
-   — every future table in `public` is still granted **ALL** to `authenticated`
-   by default. RLS contains that for a table that enables RLS; a future table
-   that forgets to is readable and writable by any signed-in account. Same class,
-   different object type, and out of scope for a migration about functions -
-   raised here so it is on the record rather than rediscovered later.
+2. **0009 closed the table default for `anon` only** — every future table in
+   `public` is still granted **ALL** to `authenticated`. Out of scope for a
+   migration about functions, and larger than a sub-bullet: **promoted to its own
+   finding, F-12**, where the provenance split (`arwd` ours, `Dxtm` platform),
+   the RLS/TRUNCATE containment limits and the severity reasoning are recorded.
 3. **The sequence default is untouched:**
    `objtype 'S' -> {postgres=rwU/postgres,anon=rU/postgres,authenticated=rU/postgres,service_role=rU/postgres}`.
    `anon` can read every future sequence's current value. Low consequence, same
