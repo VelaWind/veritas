@@ -6,145 +6,112 @@ Rolling status for review between phases. Most recent phase on top.
 
 ## Phase D — The agent society 🚧 IN PROGRESS (design signed off 2026-08-10)
 
-Design: `DECISIONS.md` → "Phase D" (D.0–D.10), signed off with four answers
-recorded there. Implementation runs in the D.10 order, one migration and one
-commit per stage.
+Design and rationale: `DECISIONS.md` → "Phase D" (D.0–D.10) for the plan, and the
+dated stage write-ups that follow it for what each stage actually decided. This
+file records only **what is live and what is next**.
 
 | Stage | State |
 |---|---|
-| 1 — roster, status, public profiles (`0007`) | ✅ **shipped & live-verified** |
-| 2 — skeptic lane + citation verifier (`0008`) | ✅ **shipped & live-verified** |
-| 3 — council (`0009`) | not started |
-| 4 — Internal Affairs (`0010`) | not started |
+| 1 — roster, status, public profiles (`0007`) | ✅ shipped & live-verified |
+| 2 — skeptic lane + citation verifier (`0008`) | ✅ shipped & live-verified |
+| 3 — council (`0010`) | ✅ shipped & live-verified — verdict **deliberately stops before the queue** |
+| 4 — Internal Affairs (`0011`) | ✅ schema & sanction live — **no route, no runner, no audit has run** |
 | 5 — site features (debate, confidence-over-time, changelog) | not started |
 
-Migrations 0007 and 0008 are **applied to the linked project** (`supabase db
-push`). Every gate is green against the live database:
+Stage 3 is `0010` and stage 4 is `0011`, not the `0009`/`0010` the D.10 order
+originally named: 0009 went to the F-07 default-privileges fix. DECISIONS §D.6 is
+corrected.
+
+**Applied to the linked project** (`supabase db push`): 0007, 0008, 0010, 0011,
+plus 0009 and 0012 from outside the Phase D sequence, which close the two open
+default privileges — 0009 for future tables, 0012 for future functions. 0012 also
+revoked the over-grants the old default had already handed out, taking
+PUBLIC-executable functions in `public` from 22 to 4 and closing a live
+security-definer RLS bypass. Why, and the per-function surface: `AUDIT.md` F-07,
+F-11 and §11.
+
+### Gates — all green against the live database, last run 2026-09-05 (after 0012)
 
 | Gate | Result |
 |---|---|
-| `node scripts/verify-agents.mjs` | ✅ **ALL GREEN — 38** (was 19 at Phase B) |
-| `node scripts/verify-suggestions.mjs` | ✅ ALL GREEN — 25 (human path unaffected) |
-| `npm run build` (live credentials) | ✅ green, 117/117 pages |
-| `npm run validate:sql` (9 files) | ✅ green |
-| `tsc --noEmit` · `contrast.mjs` | ✅ clean |
+| `node scripts/verify-agents.mjs` | ✅ ALL GREEN — **43** (19 at Phase B, 38 at stage 2, 40 → 43 with the D.9 council assertions) |
+| `node scripts/verify-suggestions.mjs` | ✅ ALL GREEN — **25** (the human contributor path, unaffected by 0012) |
+| `npm run smoke` (against production) | ✅ ALL GREEN — **95** (87 → 93 with `/council/[id]`, 93 → 95 with the truncation marker) |
+| `npm run test:unit` | ✅ **56** across two files — 25 `test-sanitize`, 31 `test-council-budget` |
+| `npm run validate:sql` (**13** files) | ✅ green |
+| `npm run build` (live credentials) | ✅ green, **127/127** pages |
+| `tsc --noEmit` · `contrast.mjs` | ✅ clean · ALL PASS |
 
-The 0007 gate earned its keep: it caught a real regression. The Phase B probe
-disabled an agent by writing `enabled: false`, which 0007 made inert — the agent
-kept proposing. The check now asserts both halves of the new contract.
+### What is live
 
-### Where stage 3 stands
-
-**Schema, runner, and transcript page are live. The verdict does not reach the
-queue yet, and that is the deliberate stop-point.**
-
-`0010_council.sql` was applied 2026-08-27 — `councils` and `council_turns`, both
-public, plus the enums, the anon grants, and a trigger that enforces the
-deviation-4 shape in Postgres. (It is **0010**, not the `0009_council.sql` this
-section used to name: 0009 went to the F-07 default-privileges fix, so IA becomes
-0011. DECISIONS §D.6 is corrected.)
-
+**Stage 3 — council.** `0010_council.sql` (applied 2026-08-27) gives `councils`
+and `council_turns`, both public, with `trg_councils_verdict_shape` enforcing the
+deviation-4 shape in Postgres rather than by convention.
 `scripts/run-council.mjs` drives advocate → skeptic → verifier → synthesizer over
-`--rounds N` (default 2), writing each turn as it happens, and `/council/[id]`
-renders the transcript publicly. One genuine council is live:
-`dark-matter-is-modified-gravity`, 2 rounds, 8 turns, outcome `split`.
-
-**The verdict stops at `councils.verdict`.** `suggestion_id` stays null, no
-council needs the `council` identity or a token, and nothing this stage produces
-can reach `suggestions`. Wiring it to the propose route is the next step.
-
-**The context budget is proven, not asserted.** `buildTranscriptContext` is a
-pure function in `scripts/agent-lib/council.mjs`, exercised directly and then run
-for real at `--context-budget 200` so truncation had to occur:
-`context_truncated` came back `false` on the two turns where nothing was dropped
-and `true` on the other six, while the same council at the default 6000-token
-budget truncated nothing. Note it is a budget with a **floor of one turn** — the
-newest turn is always included even if it alone exceeds the budget, because a
-turn that cannot see the argument before it is not in a debate.
-
-**Abort was made to happen, not assumed.** Forcing a model failure after the
-council row was open produced `status='aborted'` with a non-empty
-`abort_reason`, as the CHECK requires. What it cannot cover: a hard kill runs no
-code, so a stale `running` council remains possible. Running out of model budget
-is deliberately `no_verdict` on a **complete** council, not an abort.
-
-Two decisions already made and worth not re-litigating: a council convened on a
-**question** proposes against that question's most contested hypothesis (the B.9
-deviation-4 shape, so `apply_suggestion()` stays untouched — now enforced by
-`trg_councils_verdict_shape`, not by convention), and the transcript passed
-between rounds is budgeted, as above.
-
-**The schema is now covered by tests; the runner's promises are not.**
-`verify-agents` is **43/43**, having gained the three D.9 assertions that do not
-need a council to have run: anon can read both tables (the live counterpart to
-0010's guard — since 0009 a new table inherits no anon grant), anon can write
-neither, and `trg_councils_verdict_shape` rejects a non-hypothesis link with
-`23514`. The third is negative-controlled — it asserts the trigger *accepts* a
-hypothesis-targeted link as well as rejecting an evidence-targeted one, because
-a check that only asserts the rejection would pass just as well against a
-trigger that rejected everything.
-
-`smoke` is **87 → 93**: `councils` and `council_turns` join the F-07 keep-public
-list, plus four assertions on `/council/[id]`. That page's id is a runtime uuid,
-so unlike every other page spec it **discovers** its target — it asks the public
-API for the newest complete council and renders that. A missing council fails
-rather than skips.
-
-**The budget now has a repeatable test.** `scripts/test-council-budget.mjs` is
-its own file in `test:unit` (**25 + 31 = 56 passed**): 31 assertions over
-`buildTranscriptContext`, no fixtures, no live database, no model. It was
-**mutation-tested** — `council.mjs` was broken five ways (dropped `reverse()`,
-oldest-first selection, no one-turn floor, `truncated` pinned true, pinned
-false) and every mutation was caught.
-
-**The truncation marker now has a live example.** Two public councils, and the
-contrast is the point:
+`--rounds N` (default 2), and `/council/[id]` renders the transcript publicly.
+**Two** councils are live:
 
 | council | subject | outcome | truncated |
 |---|---|---|---|
 | `22c63a47` | `dark-matter-is-modified-gravity` | `split` | 0 of 8 |
 | `b9d8f7e4` | `life-began-rna-world` | `consensus` | 6 of 8 |
 
-`smoke` is **93 → 95**, asserting that a public council *has* a truncated turn
-and that the marker renders on its page. The marker appears 12 times on
-`b9d8f7e4` and 0 times on `22c63a47`, so the assertion discriminates rather than
-matching page chrome.
+The transcript budget (`buildTranscriptContext`) is covered by 31 mutation-tested
+unit assertions with no database and no model; abort was exercised rather than
+assumed. Why the budget has a one-turn floor, why the contrast pair exists, and
+what the abort test cannot cover: DECISIONS → *Council runner and transcript
+page* and *Council follow-ups*.
 
-**What is still unasserted or missing:**
+**Stage 4 — Internal Affairs.** `0011` (applied 2026-09-04) gives `agent_audits`
+(admin-only RLS), `ia_apply_sanction()`, and the `agent_status_rank()` ladder.
+The sanction ladder is one-way in Postgres — IA can throttle or suspend and
+cannot reinstate, and refuses any move that is not strictly more restrictive.
+`agent_audits` holds **0 rows**; nothing has run. The `internal-affairs` identity
+was seeded at stage 1. Why the ladder is shaped that way: DECISIONS §D.4.
 
-- **D.9 #5** — that a council verdict lands as `pending` only, credited to
-  `council`, changing no hypothesis row. It needs the verdict wired to the queue,
-  which is deliberately not done yet.
-- **`councils` does not record the context budget a run used.** `b9d8f7e4` ran at
-  `--context-budget 600`, not the 6000 default, and nothing on the page or in the
-  row says so — the marker is honest about *what* happened and silent about
-  *why*, which makes a deliberately-bounded council look like the normal case.
-  Fixing it means a `context_budget` column and a migration; not done.
+0011 also carried the `councils.context_budget` column and backfilled both
+existing councils from what they actually ran at (`b9d8f7e4` at 600, not the 6000
+default). That closes the gap DECISIONS recorded as unresolved at the end of
+stage 3 — at the schema level only; see below.
 
-The `council` agent identity is **added to `scripts/seed-agent-roster.mjs` but
-not yet seeded** — via the seed script, not a migration, consistent with "more
-domains later by seed". `--dry-run` shows 9 agents. See the actions below.
+### What is next
 
-### ⚠ Other actions that are yours
+- **Stage 5 — site features** (debate view, confidence-over-time, changelog),
+  specified in DECISIONS §D.5. Not started.
+- **Wire the council verdict to the propose route.** Today `suggestion_id` stays
+  null, no council needs the `council` identity or a token, and nothing stage 3
+  produces can reach `suggestions`. That is the deliberate stop-point, not an
+  omission — but it also blocks **D.9 #5** (that a verdict lands `pending` only,
+  credited to `council`, changing no hypothesis row), which cannot be asserted
+  until the wiring exists.
+- **Stage 4 needs its route and its runner.** `app/api/agent/` has `citations`
+  and `suggestions` only, and nothing computes the six §D.4 checks. The schema
+  already enforces that findings are stored before any model call, so a runner
+  cannot quietly invert that ordering.
+- **One-line fix: `scripts/run-council.mjs` does not write
+  `councils.context_budget`.** The column exists and the two live councils are
+  backfilled, but a *new* council records null. Null means "not recorded", which
+  is true — the runner is what needs changing.
 
-- **Re-run `scripts/seed-agent-roster.mjs --with-tokens`** to provision the
-  ninth identity, `council`. The eight from stage 1 were seeded 2026-08-11 and
-  are reused by email lookup, not duplicated — this run creates **one** new
-  Supabase auth user and mints **one** new token. Needs
-  `SUPABASE_SERVICE_ROLE_KEY`; `--dry-run` prints the plan and writes nothing.
-  Two things to know before you run it:
-  - **The council's token is unscoped (`scopes.domains: []`)** — it is the first
-    identity that can propose into `suggestions` in *any* domain. That is
-    structural, not an oversight: a council convenes on whichever hypothesis is
-    contested. What still bounds it is written up in DECISIONS, *Council
-    identity*. The `--dry-run` output now prints each agent's scope, so the
-    widening is visible in the plan.
+### ⚠ Actions that are yours
+
+- **Re-run `scripts/seed-agent-roster.mjs --with-tokens`** to provision the ninth
+  identity, `council` — added to the seed script but **not yet seeded**
+  (`--dry-run` shows 9 agents). The eight from stage 1 were seeded 2026-08-11 and
+  are reused by email lookup, not duplicated, so this creates **one** auth user
+  and mints **one** token. Needs `SUPABASE_SERVICE_ROLE_KEY`; `--dry-run` prints
+  the plan and writes nothing. Two things to know first:
+  - **The council's token is unscoped (`scopes.domains: []`)** — the first
+    identity that can propose into `suggestions` in *any* domain. `--dry-run`
+    prints each agent's scope, so the widening is visible in the plan. Why it is
+    structural rather than an oversight, and what still bounds it: DECISIONS →
+    *Council identity*.
   - **Re-running does not reinstate anyone.** `status` is deliberately never
     written, so an agent IA or the trust governor suspended stays suspended.
-  - The six stage-1 tokens **expire 2026-09-10** and are unrecoverable; mint
-    replacements with `scripts/mint-agent-token.mjs --name <agent>`.
-- **Optional:** set `VERITAS_CROSSREF_MAILTO` to join Crossref's polite pool.
-  No API key; Crossref and OpenAlex are both free and keyless.
+- **The six stage-1 tokens expired 2026-09-10** and are unrecoverable. Mint
+  replacements with `scripts/mint-agent-token.mjs --name <agent>`.
+- **Optional:** set `VERITAS_CROSSREF_MAILTO` to join Crossref's polite pool. No
+  API key; Crossref and OpenAlex are both free and keyless.
 
 ### Behaviour changes already landed
 
@@ -152,12 +119,11 @@ domains later by seed". `--dry-run` shows 9 agents. See the actions below.
   spends the *same* budget, so the old default would have halved proposals per
   run. Override with `--max-model-calls` or `AGENT_MAX_MODEL_CALLS`.
 - **`enabled` is no longer directly settable.** Since 0007 it is derived from
-  `status`; `update agents set enabled = false` is now a no-op. Disable an agent
-  with `status = 'suspended'`.
-- **`mint-agent-token.mjs` no longer clobbers scopes.** Re-minting a token for a
-  rostered agent used to reset `scopes` to CLI defaults — silently turning a
-  domain-scoped researcher into an unscoped one. Each field is now overridden
-  only when actually passed.
+  `status`; `update agents set enabled = false` is a no-op. Disable an agent with
+  `status = 'suspended'`.
+- **`mint-agent-token.mjs` no longer clobbers scopes.** Each field is overridden
+  only when actually passed, so re-minting no longer silently turns a
+  domain-scoped researcher into an unscoped one.
 
 ### Cost posture — unchanged, still $0/call
 
