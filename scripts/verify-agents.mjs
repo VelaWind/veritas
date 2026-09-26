@@ -628,6 +628,7 @@ async function f07Canary() {
     );
     check("F-07 canary self-test: detector sees an anon= entry where one exists (storage)", false,
       "not run — no platform credentials");
+    f12Characterization(null);
     return;
   }
 
@@ -675,6 +676,87 @@ async function f07Canary() {
     publicAcl === null
       ? "could not read pg_default_acl via the Management API"
       : `found anon in ${publicAcl} — 0009 HAS BEEN REVERTED, every future table in public is anon-readable again`,
+  );
+
+  f12Characterization(publicAcl);
+}
+
+// ── F-12 characterization: the authenticated half of that same default ──────
+//
+// CHARACTERIZATION, NOT A SECOND CANARY. The F-07 assertion above checks for an
+// ABSENCE, and red there means a hazard returned. This one is the opposite
+// shape. AUDIT.md F-12 records that the postgres-owned default ACL still grants
+// `authenticated` all eight privileges on every future table in public, and
+// records it as ACCEPTED and not fixed. The grant being PRESENT is therefore the
+// expected state, and what follows locks its exact value rather than objecting
+// to it.
+//
+// It fails in EITHER direction, the good one included. If someone closes the
+// grant this goes red, and that is intended: red here means "the accepted state
+// moved", never "something is exposed". Update AUDIT.md F-12 and this assertion
+// together — the same convention as test-sanitize.mjs section 6, which moves
+// with F-10, and the same [characterization] label in the output so no one
+// reads a failure as a breach.
+//
+// Why the value and not just the presence: the eight letters are two findings
+// wearing one string. `arwd` is OURS — 0001_core.sql:808-809, the counterpart of
+// the anon line 0009 revoked — and is closable. `Dxtm` is platform-authored, the
+// residual F-07a accepted. A change to either half surfaces here as the same
+// failure, which is why the detail prints the whole ACL instead of a verdict.
+//
+// No new query: it reads the string f07Canary already fetched and, until now,
+// only searched for the anon half.
+const F12_EXPECTED = "arwdDxtm";
+
+/** Privilege letters `authenticated` holds in a default-ACL string, null if absent. */
+const authenticatedPrivs = (acl) => {
+  const m = /(?:^|[,{])authenticated=([^/,}]*)\//.exec(acl ?? "");
+  return m ? m[1] : null;
+};
+
+function f12Characterization(publicAcl) {
+  console.log("\n── F-12: the authenticated half — CHARACTERIZATION, not a breach ──");
+
+  // The negative control cannot come from live state the way the anon one does.
+  // Every postgres-owned table default in this project reads arwdDxtm, so no
+  // relation exists whose authenticated grant DIFFERS, and manufacturing one
+  // would mean granting something — which the control above refuses to do on
+  // principle. So the control is applied to the comparator rather than to the
+  // database: synthetic ACL strings, mutated in each direction that matters,
+  // every one of which the comparator must reject. A comparator that cannot
+  // tell arwdDxtm from arwd would pass the assertion below by being blind, in
+  // exactly the way a detector that cannot see storage's anon= would.
+  const shape = (privs) =>
+    privs === null
+      ? "{postgres=arwdDxtm/postgres,service_role=arwdDxtm/postgres}"
+      : `{postgres=arwdDxtm/postgres,authenticated=${privs}/postgres,service_role=arwdDxtm/postgres}`;
+  const blind = [];
+  if (authenticatedPrivs(shape(F12_EXPECTED)) !== F12_EXPECTED) {
+    blind.push(`cannot read ${F12_EXPECTED} back out of a string that carries it`);
+  }
+  for (const [name, privs] of [
+    ["loosened (arwdDxtmU)", "arwdDxtmU"],
+    ["closed to the four verbs 0001 grants (arwd)", "arwd"],
+    ["closed to the platform residual (Dxtm)", "Dxtm"],
+    ["revoked entirely", null],
+  ]) {
+    if (authenticatedPrivs(shape(privs)) === F12_EXPECTED) blind.push(`misses ${name}`);
+  }
+  check(
+    "F-12 self-test: comparator reads the value back and rejects every mutation of it",
+    blind.length === 0,
+    `comparator ${blind.join("; ")} — the characterization below would pass by being blind`,
+  );
+
+  const privs = authenticatedPrivs(publicAcl);
+  check(
+    `[characterization] F-12: postgres default ACL grants authenticated exactly ${F12_EXPECTED} on public tables`,
+    publicAcl !== null && privs === F12_EXPECTED,
+    publicAcl === null
+      ? "not run — no platform credentials, or pg_default_acl unreachable via the Management API"
+      : privs === null
+        ? `authenticated= is ABSENT from ${publicAcl} — the F-12 grant is gone. NOT a breach: if that was deliberate, close F-12 in AUDIT.md and delete this assertion in the same commit.`
+        : `authenticated=${privs}, expected ${F12_EXPECTED}, in ${publicAcl} — the ACCEPTED F-12 state moved. NOT a breach in itself; reconcile AUDIT.md F-12 against this value before reading it either way.`,
   );
 }
 

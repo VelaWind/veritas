@@ -963,8 +963,10 @@ asserts that the `postgres`-owned default ACL for `public` tables contains no
 `anon=` entry, so a platform re-application of its baseline cannot silently undo
 0009. (Not `scripts/smoke.ts`, as this paragraph previously said: `pg_default_acl`
 is not PostgREST-exposed, so the check needs a platform credential and `smoke`
-must stay runnable on public credentials alone.) It watches the `anon` half only
-— see F-12. See §9.
+must stay runnable on public credentials alone.) That assertion watches the
+`anon` half only, because it asserts an *absence*; the `authenticated` half is an
+accepted *presence* and is locked separately, as a characterization — see F-12.
+See §9.
 
 ---
 
@@ -1018,17 +1020,37 @@ contained everywhere it currently applies. Classification is *hazard*, not
    why F-07a accepted it — but the acceptance was reasoned about *existing*
    relations, and it silently extends to every table not yet written.
 
-**The existing canary does not watch this.** `f07Canary()` in
-`scripts/verify-agents.mjs:604-678` asserts only that the `public` default ACL
-contains no `anon=` entry. It already fetches the entire ACL string — the
-`authenticated=arwdDxtm` above is *in the value it reads* — and passes anyway,
-because nothing looks at it. Whatever a fix costs, the detection does not: it is
-a second assertion over a string the harness has already retrieved.
+**The canary now watches this — as a characterization, not a second canary.**
+`f07Canary()` in `scripts/verify-agents.mjs` asserted only that the `public`
+default ACL contains no `anon=` entry. It already fetched the entire ACL string —
+the `authenticated=arwdDxtm` above was *in the value it read* — and passed
+anyway, because nothing looked at it. `f12Characterization()` now reads that same
+string, over no new query, and asserts the value is **exactly** `arwdDxtm`.
 
-**Status: OPEN — recorded, not fixed (2026-09-18).** Deliberately not remediated
-in this pass. This is a known state rather than a discovery, which is the point
-of writing it down: a future `\dp` or `pg_default_acl` audit showing
-`authenticated=arwdDxtm` should resolve to this entry.
+It is labelled `[characterization]` in the output, the convention
+`scripts/test-sanitize.mjs` section 6 uses for F-10, because the shape is
+inverted. The F-07 assertion checks an absence, and red there means a hazard came
+back. This one locks an accepted presence, and **fails in either direction —
+including if someone closes the grant.** Red here means the accepted state moved,
+never that something is exposed; reconcile this entry and the assertion in the
+same commit. The two halves above are indistinguishable to it — a change to
+`arwd` and a change to `Dxtm` surface identically — so the failure detail prints
+the whole ACL rather than a verdict.
+
+Its negative control cannot come from live state the way the `anon` one does.
+Every `postgres`-owned table default in this project reads `arwdDxtm`, so no
+relation exists whose `authenticated` grant differs, and manufacturing one would
+mean granting something. So the control is applied to the comparator instead of
+to the database: synthetic ACL strings mutated in each direction that matters —
+loosened, closed to `arwd`, closed to `Dxtm`, revoked entirely — every one of
+which the comparator must reject before the assertion below it is trusted.
+
+**Status: OPEN — recorded, not fixed (2026-09-18); watched since 2026-09-26.**
+Deliberately not remediated. This is a known state rather than a discovery, which
+is the point of writing it down: a future `\dp` or `pg_default_acl` audit showing
+`authenticated=arwdDxtm` should resolve to this entry, and the characterization
+now guarantees the reverse — that the value cannot drift out of this entry
+unnoticed either.
 
 **Severity reasoning, since it is a judgement call.** LOW matches F-07's
 treatment of the identical shape — zero current violations, nothing reachable
