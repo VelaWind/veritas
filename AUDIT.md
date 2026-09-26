@@ -1122,6 +1122,87 @@ that day — there is no assertion anywhere that every table in `public` has
 
 ---
 
+### F-13 — LOW — An `internal_affairs` token can write to `suggestions`, which §D.4 says it cannot
+
+Found while writing the D.9 #4 assertion, which is the assertion that this does
+not happen. It does happen.
+
+DECISIONS §D.4 states the separation twice. Once as a power: *"IA writes audits.
+It cannot touch a knowledge table, `scopes`, `trust`, or `suggestions`."* And once
+as a test — **D.9 #4**: *"IA cannot touch knowledge — attempt a hypothesis write
+with the IA token; expect 401/403."*
+
+**Measured, not reasoned.** A probe `internal_affairs` agent with the real
+identity's unscoped shape (`scopes.domains: []`), posting an ordinary hypothesis
+proposal to `POST /api/agent/suggestions`:
+
+```
+>>> POST /api/agent/suggestions with an internal_affairs token -> HTTP 201
+```
+
+It lands a `pending` suggestion. Not 401, not 403.
+
+**Why, precisely.** `requireAgent()` authenticates any enabled agent on any lane —
+it resolves `kind` but does not gate on it. The propose route then checks the
+envelope, the B.3 minimums, and the D.2 skeptic lane, and that last one is where
+the divergence is visible in the code rather than merely in its behaviour:
+
+```ts
+if (auth.agent.kind === "research" && !critique) { … 422 … }
+```
+
+Only `research` proposals require a critique. The route's own comment says *"Other
+lanes (contradiction findings, IA) are not critiqued"* — so an IA proposal was not
+an oversight the route failed to consider, it was **anticipated and permitted**.
+Meanwhile `enforce_agent_quota` bounds caps and domain scope, and IA's token is
+unscoped, so the domain branch does not apply to it at all.
+
+**What 0011's header claims, and why it is still true.** *"There is no path from
+anything in this file to any of them, which is enforcement by absence."* Correct,
+and verified — nothing in 0011 reaches `suggestions`. The gap is not in the
+migration. IA's *token* reaches a different route entirely, and no migration was
+ever going to constrain that.
+
+**Severity LOW, at the upper end, for the same reasons F-12 is.** The proposal
+lands `pending`: a human admin must approve it, `apply_suggestion()` still
+requires `is_admin()`, and every epistemic constraint and audit trigger still
+binds. Nothing reaches the public map without a person. What makes it the upper
+end rather than the middle is the combination it permits — a compromised IA token
+can suspend every agent on the roster *and* propose into the queue, and those are
+the two powers §D.4 went out of its way to separate. **It becomes MEDIUM the day
+the IA runner is wired to propose, or the day anything approves without a human.**
+
+**Status: OPEN — recorded, watched, not fixed (2026-09-27).** Not remediated in
+this pass, deliberately: the fix is a design decision, not a patch, and it is not
+mine to make. Two coherent resolutions, and they are not equivalent:
+
+1. **Gate the propose route on `kind`,** refusing `internal_affairs` (and
+   probably `council`, until D.5's wiring lands) with 403. Makes D.9 #4 true as
+   written. Touches the most-verified route in the repository.
+2. **Revise §D.4,** on the ground that a `pending` proposal is not "touching
+   knowledge" — approval is — and that an auditor able to file a proposal for
+   human review is not obviously wrong. Then D.9 #4 is the thing that is wrong
+   and should be rewritten or dropped.
+
+Doing neither, silently, is the only option that is definitely wrong, which is
+why this entry exists.
+
+**It is watched in the meantime.** `verify-agents.mjs` carries it as a
+`[characterization]` — the F-12 convention — asserting the **201** that happens
+today rather than the 401/403 that should:
+
+```
+[characterization] D.9 #4: an IA token CAN reach the propose route → 201
+                   (AUDIT F-13; D.9 #4 expects 401/403)
+```
+
+A failure there means resolution 1 was taken and the gap is closed: promote it to
+a real D.9 #4 assertion and close this entry in the same commit. It is labelled so
+that nobody reads the red as a breach, and it exists so that nobody reads the
+green as coverage.
+
+---
+
 ### F-08 — LOW (environment, not code) — Eight orphaned `next` processes were holding file locks
 
 `npm ci` could not run until these were terminated. They are leftovers from

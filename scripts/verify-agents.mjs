@@ -95,7 +95,10 @@ function mkToken() {
   return { plaintext, hash: createHash("sha256").update(plaintext).digest("hex") };
 }
 
-async function provisionAgent(name, scopes) {
+// `kind` defaults to 'research' so every existing call site keeps the lane it
+// was written for. §D.4's assertions need an `internal_affairs` agent, and kind
+// is what the sanction route gates on, so it has to be settable here.
+async function provisionAgent(name, scopes, kind = "research") {
   const email = `${SLUG_PREFIX}${name}@example.com`;
   const password = "vagent-" + randomBytes(12).toString("base64url") + "A1!";
   let userId;
@@ -111,7 +114,7 @@ async function provisionAgent(name, scopes) {
   await service.from("profiles").update({ role: "agent", display_name: name }).eq("id", userId);
   const { data: agent, error: aErr } = await service
     .from("agents")
-    .upsert({ name, profile_id: userId, enabled: true, scopes }, { onConflict: "name" })
+    .upsert({ name, profile_id: userId, enabled: true, status: "active", scopes, kind }, { onConflict: "name" })
     .select("id")
     .single();
   if (aErr) throw new Error(`upsert agent: ${aErr.message}`);
@@ -547,6 +550,209 @@ async function run() {
   const { data: agentRow } = await service.from("agents").select("trust").eq("id", agent.agentId).single();
   check("trust: recomputed after approval", agentRow?.trust === 100, `trust=${agentRow?.trust}`);
 
+  // ── §D.4 / D.9 — Internal Affairs: the sanction route and the auditor ───────
+  //
+  // The powers live in two places by design, and each assertion below says which
+  // half it is testing. `ia_apply_sanction` enforces WHAT a sanction may be; it
+  // runs as service_role and cannot see which token authenticated, so the route
+  // enforces WHO may ask. Testing only the function would leave the route
+  // untested and vice versa — and the route half is the one with no database
+  // constraint standing behind it.
+  {
+    const ia = await provisionAgent(
+      "ia-probe",
+      { domains: [], max_pending: 50, max_per_hour: 1000 },
+      "internal_affairs",
+    );
+    created.users.push(ia.profileId);
+    created.agents.push(ia.agentId);
+
+    const sanction = (token, body) =>
+      fetch(`${BASE}/api/agent/sanction`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify(body),
+      }).then(async (r) => ({ status: r.status, ...((await r.json().catch(() => ({}))) ?? {}) }));
+
+    const statusOf = async (id) => {
+      const { data } = await service.from("agents").select("status, enabled").eq("id", id).single();
+      return data ?? {};
+    };
+    const auditCount = async (name) => {
+      const { count } = await service
+        .from("agent_audits")
+        .select("id", { count: "exact", head: true })
+        .eq("agent_name", name);
+      return count ?? 0;
+    };
+
+    check("D.4 provision: internal_affairs probe agent (kind set, token minted)", Boolean(ia.token));
+
+    // (1) THE ROUTE'S HALF. A VALID token for a NON-IA agent must be refused
+    // here, before the database. `probe` is kind='research' and its token is
+    // live — it proposed successfully earlier in this run — so a refusal cannot
+    // be attributed to the credential. And the refusal must be total: not a
+    // sanction that fails later, but one that never reaches the function. Both
+    // consequences are asserted, not just the status code.
+    const beforeAudits = await auditCount(ia.name);
+    const wrongKind = await sanction(agent.token, {
+      agent_name: ia.name, action: "suspend", reason: "A research agent attempting a sanction.",
+    });
+    const afterWrongKind = await statusOf(ia.agentId);
+    check(
+      "D.4 route: a valid NON-IA token is refused a sanction → 403",
+      wrongKind.status === 403,
+      `got ${wrongKind.status} — ${wrongKind.error ?? ""}`,
+    );
+    check(
+      "D.4 route: …and nothing reached the database — no status change, no audit row",
+      afterWrongKind.status === "active" && (await auditCount(ia.name)) === beforeAudits,
+      `status=${afterWrongKind.status}, audits ${beforeAudits} → ${await auditCount(ia.name)}`,
+    );
+
+    // (2) D.9 #9, first half — THE AUDITOR IS NOT EXEMPT. IA sanctions ITSELF,
+    // through the real route, with its own token. Self-suspension is fail-safe:
+    // it stops work and can corrupt nothing, which is exactly why it is allowed.
+    const selfSuspend = await sanction(ia.token, {
+      agent_name: ia.name, action: "suspend", reason: "D.9 #9: the auditor suspending itself.",
+    });
+    const afterSelf = await statusOf(ia.agentId);
+    check(
+      "D.9 #9: IA may suspend ITSELF through its own route → 200, status suspended",
+      selfSuspend.status === 200 && afterSelf.status === "suspended",
+      `got ${selfSuspend.status}, status=${afterSelf.status} — ${selfSuspend.error ?? ""}`,
+    );
+    // 0007 derives `enabled` from `status`, and the quota trigger reads `enabled`.
+    // That derivation is what makes suspension fail-safe rather than advisory.
+    check(
+      "D.9 #9: …and suspension derived enabled=false, which is what stops the work",
+      afterSelf.enabled === false,
+      `enabled=${afterSelf.enabled}`,
+    );
+    check(
+      "D.9 #9: …and the sanction recorded its own audit row with the transition",
+      await (async () => {
+        const { data } = await service
+          .from("agent_audits")
+          .select("severity, actions_taken, findings, report")
+          .eq("agent_name", ia.name)
+          .order("run_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        const act = Array.isArray(data?.actions_taken) ? data.actions_taken[0] : null;
+        return (
+          data?.severity === "critical" &&
+          act?.action === "suspend" &&
+          act?.from_status === "active" &&
+          act?.to_status === "suspended" &&
+          data?.report === null
+        );
+      })(),
+      "expected severity critical, actions_taken[0] active→suspend, report null",
+    );
+
+    // (3) D.9 #9, second half — IA CANNOT UN-SUSPEND ITSELF, asserted at every
+    // layer that could conceivably express it.
+    //
+    // (a) Its own token is now dead. Suspension derived enabled=false, and
+    //     requireAgent refuses a disabled agent — so a self-suspended auditor
+    //     cannot even reach the route to argue. Self-suspension is self-disarming.
+    const selfUnsuspend = await sanction(ia.token, {
+      agent_name: ia.name, action: "throttle", reason: "Attempting to walk it back.",
+    });
+    check(
+      "D.9 #9: a self-suspended IA cannot reach its own route at all → 403 (token disabled)",
+      selfUnsuspend.status === 403,
+      `got ${selfUnsuspend.status} — ${selfUnsuspend.error ?? ""}`,
+    );
+
+    // (b) And the transition does not exist in the function either, so this is
+    //     not merely gated by a dead token. Called with the SERVICE ROLE — the
+    //     widest credential in the system, wider than any route holds — which is
+    //     the point: 0011 says reinstatement is "a transition it cannot express",
+    //     and a permission check would be satisfiable by a big enough key.
+    const { error: reinstateErr } = await service.rpc("ia_apply_sanction", {
+      p_agent_name: ia.name, p_action: "reinstate", p_reason: "D.9 #3: attempting reinstatement.",
+    });
+    check(
+      "D.9 #3: ia_apply_sanction('reinstate') raises even for service_role → 22023",
+      reinstateErr?.code === "22023",
+      `got ${reinstateErr?.code ?? "NO ERROR — REINSTATEMENT SUCCEEDED"}`,
+    );
+
+    // (c) Loosening is refused by the same rule that refuses reinstatement:
+    //     strictly-more-restrictive. suspended → throttled moves DOWN the ladder.
+    const { error: loosenErr } = await service.rpc("ia_apply_sanction", {
+      p_agent_name: ia.name, p_action: "throttle", p_reason: "D.9 #3: attempting to loosen a suspension.",
+    });
+    check(
+      "D.9 #3: suspended → throttled is refused as not strictly more restrictive → 23514",
+      loosenErr?.code === "23514",
+      `got ${loosenErr?.code ?? "NO ERROR — A SANCTION WAS LOOSENED"}`,
+    );
+
+    // (4) CLEANUP THAT IS ALSO THE ASSERTION. A suspended IA is a dead auditor:
+    // if this probe left it suspended, the roster would be stuck with no working
+    // Internal Affairs and nothing in the harness would say so. Reinstatement is
+    // admin-only, so it goes through the ADMIN path — an admin's own session,
+    // under RLS, not the service role, because service_role would bypass the
+    // policy and prove nothing about who is allowed to do this.
+    //
+    // NOTE ON SCOPE: D.4 specifies reinstatement "via requireAdmin() and a
+    // separate route". That route does not exist yet — no admin surface writes
+    // agents.status — so what is asserted here is the admin RLS path that does.
+    // When the route lands, this assertion should move to it.
+    const { error: reinstateAdminErr } = await admin.client
+      .from("agents")
+      .update({ status: "active" })
+      .eq("id", ia.agentId);
+    const afterReinstate = await statusOf(ia.agentId);
+    check(
+      "D.9 #3: an ADMIN can reinstate (status → active, enabled derived back to true)",
+      !reinstateAdminErr && afterReinstate.status === "active" && afterReinstate.enabled === true,
+      `${reinstateAdminErr?.code ?? ""} status=${afterReinstate.status}, enabled=${afterReinstate.enabled}`,
+    );
+    // And the auditor is genuinely alive again, not merely green in a column: a
+    // malformed body now answers 422 (validation) rather than 403 (disabled),
+    // which is only reachable once the token passes auth AND the capability gate.
+    const aliveAgain = await sanction(ia.token, { agent_name: ia.name, action: "throttle", reason: "" });
+    check(
+      "D.9 #3: …and the reinstated IA token passes auth and the capability gate again → 422, not 403",
+      aliveAgain.status === 422,
+      `got ${aliveAgain.status} — ${aliveAgain.error ?? ""}`,
+    );
+
+    // (5) D.9 #3, the route's own refusal of reinstatement. There is no spelling
+    // of it to send: the zod enum accepts the same two values the function does,
+    // so it is refused at the edge without a database round trip.
+    const routeReinstate = await sanction(ia.token, {
+      agent_name: ia.name, action: "reinstate", reason: "Reinstating through the route.",
+    });
+    check(
+      "D.9 #3: the route cannot express 'reinstate' either → 422 at the edge",
+      routeReinstate.status === 422,
+      `got ${routeReinstate.status} — ${routeReinstate.error ?? ""}`,
+    );
+
+    // (6) D.9 #4 — AUDIT.md F-13. This is a CHARACTERIZATION, not an assertion:
+    // D.9 #4 says an IA token attempting a knowledge write should be refused
+    // (401/403), and it is NOT. The propose route gates on caps, scope and the
+    // skeptic lane, never on kind, and IA's token is unscoped so the domain
+    // branch does not apply either. So it lands a `pending` suggestion — 201.
+    //
+    // Locked at the current value rather than left undetected, the same way F-12
+    // is: a failure here means the gap was closed and this should become D.9 #4
+    // proper. See AUDIT.md F-13 for why it is recorded rather than fixed in this
+    // pass.
+    const iaPropose = await callAgent(ia.token, hypBody(`${SLUG_PREFIX}ia-knowledge`, "IA knowledge write", physics.id));
+    if (iaPropose?.data?.id) created.suggestions.push(iaPropose.data.id);
+    check(
+      "[characterization] D.9 #4: an IA token CAN reach the propose route → 201 (AUDIT F-13; D.9 #4 expects 401/403)",
+      iaPropose.status === 201,
+      `got ${iaPropose.status} — if this is now 401/403 the gap is CLOSED: promote this to a real assertion and close F-13`,
+    );
+  }
+
  } catch (e) {
   check(`harness error: ${e.message}`, false);
  } finally {
@@ -570,16 +776,43 @@ async function run() {
   for (const id of created.agents) {
     await service.from("agent_tokens").delete().eq("agent_id", id);
   }
-  for (const u of [agent, admin]) {
-    if (!u) continue;
-    const pid = u.profileId ?? u.userId;
+  // Every provisioned identity, not a hard-coded pair: the IA probe proposes too
+  // (the D.9 #4 characterization), and naming agents individually here is how a
+  // later probe's rows get left behind.
+  for (const pid of created.users) {
     await service.from("suggestions").update({ reviewed_by: null }).eq("reviewed_by", pid);
     await service.from("suggestions").delete().eq("proposed_by", pid);
   }
+  // agent_audits BEFORE agents, and by name rather than by id: agent_id is
+  // `on delete set null` (0011 — deleting an agent must not erase what it was
+  // audited for), so a row deleted in the wrong order survives with a null
+  // agent_id and its probe name still in an admin-only table, forever.
+  const auditNames = ["ia-probe", agent?.name].filter(Boolean);
+  for (const n of auditNames) await service.from("agent_audits").delete().eq("agent_name", n);
   for (const id of created.agents) await service.from("agents").delete().eq("id", id);
   if (admin?.client) await admin.client.auth.signOut().catch(() => {});
   for (const id of created.users) await service.auth.admin.deleteUser(id).catch(() => {});
   check("cleanup: probe artifacts + temp identities removed", true);
+
+  // A suspended IA is a dead auditor, and an audit row that outlives its probe
+  // agent is an admin-only table slowly filling with test names. Both are silent
+  // failures, so both are counted rather than assumed — the reinstatement itself
+  // is asserted above, at the point where it happens.
+  {
+    const { count: leftAudits } = await service
+      .from("agent_audits")
+      .select("id", { count: "exact", head: true })
+      .in("agent_name", auditNames.length ? auditNames : ["ia-probe"]);
+    const { count: leftSugg } = await service
+      .from("suggestions")
+      .select("id", { count: "exact", head: true })
+      .in("agent_name", auditNames.length ? auditNames : ["ia-probe"]);
+    check(
+      "cleanup: agent_audits and suggestions both back to zero for the probe agents",
+      (leftAudits ?? 0) === 0 && (leftSugg ?? 0) === 0,
+      `agent_audits=${leftAudits}, suggestions=${leftSugg}`,
+    );
+  }
  }
 }
 

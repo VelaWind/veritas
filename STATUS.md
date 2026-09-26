@@ -34,12 +34,12 @@ F-11 and §11.
 
 | Gate | Result |
 |---|---|
-| `node scripts/verify-agents.mjs` | ✅ ALL GREEN — **43** (19 at Phase B, 38 at stage 2, 40 → 43 with the D.9 council assertions) |
+| `node scripts/verify-agents.mjs` | ✅ ALL GREEN — **61**, live-verified 2026-09-27 (19 at Phase B, 38 at stage 2, 43 with the D.9 council assertions, 47 with the F-07a/F-12 default-ACL block, 61 with the D.4 sanction route and D.9 #3/#4/#9) |
 | `node scripts/verify-suggestions.mjs` | ✅ ALL GREEN — **25** (the human contributor path, unaffected by 0012) |
 | `npm run smoke` (against production) | ✅ ALL GREEN — **95** (87 → 93 with `/council/[id]`, 93 → 95 with the truncation marker) |
 | `npm run test:unit` | ✅ **56** across two files — 25 `test-sanitize`, 31 `test-council-budget` |
 | `npm run validate:sql` (**13** files) | ✅ green |
-| `npm run build` (live credentials) | ✅ green, **127/127** pages |
+| `npm run build` (live credentials) | ✅ green, **128/128** pages (127 → 128 with `/api/agent/sanction`) |
 | `tsc --noEmit` · `contrast.mjs` | ✅ clean · ALL PASS |
 
 ### What is live
@@ -66,8 +66,36 @@ page* and *Council follow-ups*.
 (admin-only RLS), `ia_apply_sanction()`, and the `agent_status_rank()` ladder.
 The sanction ladder is one-way in Postgres — IA can throttle or suspend and
 cannot reinstate, and refuses any move that is not strictly more restrictive.
-`agent_audits` holds **0 rows**; nothing has run. The `internal-affairs` identity
-was seeded at stage 1. Why the ladder is shaped that way: DECISIONS §D.4.
+The `internal-affairs` identity was seeded at stage 1. Why the ladder is shaped
+that way: DECISIONS §D.4.
+
+**First pass shipped 2026-09-27 — the mechanical half, with no model call
+anywhere in it.** `scripts/run-internal-affairs.mjs` computes all six §D.4 checks
+in SQL/JS and writes an `agent_audits` row with `findings` populated, `severity`
+derived from those findings, and `report` NULL. That row is a complete audit;
+NULL means "no report was written", which 0011 deliberately keeps distinct from
+an empty string. The script does not import the LLM provider, takes no model
+flags, and has no token budget — the findings path had to ship and be verified
+before any model code existed that could contaminate it, because 0011's CHECK
+constraints can enforce that a report has a timestamp and cannot precede its run,
+but cannot tell whether findings were computed from data or written to match a
+report. Only the runner's structure can.
+
+`POST /api/agent/sanction` is the capability-narrow route §D.4 specifies. The
+`kind = 'internal_affairs'` check runs BEFORE the body is parsed, so a valid
+token from another lane is refused for the right reason and reaches no database
+call — asserted, including that no status changed and no audit row appeared.
+
+It does not sanction yet: `ia_apply_sanction` is reached only through that route,
+and wiring the runner to it is the next step, held back for the same reason
+`run-council.mjs` does not propose. `actions_taken` is `[]` on every row the
+runner writes.
+
+All six checks were exercised against manufactured conduct rather than left to a
+quiet database — a mismatched citation, four out-of-declared-domain proposals,
+six cap incidents, an exact-normalized resubmission of a rejected title, a 0%
+approval rate against a 50% roster median, and six stale pending proposals — each
+asserted to fire at the expected grade with the expected counts, then cleaned up.
 
 0011 also carried the `councils.context_budget` column and backfilled both
 existing councils from what they actually ran at (`b9d8f7e4` at 600, not the 6000
@@ -84,10 +112,19 @@ stage 3 — at the schema level only; see below.
   omission — but it also blocks **D.9 #5** (that a verdict lands `pending` only,
   credited to `council`, changing no hypothesis row), which cannot be asserted
   until the wiring exists.
-- **Stage 4 needs its route and its runner.** `app/api/agent/` has `citations`
-  and `suggestions` only, and nothing computes the six §D.4 checks. The schema
-  already enforces that findings are stored before any model call, so a runner
-  cannot quietly invert that ordering.
+- **Stage 4's model half — the report.** The findings path is live and verified;
+  nothing yet writes `report` / `report_at`. That is the deliberate stop-point of
+  the first pass, not an omission.
+- **Wire the runner to the sanction route.** The route exists and is asserted;
+  `run-internal-affairs.mjs` writes audits and applies nothing. Until they are
+  connected, a finding graded `concern` or `critical` has no consequence.
+- **AUDIT F-13 — D.9 #4 does not hold.** An `internal_affairs` token reaches
+  `POST /api/agent/suggestions` and lands a `pending` suggestion (**201**), where
+  D.9 #4 expects 401/403 and DECISIONS §D.4 says IA "cannot touch … `suggestions`".
+  The propose route gates on caps, scope and the skeptic lane, never on `kind`.
+  Recorded, locked as a `[characterization]` in `verify-agents` so it cannot drift
+  unnoticed, and **not** fixed in this pass — closing it is a design decision
+  about whether the gate belongs on the route or the claim belongs in DECISIONS.
 - **One-line fix: `scripts/run-council.mjs` does not write
   `councils.context_budget`.** The column exists and the two live councils are
   backfilled, but a *new* council records null. Null means "not recorded", which
