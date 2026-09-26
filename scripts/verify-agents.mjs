@@ -628,14 +628,54 @@ async function f07Canary() {
     );
     check("F-07 canary self-test: detector sees an anon= entry where one exists (storage)", false,
       "not run — no platform credentials");
+    check("F-07a control: owner detector sees non-postgres-owned relations where they exist (storage)",
+      false, "not run — no platform credentials");
+    check("F-07a: every relation in public is postgres-owned (the supabase_admin acceptance holds)",
+      false, "not run — no platform credentials");
     f12Characterization(null);
     return;
   }
 
-  /** postgres-owned default ACL for tables in `schema`, or null if unreachable. */
-  const defaultAcl = async (schema) => {
+  /**
+   * Two facts about `schema`, over ONE round trip, or null if unreachable:
+   *   .acl          postgres-owned default ACL for tables
+   *   .foreignOwned [{ owner, rels, ownerDefaultAcl }] — relations owned by a
+   *                 role OTHER than postgres, grouped by owner, each carrying
+   *                 THAT owner's own default ACL for tables in the schema.
+   *
+   * The second column is why `.acl` alone was never enough. Every assertion in
+   * this function filters the default ACL to `defaclrole = 'postgres'`, which is
+   * right — postgres is the role `supabase db push` connects as, so its entry is
+   * the one that binds for anything a migration creates. But it also means none
+   * of them can see any OTHER role's default entry, and AUDIT.md F-07a accepts
+   * the `supabase_admin` table default on exactly one ground: that
+   * `supabase_admin` owns no relations in `public`. That is a claim about
+   * current state, and nothing verified it. The column below does, by watching
+   * the PRECONDITION rather than the ACL — the ACL does not change on the day
+   * the hazard fires, the owner does.
+   *
+   * Widened from `= 'supabase_admin'` to `<> 'postgres'` at no extra cost,
+   * because 0009's own correctness argument is that postgres creates everything
+   * in public. ANY other owner breaks that premise, not only supabase_admin.
+   *
+   * The scalar subquery costs nothing measurable: the same statement returned in
+   * 424ms against 395-440ms for a bare `select 1` over the same endpoint.
+   */
+  const tableDefaults = async (schema) => {
     const sql =
-      "select coalesce(string_agg(d.defaclacl::text, ' '), '') as acl " +
+      "select coalesce(string_agg(d.defaclacl::text, ' '), '') as acl, (" +
+      "  select coalesce(json_agg(x order by x.owner), '[]'::json) from (" +
+      "    select pg_get_userbyid(c.relowner) as owner," +
+      "           string_agg(c.relname, ', ' order by c.relname) as rels," +
+      "           (select coalesce(string_agg(d2.defaclacl::text, ' '), '')" +
+      "              from pg_default_acl d2" +
+      "              join pg_namespace n2 on n2.oid = d2.defaclnamespace" +
+      `             where n2.nspname = '${schema}' and d2.defaclobjtype = 'r'` +
+      "               and d2.defaclrole = c.relowner) as owner_default_acl" +
+      "      from pg_class c join pg_namespace n3 on n3.oid = c.relnamespace" +
+      `     where n3.nspname = '${schema}' and c.relkind in ('r','p','v','m','f')` +
+      "       and pg_get_userbyid(c.relowner) <> 'postgres'" +
+      "     group by c.relowner) x) as foreign_owned " +
       "from pg_default_acl d join pg_namespace n on n.oid = d.defaclnamespace " +
       `where n.nspname = '${schema}' and d.defaclobjtype = 'r' ` +
       "and pg_get_userbyid(d.defaclrole) = 'postgres'";
@@ -647,7 +687,15 @@ async function f07Canary() {
       });
       if (!res.ok) return null;
       const rows = await res.json();
-      return Array.isArray(rows) && rows.length > 0 ? (rows[0].acl ?? "") : "";
+      const row = Array.isArray(rows) && rows.length > 0 ? rows[0] : {};
+      return {
+        acl: row.acl ?? "",
+        foreignOwned: (Array.isArray(row.foreign_owned) ? row.foreign_owned : []).map((r) => ({
+          owner: r.owner,
+          rels: r.rels ?? "",
+          ownerDefaultAcl: r.owner_default_acl ?? "",
+        })),
+      };
     } catch {
       return null;
     }
@@ -660,7 +708,8 @@ async function f07Canary() {
   // rather than by being satisfied. This is the negative control, permanently
   // wired in, using existing state — nothing is granted to manufacture it and
   // nothing is left behind.
-  const storageAcl = await defaultAcl("storage");
+  const storage = await tableDefaults("storage");
+  const storageAcl = storage === null ? null : storage.acl;
   check(
     "F-07 canary self-test: detector sees an anon= entry where one exists (storage)",
     storageAcl !== null && /\banon=/.test(storageAcl),
@@ -669,13 +718,76 @@ async function f07Canary() {
       : `storage postgres default ACL = ${storageAcl || "(empty)"} — expected an anon= entry; detector may be blind`,
   );
 
-  const publicAcl = await defaultAcl("public");
+  // The owner detector gets its own control, on the SAME live state and the same
+  // round trip — `storage` was already being fetched for the ACL control above,
+  // and it qualifies for this one too: its 8 relations are owned by
+  // `supabase_storage_admin`, verified against pg_class before this was written
+  // rather than assumed. (`auth`, `realtime` and `vault` also qualify; storage
+  // was chosen because it is already fetched, so the control costs no query.)
+  //
+  // If the detector cannot see NON-POSTGRES OWNERS THERE, its empty result for
+  // `public` below means nothing — the assertion would be reporting silence, not
+  // absence, which is the same trap the anon control exists to catch.
+  //
+  // storage also demonstrates why the failure detail below must not flatten the
+  // two facts: supabase_storage_admin owns 8 relations AND has no default ACL
+  // entry of its own, so "owned by another role" is true there while "anon may
+  // hold ALL on it" is false. Ownership is the trigger; the consequence depends
+  // on that owner's default entry, and only the pair together says anything.
+  check(
+    "F-07a control: owner detector sees non-postgres-owned relations where they exist (storage)",
+    storage !== null && storage.foreignOwned.length > 0,
+    storage === null
+      ? "Management API unreachable — the F-07a assertion below is NOT trustworthy"
+      : "storage reported NO non-postgres-owned relations, but supabase_storage_admin owns 8 — " +
+        "the owner detector is blind and the public result below is meaningless",
+  );
+
+  const pub = await tableDefaults("public");
+  const publicAcl = pub === null ? null : pub.acl;
   check(
     "F-07: postgres default ACL for public tables grants anon nothing (0009 intact)",
     publicAcl !== null && !/\banon=/.test(publicAcl),
     publicAcl === null
       ? "could not read pg_default_acl via the Management API"
       : `found anon in ${publicAcl} — 0009 HAS BEEN REVERTED, every future table in public is anon-readable again`,
+  );
+
+  // ── F-07a: the precondition the supabase_admin acceptance rests on ─────────
+  //
+  // A REAL ASSERTION, not a characterization. Red here means something is wrong:
+  // a relation exists in `public` whose creating role is not the one 0009's fix
+  // binds to. See AUDIT.md F-07a, "What is NOT watched".
+  //
+  // Two facts, reported separately and never merged. "Owned by X" is the fact
+  // this query establishes. "anon may hold ALL on it" is a SEPARATE claim that
+  // depends entirely on X's own default ACL — which may not exist at all. So the
+  // detail prints the owner, its relations, and that owner's default entry, and
+  // states the anon consequence only where the entry actually carries an anon
+  // grant. Same rule as F-12's failure detail: print the evidence, not a verdict.
+  const foreign = pub === null ? [] : pub.foreignOwned;
+  const report = foreign.map((o) => {
+    const anon = rolePrivs(o.ownerDefaultAcl, "anon");
+    return (
+      `\n    · ${o.owner} owns: ${o.rels}` +
+      `\n      ${o.owner}'s default ACL for tables in public: ${o.ownerDefaultAcl || "(no entry)"}` +
+      `\n      consequence: ${
+        anon === null
+          ? "that owner grants anon nothing by default — the ownership is the finding, not an anon exposure"
+          : `anon=${anon} on every table that owner creates in public — ` +
+            (/a|w|d/.test(anon) ? "WRITE-CAPABLE, and RLS does not restrain TRUNCATE" : "read-level")
+      }`
+    );
+  });
+  check(
+    "F-07a: every relation in public is postgres-owned (the supabase_admin acceptance holds)",
+    pub !== null && foreign.length === 0,
+    pub === null
+      ? "could not read pg_class via the Management API"
+      : `public holds relations owned by ${foreign.length} role(s) other than postgres, so 0009's ` +
+        `default-ACL fix does not bind for them and neither canary above can see it:${report.join("")}` +
+        "\n    AUDIT.md F-07a accepts the supabase_admin default ONLY because this count was 0. " +
+        "Re-read that acceptance before treating this as benign.",
   );
 
   f12Characterization(publicAcl);
@@ -708,11 +820,21 @@ async function f07Canary() {
 // only searched for the anon half.
 const F12_EXPECTED = "arwdDxtm";
 
-/** Privilege letters `authenticated` holds in a default-ACL string, null if absent. */
-const authenticatedPrivs = (acl) => {
-  const m = /(?:^|[,{])authenticated=([^/,}]*)\//.exec(acl ?? "");
+/**
+ * Privilege letters `role` holds in a default-ACL string, null if it has no
+ * entry at all. Called with literal role names only — `anon`, `authenticated` —
+ * so the name is interpolated into the pattern without escaping.
+ *
+ * null and "" are different answers and both matter: null means the role is
+ * absent from the ACL, "" means it is present holding nothing.
+ */
+const rolePrivs = (acl, role) => {
+  const m = new RegExp(`(?:^|[,{])${role}=([^/,}]*)/`).exec(acl ?? "");
   return m ? m[1] : null;
 };
+
+/** Privilege letters `authenticated` holds in a default-ACL string, null if absent. */
+const authenticatedPrivs = (acl) => rolePrivs(acl, "authenticated");
 
 function f12Characterization(publicAcl) {
   console.log("\n── F-12: the authenticated half — CHARACTERIZATION, not a breach ──");

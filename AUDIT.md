@@ -968,6 +968,65 @@ must stay runnable on public credentials alone.) That assertion watches the
 accepted *presence* and is locked separately, as a characterization — see F-12.
 See §9.
 
+**The ACL assertions' scope, stated rather than left to inference.** Both
+filter `pg_get_userbyid(d.defaclrole) = 'postgres'`. That filter is
+correct for what they are for — `postgres` is the role `supabase db push`
+connects as, so the `postgres`-owned entry is the one that binds for every
+relation a migration creates — but it means **neither assertion can see the
+`supabase_admin` default ACL at all.** That entry grants `anon` `arwdDxtm` on any
+table `supabase_admin` creates in `public`, is recorded in
+`supabase/migrations/0009_default_privileges.sql` §2 and in DECISIONS.md *"The
+residual: `supabase_admin`, which this migration cannot close"*, and is accepted
+there on the ground that `postgres` provably cannot alter it.
+
+The gap is not the acceptance — it is that **the acceptance rests on a
+precondition nothing verifies.** Both records close it with *"`supabase_admin`
+owns 0 of the 24 relations in `public`"*, which is a claim about current state,
+not a property. If it ever stops being true, the new table is granted **ALL** to
+`anon`, and `f07Canary()` and `f12Characterization()` both still pass — they are
+reading a different role's ACL, and that ACL is genuinely unchanged. The failure
+would be invisible to the two assertions that look nearest to it.
+
+**The precondition is now watched (2026-09-27), and the residual stays
+accepted.** Those are two separate statements and both hold. Nothing about the
+`supabase_admin` default ACL changed or can change — `postgres` still cannot
+alter it, and the acceptance above stands unrevised. What changed is that its
+load-bearing premise is now asserted instead of assumed.
+
+`f07Canary()` carries a third assertion: **every relation in `public` is
+`postgres`-owned.** It watches the precondition, not the ACL, which is the only
+thing worth watching here — on the day this hazard fires, the `supabase_admin`
+default ACL is *unchanged* and the owner is what moved. Asserting on that ACL
+would watch the wrong object and would fail permanently, since the entry is
+accepted and unfixable.
+
+Three details worth keeping:
+
+- **It is a real assertion, not a characterization.** Unlike F-12, red means
+  something is wrong: a relation exists in `public` whose creating role is not
+  the one 0009's fix binds to.
+- **It is widened to `<> 'postgres'`, not `= 'supabase_admin'`,** at no extra
+  cost. 0009 §1's own correctness argument is that `postgres` creates everything
+  in `public`, so that entry "is the one that binds". *Any* other owner breaks
+  that premise, not only `supabase_admin` — one assertion covers the residual's
+  precondition and 0009's.
+- **It reports ownership and consequence separately, never merged.** "Owned by X"
+  is what the query establishes; "anon may hold ALL on it" is a distinct claim
+  that depends on X's own default entry, which may not exist at all. The failure
+  detail prints the owner, its relations, and that owner's default ACL, and draws
+  the anon conclusion only where that ACL actually carries an `anon=` grant. Same
+  rule as F-12's failure detail: print the evidence, not a verdict.
+
+It costs no new query and no new privilege — the second column rides the
+`pg_default_acl` statement that was already being issued (424ms against 395-440ms
+for a bare `select 1` over the same endpoint), and its negative control rides the
+`storage` call that was already being made for the `anon` control.
+
+**Live at the time of writing:** 27 relations in `public` — 23 tables, 3 views, 1
+materialized view — all `postgres`-owned; non-`postgres` count 0. The records in
+0009 §2 and DECISIONS.md say *"0 of the 24 relations"*; the schema has grown since
+and the claim still holds, which is now checked on every run rather than restated.
+
 ---
 
 ### F-12 — LOW — `ALTER DEFAULT PRIVILEGES` grants `authenticated` ALL on every future table
