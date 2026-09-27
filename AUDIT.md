@@ -1122,10 +1122,10 @@ that day — there is no assertion anywhere that every table in `public` has
 
 ---
 
-### F-13 — LOW — An `internal_affairs` token can write to `suggestions`, which §D.4 says it cannot
+### F-13 — LOW — **FIXED 2026-09-27** — An `internal_affairs` token could write to `suggestions`, which §D.4 says it cannot
 
 Found while writing the D.9 #4 assertion, which is the assertion that this does
-not happen. It does happen.
+not happen. It did happen. It no longer does — see **The fix**, at the end.
 
 DECISIONS §D.4 states the separation twice. Once as a power: *"IA writes audits.
 It cannot touch a knowledge table, `scopes`, `trust`, or `suggestions`."* And once
@@ -1167,39 +1167,96 @@ ever going to constrain that.
 lands `pending`: a human admin must approve it, `apply_suggestion()` still
 requires `is_admin()`, and every epistemic constraint and audit trigger still
 binds. Nothing reaches the public map without a person. What makes it the upper
-end rather than the middle is the combination it permits — a compromised IA token
-can suspend every agent on the roster *and* propose into the queue, and those are
-the two powers §D.4 went out of its way to separate. **It becomes MEDIUM the day
-the IA runner is wired to propose, or the day anything approves without a human.**
+end rather than the middle is the combination it permitted — a compromised IA
+token could suspend every agent on the roster *and* propose into the queue, and
+those are the two powers §D.4 went out of its way to separate. It would have
+become MEDIUM the day the IA runner was wired to propose, or the day anything
+approved without a human; it was fixed before either.
 
-**Status: OPEN — recorded, watched, not fixed (2026-09-27).** Not remediated in
-this pass, deliberately: the fix is a design decision, not a patch, and it is not
-mine to make. Two coherent resolutions, and they are not equivalent:
+The severity is left as it was assessed rather than downgraded now that it is
+closed, because a finding's grade records what was true when it was open.
 
-1. **Gate the propose route on `kind`,** refusing `internal_affairs` (and
-   probably `council`, until D.5's wiring lands) with 403. Makes D.9 #4 true as
-   written. Touches the most-verified route in the repository.
+**Two resolutions were open, and they were not equivalent.** Recorded here because
+the one not taken is the reason the fix looks the way it does.
+
+1. **Gate the propose route on `kind`.** Makes D.9 #4 true as written. Touches the
+   most-verified route in the repository.
 2. **Revise §D.4,** on the ground that a `pending` proposal is not "touching
-   knowledge" — approval is — and that an auditor able to file a proposal for
-   human review is not obviously wrong. Then D.9 #4 is the thing that is wrong
-   and should be rewritten or dropped.
+   knowledge" — approval is. Then D.9 #4 was the thing that was wrong.
 
-Doing neither, silently, is the only option that is definitely wrong, which is
-why this entry exists.
+**Resolution 1 was chosen (2026-09-27).**
 
-**It is watched in the meantime.** `verify-agents.mjs` carries it as a
-`[characterization]` — the F-12 convention — asserting the **201** that happens
-today rather than the 401/403 that should:
+## The fix — an allow-list, and why not a deny-list
 
-```
-[characterization] D.9 #4: an IA token CAN reach the propose route → 201
-                   (AUDIT F-13; D.9 #4 expects 401/403)
+`app/api/agent/suggestions/route.ts` now gates on the caller's registry kind
+before the body is parsed:
+
+```ts
+const MAY_PROPOSE: ReadonlySet<AgentKind> = new Set<AgentKind>(["research", "council"]);
 ```
 
-A failure there means resolution 1 was taken and the gap is closed: promote it to
-a real D.9 #4 assertion and close this entry in the same commit. It is labelled so
-that nobody reads the red as a breach, and it exists so that nobody reads the
-green as coverage.
+**An ALLOW-LIST, deliberately, and not a deny-list naming `internal_affairs`.** A
+deny-list would close exactly the hole that was found and silently admit every
+`agent_kind` added afterwards — the enum already holds six values. The allow-list
+has to be edited to widen, and that edit is the decision. The distinction is not
+rhetorical: it is asserted, by flipping a probe agent to `kind='verifier'` — a
+real kind that is neither on the list nor the one that was found — and requiring
+403. A deny-list passes every other assertion in the block and fails that one.
+
+- `research` proposes; that is the lane.
+- `council` is on the list **ahead of need.** Stage 3 stops short of the queue on
+  purpose, so nothing exercises it yet — which is why the same probe is flipped to
+  `kind='council'` and required to get **201**. Omitting it would have made the
+  stage-3 wiring look like a bug in this route.
+- `skeptic` and `verifier` are absent because they cannot reach the route at all:
+  both run inside the research lane and `seed-agent-roster.mjs` mints them no
+  token (`NEEDS_TOKEN`). "Holds no token" and "would be refused if it did" are
+  different facts, and the `verifier` flip above is what turns the second one from
+  an inference into an assertion.
+- `contradiction` is absent and that is a live decision, not a moot point: no
+  contradiction agent is on the roster. If one is added with a token it will be
+  refused until this list says otherwise.
+
+**It also closes a second, older finding** — recorded in DECISIONS under *Council
+identity* → "Correction to the pre-push note", and left explicitly unfixed there.
+IA's token is UNSCOPED (`scopes.domains: []`, the oversight default since
+2026-08-11), and an unscoped token skips the domain branch of
+`enforce_agent_quota()` entirely (`if jsonb_array_length(v_domains) > 0`), so *"IA
+could in principle propose in any domain"*. That was **unexercised, not
+unreachable.** It is unreachable now: IA does not get past `MAY_PROPOSE`, so the
+missing domain branch behind it has no caller. The unscoped scope itself is
+unchanged — nothing was re-scoped — and it remains correct for the council, which
+genuinely has no home domain.
+
+## What is asserted now
+
+The `[characterization]` that locked the old 201 for one commit is **gone**,
+replaced by real assertions in the D.9 block — red means something is wrong, the
+same distinction as F-07a against F-12:
+
+```
+D.9 #4: an IA token is refused at the propose route → 403 for the KIND
+D.9 #4: …and no suggestion row exists for the IA agent at all
+D.9 #4: …while a research token still proposes → 201
+D.9 #4: kind='verifier' → 403   (allow-list, not deny-list)
+D.9 #4: kind='council'  → 201   (the list's second entry)
+```
+
+**Both sides, and the second side is not optional.** A gate that rejected
+everything would satisfy a rejection-only test — the mistake 0010's verdict-shape
+trigger work had to correct, where a trigger raising on all input is
+indistinguishable from a correct one unless something asserts the permitted case
+still passes.
+
+**Message-checked, not just status-checked.** `requireAgent` also answers 403 for
+a *disabled* agent, and the IA probe is suspended and reinstated a few assertions
+earlier in the same block. A bare `status === 403` would therefore pass if the
+probe were simply left dead. The assertions match on `does not propose` (the
+allow-list's refusal) rather than `is disabled` (the credential's).
+
+**It did not pass before the fix.** The 201 in the evidence above was measured
+against this same request, so the assertion's discriminating power is established
+by that prior measurement rather than assumed.
 
 ---
 

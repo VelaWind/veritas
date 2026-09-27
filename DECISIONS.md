@@ -1143,6 +1143,40 @@ executable by `service_role` only, called from a capability-narrow route after
 Reinstatement (`→ active`) is admin-only, via `requireAdmin()` and a separate
 route, never reachable from any agent token.
 
+**"Cannot touch `suggestions`" is true of the SYSTEM as of 2026-09-27, and was
+only true of the migration before that.** The claim above is old; this paragraph
+is what makes it carry its own evidence, because for a while it did not.
+
+0011 enforces its half by absence — nothing in that file reaches `suggestions`,
+`scopes`, `trust`, or any knowledge table — and that was always verified. But IA
+holds an ordinary agent token, and `POST /api/agent/suggestions` authenticated any
+enabled agent on any lane: `requireAgent()` resolves `kind` and did not gate on
+it. So an `internal_affairs` token posted a hypothesis proposal and got **201**,
+landing a `pending` suggestion. Measured with a probe, not reasoned about. The
+route's own comment — *"Other lanes (contradiction findings, IA) are not
+critiqued"* — showed the case had been anticipated and permitted rather than
+overlooked. Recorded as **AUDIT F-13**.
+
+**What made it true:** an allow-list on the propose route, gating on the caller's
+registry kind before the body is parsed —
+`MAY_PROPOSE = {research, council}` — so IA is refused with 403 and reaches no
+database call. An allow-list rather than a deny-list naming `internal_affairs`,
+because a deny-list would silently admit every `agent_kind` added later; widening
+now requires editing that line. `council` is on the list ahead of the stage-3
+wiring that will need it, and both facts are asserted by flipping a probe agent's
+kind (`verifier` → 403, `council` → 201), so the allow-list's *semantics* are
+verified and not just its effect on IA.
+
+**It also closed the unscoped-token residual** recorded under *Council identity* →
+"Correction to the pre-push note" and left unfixed there: IA's unscoped token
+skips `enforce_agent_quota()`'s domain branch, so "IA could in principle propose
+in any domain". That was unexercised rather than unreachable. It is unreachable
+now — the gate is in front of it. Nothing was re-scoped; the unscoped default is
+unchanged and remains correct for the council.
+
+D.9 #4 is therefore an assertion about the system rather than an aspiration, and
+`verify-agents` asserts it from both sides.
+
 **Suspension is fail-safe.** It sets `enabled=false` through the derive trigger,
 which makes the quota trigger reject that agent's inserts. It stops work; it
 cannot corrupt the map, because nothing IA can reach is a knowledge table.
@@ -1850,6 +1884,17 @@ unscoped token bypasses the domain branch of `enforce_agent_quota()` entirely
 (`if jsonb_array_length(v_domains) > 0`), so IA could in principle propose in any
 domain. That is a pre-existing property of the oversight default, noted here
 because this is where it was noticed. It is not fixed here.
+
+> **CLOSED 2026-09-27, by the fix for AUDIT F-13.** "IA could in principle propose
+> in any domain" was true and unexercised; it is now unreachable. The propose route
+> gates on the caller's registry kind (`MAY_PROPOSE = {research, council}`), so IA
+> is refused 403 before the quota trigger is ever reached and the missing domain
+> branch behind it has no caller. **Nothing was re-scoped** — IA's token is still
+> `domains: []`, which is still the right default for an identity whose work goes
+> through a capability-narrow route, and still right for the council, which has no
+> home domain. The exposure was never the scope; it was that a lane which should
+> not propose could. See AUDIT F-13 and §D.4, *"Cannot touch `suggestions`" is true
+> of the SYSTEM*.
 
 **What still bounds the council, with the domain check gone:**
 

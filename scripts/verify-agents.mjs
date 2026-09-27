@@ -599,9 +599,15 @@ async function run() {
       agent_name: ia.name, action: "suspend", reason: "A research agent attempting a sanction.",
     });
     const afterWrongKind = await statusOf(ia.agentId);
+    // The status code alone is not enough. requireAgent ALSO answers 403 for a
+    // disabled agent, and `probe` has been suspended and reinstated earlier in
+    // this run — so a 403 here could mean "the capability gate worked" or "the
+    // probe agent was left disabled by an earlier block", and those are not the
+    // same result. The message disambiguates: the capability refusal names the
+    // kind, the credential refusal says "is disabled".
     check(
-      "D.4 route: a valid NON-IA token is refused a sanction → 403",
-      wrongKind.status === 403,
+      "D.4 route: a valid NON-IA token is refused a sanction → 403, for the KIND and not the credential",
+      wrongKind.status === 403 && /internal_affairs capability/.test(wrongKind.error ?? ""),
       `got ${wrongKind.status} — ${wrongKind.error ?? ""}`,
     );
     check(
@@ -734,23 +740,93 @@ async function run() {
       `got ${routeReinstate.status} — ${routeReinstate.error ?? ""}`,
     );
 
-    // (6) D.9 #4 — AUDIT.md F-13. This is a CHARACTERIZATION, not an assertion:
-    // D.9 #4 says an IA token attempting a knowledge write should be refused
-    // (401/403), and it is NOT. The propose route gates on caps, scope and the
-    // skeptic lane, never on kind, and IA's token is unscoped so the domain
-    // branch does not apply either. So it lands a `pending` suggestion — 201.
+    // (6) D.9 #4 — IA CANNOT TOUCH KNOWLEDGE. A REAL ASSERTION, not a
+    // characterization: red here means something is wrong, so it sits with the
+    // D.9 block and carries no [characterization] label. Same distinction as
+    // F-07a (a precondition that must hold) against F-12 (an accepted state
+    // locked at its current value).
     //
-    // Locked at the current value rather than left undetected, the same way F-12
-    // is: a failure here means the gap was closed and this should become D.9 #4
-    // proper. See AUDIT.md F-13 for why it is recorded rather than fixed in this
-    // pass.
+    // This replaces the characterization that stood here for one commit, which
+    // locked the 201 the route used to return. AUDIT F-13 is closed by the
+    // MAY_PROPOSE allow-list in app/api/agent/suggestions/route.ts.
+    //
+    // BOTH SIDES, AND THE SECOND SIDE IS NOT OPTIONAL. A gate that rejected
+    // everything would satisfy a rejection-only test — which is exactly the
+    // mistake 0010's verdict-shape trigger work had to correct: a trigger that
+    // raises on all input looks identical to a correct one if nothing asserts the
+    // permitted case still passes. So the research lane is asserted to still
+    // propose successfully, immediately below.
     const iaPropose = await callAgent(ia.token, hypBody(`${SLUG_PREFIX}ia-knowledge`, "IA knowledge write", physics.id));
-    if (iaPropose?.data?.id) created.suggestions.push(iaPropose.data.id);
+    if (iaPropose?.data?.id) created.suggestions.push(iaPropose.data.id);   // only if the gate failed
+    // Message-checked for the same reason as the sanction gate above: IA was
+    // suspended and reinstated a few assertions ago, and a disabled agent also
+    // answers 403. "does not propose" is the allow-list's refusal; "is disabled"
+    // would be the credential's, and passing on that would be passing by accident.
     check(
-      "[characterization] D.9 #4: an IA token CAN reach the propose route → 201 (AUDIT F-13; D.9 #4 expects 401/403)",
-      iaPropose.status === 201,
-      `got ${iaPropose.status} — if this is now 401/403 the gap is CLOSED: promote this to a real assertion and close F-13`,
+      "D.9 #4: an IA token is refused at the propose route → 403 for the KIND (AUDIT F-13 closed)",
+      iaPropose.status === 403 && /does not propose/.test(iaPropose.error ?? ""),
+      `got ${iaPropose.status}${iaPropose.status === 201 ? " — IA PROPOSED SUCCESSFULLY; the allow-list is not holding" : ""} — ${iaPropose.error ?? ""}`,
     );
+    // …and nothing landed. A 403 that still wrote a row would be worse than no
+    // gate, because the status code would say it had not.
+    const { count: iaRows } = await service
+      .from("suggestions")
+      .select("id", { count: "exact", head: true })
+      .eq("agent_name", ia.name);
+    check(
+      "D.9 #4: …and no suggestion row exists for the IA agent at all",
+      (iaRows ?? 0) === 0,
+      `${iaRows} row(s) attributed to ${ia.name}`,
+    );
+
+    // THE OTHER SIDE OF THE ALLOW-LIST. `probe` is kind='research', on the list,
+    // and must still get through. Its earlier proposals in this run predate the
+    // gate's code path being exercised with a fresh request, so this re-asserts it
+    // after the IA refusal rather than relying on an earlier success.
+    const researchStillWorks = await callAgent(
+      agent.token,
+      hypBody(`${SLUG_PREFIX}gate-research`, "Research lane still proposes", physics.id),
+    );
+    if (researchStillWorks?.data?.id) created.suggestions.push(researchStillWorks.data.id);
+    check(
+      "D.9 #4: …while a research token still proposes → 201 (the gate allows, it does not just reject)",
+      researchStillWorks.status === 201,
+      `got ${researchStillWorks.status} — ${researchStillWorks.error ?? ""}`,
+    );
+
+    // IT IS AN ALLOW-LIST, AND THAT IS ASSERTED RATHER THAN ASSUMED. Everything
+    // above is equally consistent with a deny-list that names `internal_affairs`
+    // — which is the thing F-13 was explicitly NOT closed with, because a
+    // deny-list silently admits every agent_kind added after it. Two flips of the
+    // probe agent's registry kind separate the two designs:
+    //
+    //   `verifier`  — a real kind that is NOT on the list and is NOT IA. A
+    //                 deny-list would let it through. (In production it holds no
+    //                 token at all, which is why this has to be provoked rather
+    //                 than observed: "cannot authenticate" and "would be allowed
+    //                 if it could" are different facts, and only one is safe.)
+    //   `council`   — the list's second entry, which nothing else in this suite
+    //                 exercises because the council identity is not seeded yet.
+    //                 It is on the list ahead of need, so the need is simulated.
+    for (const [kind, expected, why] of [
+      ["verifier", 403, "a kind that is neither research, council, nor IA is refused — allow-list, not deny-list"],
+      ["council", 201, "the list's second entry proposes, so stage 3's wiring will not hit this gate"],
+    ]) {
+      await service.from("agents").update({ kind }).eq("id", ia.agentId);
+      const res = await callAgent(
+        ia.token,
+        hypBody(`${SLUG_PREFIX}gate-${kind}`, `Gate probe: ${kind}`, physics.id),
+      );
+      if (res?.data?.id) created.suggestions.push(res.data.id);
+      check(
+        `D.9 #4: kind='${kind}' → ${expected} (${why})`,
+        res.status === expected,
+        `got ${res.status} — ${res.error ?? ""}`,
+      );
+    }
+    // Back to what it was provisioned as, so the cleanup block and any later
+    // reader see the agent this probe claimed to be.
+    await service.from("agents").update({ kind: "internal_affairs" }).eq("id", ia.agentId);
   }
 
  } catch (e) {

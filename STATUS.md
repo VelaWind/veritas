@@ -34,7 +34,7 @@ F-11 and §11.
 
 | Gate | Result |
 |---|---|
-| `node scripts/verify-agents.mjs` | ✅ ALL GREEN — **61**, live-verified 2026-09-27 (19 at Phase B, 38 at stage 2, 43 with the D.9 council assertions, 47 with the F-07a/F-12 default-ACL block, 61 with the D.4 sanction route and D.9 #3/#4/#9) |
+| `node scripts/verify-agents.mjs` | ✅ ALL GREEN — **65**, live-verified 2026-09-27 (19 at Phase B, 38 at stage 2, 43 with the D.9 council assertions, 47 with the F-07a/F-12 default-ACL block, 61 with the D.4 sanction route and D.9 #3/#9, 65 with D.9 #4 asserted from both sides) |
 | `node scripts/verify-suggestions.mjs` | ✅ ALL GREEN — **25** (the human contributor path, unaffected by 0012) |
 | `npm run smoke` (against production) | ✅ ALL GREEN — **95** (87 → 93 with `/council/[id]`, 93 → 95 with the truncation marker) |
 | `npm run test:unit` | ✅ **56** across two files — 25 `test-sanitize`, 31 `test-council-budget` |
@@ -118,13 +118,16 @@ stage 3 — at the schema level only; see below.
 - **Wire the runner to the sanction route.** The route exists and is asserted;
   `run-internal-affairs.mjs` writes audits and applies nothing. Until they are
   connected, a finding graded `concern` or `critical` has no consequence.
-- **AUDIT F-13 — D.9 #4 does not hold.** An `internal_affairs` token reaches
-  `POST /api/agent/suggestions` and lands a `pending` suggestion (**201**), where
-  D.9 #4 expects 401/403 and DECISIONS §D.4 says IA "cannot touch … `suggestions`".
-  The propose route gates on caps, scope and the skeptic lane, never on `kind`.
-  Recorded, locked as a `[characterization]` in `verify-agents` so it cannot drift
-  unnoticed, and **not** fixed in this pass — closing it is a design decision
-  about whether the gate belongs on the route or the claim belongs in DECISIONS.
+- ~~**AUDIT F-13 — D.9 #4 does not hold.**~~ **Fixed 2026-09-27.** The propose
+  route now gates on the caller's registry kind as an allow-list
+  (`MAY_PROPOSE = {research, council}`), so an `internal_affairs` token is refused
+  403 before any database call. D.9 #4 is a real assertion now, not a
+  `[characterization]`, and is asserted from **both** sides — IA refused, research
+  still proposing, plus `kind='verifier'` → 403 and `kind='council'` → 201 so the
+  allow-list's semantics are verified rather than just its effect on IA. It also
+  closed the older unscoped-token residual: IA's token skips
+  `enforce_agent_quota()`'s domain branch, which was unexercised and is now
+  unreachable. Nothing was re-scoped.
 - **One-line fix: `scripts/run-council.mjs` does not write
   `councils.context_budget`.** The column exists and the two live councils are
   backfilled, but a *new* council records null. Null means "not recorded", which

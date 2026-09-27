@@ -7,6 +7,7 @@ import {
   translateDbError,
 } from "@/lib/api";
 import type { z } from "zod";
+import type { AgentKind } from "@/types/domain";
 import {
   agentCritiqueSchema,
   SUGGESTION_PAYLOAD_SCHEMAS,
@@ -26,9 +27,68 @@ import {
  * authoritative cap (max_pending / max_per_hour / domain scope); a runaway
  * runner that ignores its client-side caps still cannot flood review.
  */
+/**
+ * §D.4 / AUDIT F-13 — WHICH LANES MAY PROPOSE AT ALL.
+ *
+ * AN ALLOW-LIST, NOT A DENY-LIST OF `internal_affairs`, and the difference is the
+ * whole point. A deny-list closes exactly the hole that was found and silently
+ * admits every `agent_kind` added after it — the enum already carries six values
+ * and will carry more. This list has to be edited deliberately to widen, and the
+ * edit is the decision.
+ *
+ * `research` proposes; that is the lane's purpose. `council` is here BEFORE it
+ * needs to be: stage 3 stops short of the queue on purpose (`councils.suggestion_id`
+ * stays null), and when the verdict is wired it posts through this route as
+ * itself so `enforce_agent_quota()` finds it by `profile_id` and caps it like any
+ * other proposer. Omitting it now would make that wiring look like a bug here.
+ *
+ * `skeptic` and `verifier` are absent because they cannot reach this code at all,
+ * not because they are refused: both run INSIDE the research lane — the research
+ * runner makes their model calls and attributes the output to them by id — so
+ * `seed-agent-roster.mjs` mints them no token (`NEEDS_TOKEN`). Stated rather than
+ * left to be inferred from the omission.
+ *
+ * `contradiction` is also absent, and that one IS a live decision rather than a
+ * moot point: no contradiction agent is on the roster today. If one is added with
+ * a token, it will be refused here until this list says otherwise — which is the
+ * allow-list working, not failing.
+ *
+ * WHAT THIS CLOSES. AUDIT F-13: an `internal_affairs` token reached this route and
+ * landed a `pending` suggestion (201), contradicting §D.4's "IA … cannot touch a
+ * knowledge table, `scopes`, `trust`, or `suggestions`". 0011's own claim was
+ * always true — nothing in that migration reaches `suggestions` — but IA's token
+ * reached a different route, which no migration could constrain.
+ *
+ * It also closes a second, older one, recorded in DECISIONS under *Council
+ * identity* → "Correction to the pre-push note" and left unfixed there: IA's
+ * token is UNSCOPED (`scopes.domains: []`, the oversight default since
+ * 2026-08-11), and an unscoped token skips the domain branch of
+ * `enforce_agent_quota()` entirely (`if jsonb_array_length(v_domains) > 0`), so
+ * "IA could in principle propose in any domain". That was unexercised rather than
+ * unreachable. It is unreachable now: IA does not get past this check, so the
+ * missing domain branch behind it no longer has a caller.
+ *
+ * The check runs BEFORE the body is parsed, for the same reason the sanction
+ * route's does: a lane that may not propose must be refused for that reason and
+ * no other, and a malformed body from such a caller must not answer 422 as though
+ * the route were open to it.
+ *
+ * 403, not 401: the token is valid and the agent is real. The capability is
+ * absent, not the credential.
+ */
+const MAY_PROPOSE: ReadonlySet<AgentKind> = new Set<AgentKind>(["research", "council"]);
+
 export async function POST(request: NextRequest) {
   const auth = await requireAgent(request);
   if (!auth.ok) return auth.response;
+
+  if (!MAY_PROPOSE.has(auth.agent.kind)) {
+    return apiError(
+      `Agent "${auth.agent.name}" is kind '${auth.agent.kind}', which does not propose. ` +
+        `Proposing is limited to: ${[...MAY_PROPOSE].sort().join(", ")}.`,
+      403,
+    );
+  }
 
   let body: unknown;
   try {
@@ -64,7 +124,12 @@ export async function POST(request: NextRequest) {
 
   // D.2 — the skeptic lane is always on for research agents. A research proposal
   // arrives with its strongest objection already attached or it does not arrive.
-  // Other lanes (contradiction findings, IA) are not critiqued.
+  //
+  // The other lane that reaches this point is `council`, and it is not critiqued:
+  // a council transcript already contains a skeptic turn, so requiring a separate
+  // critique would ask it to re-argue what it just argued. (This comment used to
+  // read "contradiction findings, IA" — IA can no longer reach this code at all;
+  // see MAY_PROPOSE above and AUDIT F-13.)
   const rawCritique = (body as { critique?: unknown }).critique;
   let critique: z.infer<typeof agentCritiqueSchema> | null = null;
   if (rawCritique !== undefined && rawCritique !== null) {
