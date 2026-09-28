@@ -23,7 +23,7 @@ import { loadEnv, requireEnv } from "./agent-lib/env.mjs";
 import { parseArgs, intArg } from "./agent-lib/args.mjs";
 import { createLlmProvider } from "./agent-lib/llm.mjs";
 import { capsFromArgs } from "./agent-lib/caps.mjs";
-import { makeAnonClient, propose } from "./agent-lib/agent-client.mjs";
+import { credentialStop, makeAnonClient, preflightToken, propose } from "./agent-lib/agent-client.mjs";
 import { clampConfidence, normalizeStatus } from "./agent-lib/epistemics.mjs";
 import { slugify, uniquify, extractJson, titleKey } from "./agent-lib/util.mjs";
 import { critiqueProposal, critiqueEnvelope } from "./agent-lib/skeptic.mjs";
@@ -45,6 +45,23 @@ const TOKEN = process.env.VERITAS_AGENT_TOKEN;
 if (!TOKEN && !DRY) {
   console.error("Missing VERITAS_AGENT_TOKEN. Mint one with scripts/mint-agent-token.mjs, or use --dry-run.");
   process.exit(2);
+}
+
+// ── AUDIT F-14 — PREFLIGHT, before ANY model work ─────────────────────────────
+// Resolve the token against the server first. A dead credential used to be
+// discovered only at the first propose — after the model had already run — and
+// then skipped item by item to a clean-looking exit 0. The 401 is where that
+// failure surfaced; the waste was everything before it. So a token that cannot
+// post stops the run here, non-zero, naming the cause.
+let preflightAgent = null;
+if (!DRY) {
+  const pf = await preflightToken(BASE, TOKEN);
+  if (!pf.ok) {
+    console.error(`✗ preflight: ${pf.reason}`);
+    process.exit(1);
+  }
+  if (pf.warning) console.warn(`⚠ preflight: ${pf.warning}`);
+  preflightAgent = pf.agent;
 }
 
 const llm = createLlmProvider();
@@ -104,6 +121,9 @@ const seenTitles = new Set(existingList.map((h) => titleKey(h.title)));
 
 console.log(`\nResearch Agent — ${DRY ? "DRY RUN (no writes)" : "proposing into the queue"}`);
 console.log(`  model    : ${llm.describe()}`);
+if (preflightAgent) {
+  console.log(`  agent    : ${preflightAgent.name} (${preflightAgent.kind}, ${preflightAgent.status}) — token expires ${preflightAgent.expires_at ?? "never"}`);
+}
 console.log(`  target   : ${topic}`);
 console.log(`  domain   : ${domain.name} (${domain.slug})`);
 console.log(`  caps     : ${caps.summary()}`);
@@ -146,6 +166,10 @@ async function submit(envelope) {
 
 const proposedTitles = [];
 const results = { hypotheses: 0, evidence: 0, skipped: 0 };
+// Set when a propose answer means the CREDENTIAL is dead (credentialStop). The
+// run stops at once: every later item would fail the same way, after its model
+// calls.
+let credentialDead = false;
 // Structured record of what was generated (for --out; full citations included).
 const collected = [];
 
@@ -280,6 +304,15 @@ Draft ONE NEW, distinct hypothesis (#${i + 1}) on this target, with 1–2 pieces
     caps.stoppedReason ??= "server queue cap (429)";
     break;
   } else {
+    // AUDIT F-14: a credential failure is not a per-item problem. It used to be
+    // skipped here like a bad payload, and the run carried on generating.
+    const stop = credentialStop(res);
+    if (stop) {
+      console.log(`    ✗ ${stop} — stopping the run`);
+      caps.stoppedReason ??= stop;
+      credentialDead = true;
+      break;
+    }
     console.log(`    ✗ proposal rejected (${res.status}): ${res.error}`);
     results.skipped++;
     continue; // do not attach evidence to a hypothesis that didn't land
@@ -330,8 +363,20 @@ Draft ONE NEW, distinct hypothesis (#${i + 1}) on this target, with 1–2 pieces
     } else if (evRes.status === 429) {
       caps.stoppedReason ??= "server queue cap (429)";
       break;
+    } else {
+      const stop = credentialStop(evRes);
+      if (stop) {
+        console.log(`       ✗ ${stop} — stopping the run`);
+        caps.stoppedReason ??= stop;
+        credentialDead = true;
+        break;
+      }
+      // Was silent: an evidence proposal that failed for any reason other than
+      // 429 left no trace at all.
+      console.log(`       ✗ evidence rejected (${evRes.status}): ${evRes.error}`);
     }
   }
+  if (credentialDead) break;
 
   // ── D.5a citation verification ─────────────────────────────────────────────
   // Server-side resolution against Crossref/OpenAlex. Costs no model calls, so
@@ -386,6 +431,12 @@ console.log(`\nDone — ${results.hypotheses} hypothesis + ${results.evidence} e
   `${results.skipped ? `, ${results.skipped} skipped` : ""}.`);
 console.log(`  caps: ${caps.summary()}`);
 if (caps.stoppedReason) console.log(`  stopped early: ${caps.stoppedReason}`);
+// A run stopped by its credential did not succeed, whatever it managed to post
+// first. Exit 0 here is what let a dead token look like a quiet day.
+if (credentialDead) {
+  console.log(`  ✗ exit 1 — the credential failed mid-run. Check it: GET ${BASE.replace(/\/$/, "")}/api/agent/whoami`);
+  process.exitCode = 1;
+}
 if (!DRY && results.hypotheses + results.evidence > 0) {
   console.log(`\nReview them in the admin queue: ${BASE.replace(/\/$/, "")}/admin/suggestions  (status: pending)`);
 } else if (DRY) {

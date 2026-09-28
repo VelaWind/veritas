@@ -34,12 +34,12 @@ F-11 and §11.
 
 | Gate | Result |
 |---|---|
-| `node scripts/verify-agents.mjs` | ✅ ALL GREEN — **82**, live-verified 2026-09-28 (19 at Phase B, 38 at stage 2, 43 with the D.9 council assertions, 47 with the F-07a/F-12 default-ACL block, 61 with the D.4 sanction route and D.9 #3/#9, 65 with D.9 #4 asserted from both sides, 82 with the IA report stage and 0013) |
+| `node scripts/verify-agents.mjs` | ✅ ALL GREEN — **88**, live-verified 2026-09-28 (19 at Phase B, 38 at stage 2, 43 with the D.9 council assertions, 47 with the F-07a/F-12 default-ACL block, 61 with the D.4 sanction route and D.9 #3/#9, 65 with D.9 #4 asserted from both sides, 82 with the IA report stage and 0013, 88 with the F-14 preflight and credential-stop assertions) |
 | `node scripts/verify-suggestions.mjs` | ✅ ALL GREEN — **25** (the human contributor path, unaffected by 0012 and 0013) |
 | `npm run smoke` (against production) | ✅ ALL GREEN — **95** (87 → 93 with `/council/[id]`, 93 → 95 with the truncation marker) |
 | `npm run test:unit` | ✅ **73** across three files — 25 `test-sanitize`, 31 `test-council-budget`, 17 `test-ia-report` |
 | `npm run validate:sql` (**14** files) | ✅ green |
-| `npm run build` (live credentials) | ✅ green, **128/128** pages (127 → 128 with `/api/agent/sanction`) |
+| `npm run build` (live credentials) | ✅ green, **129/129** pages (127 → 128 with `/api/agent/sanction`, 129 with `/api/agent/whoami`) |
 | `tsc --noEmit` · `contrast.mjs` | ✅ clean · ALL PASS |
 
 ### What is live
@@ -159,6 +159,18 @@ stage 3 — at the schema level only; see below.
   closed the older unscoped-token residual: IA's token skips
   `enforce_agent_quota()`'s domain branch, which was unexercised and is now
   unreachable. Nothing was re-scoped.
+- ~~**AUDIT F-14 — a dead token produced a successful-looking run.**~~ **Fixed
+  2026-09-28.** Both token runners now PREFLIGHT via `GET /api/agent/whoami`
+  before any model work and exit 1 naming the cause (`Agent token expired.`);
+  a 401 mid-run, or a 403 "is disabled", STOPS the run with its own reason
+  (`stopped early: token revoked (401)`) instead of skipping each item to an
+  exit-0 "N skipped". Measured against the pre-fix runner: 6 model calls and
+  exit 0 on a dead token; now 0 calls at preflight, 2 on a mid-run revoke.
+- **AUDIT F-15 — OPEN, owner's call: the contradiction runner cannot post with
+  any token that exists.** A research token gets 422 on every item (no skeptic
+  critique); a `contradiction` token is refused by `MAY_PROPOSE`. Do not
+  schedule it until the lane is decided — add it to the allow-list, give it a
+  skeptic pass, or retire it.
 - **One-line fix: `scripts/run-council.mjs` does not write
   `councils.context_budget`.** The column exists and the two live councils are
   backfilled, but a *new* council records null. Null means "not recorded", which

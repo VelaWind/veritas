@@ -1085,6 +1085,137 @@ async function run() {
     await new Promise((r) => stub.close(r));
   }
 
+  // ── AUDIT F-14 — a dead credential stops a run BEFORE the model, not after ──
+  //
+  // The real research runner, spawned as a child process against the dev server
+  // and a stub model. The stub counts model calls, which is the quantity F-14 is
+  // about: a dead token used to cost a generation and a skeptic call PER ITEM
+  // before anything noticed, and then exit 0.
+  {
+    const { createServer } = await import("node:http");
+    const { execFile } = await import("node:child_process");
+    const hashOf = (t) => createHash("sha256").update(t).digest("hex");
+
+    // (1) The preflight endpoint answers with requireAgent's own verdicts.
+    const whoami = (token) =>
+      fetch(`${BASE}/api/agent/whoami`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+        .then(async (r) => ({ status: r.status, ...((await r.json().catch(() => ({}))) ?? {}) }));
+    const expiredTok = await mintTokenFor(agent.agentId, { expiresAt: new Date(Date.now() - 60_000).toISOString() });
+    const revokedTok = await mintTokenFor(agent.agentId, { revoked: true });
+    const liveTok = await mintTokenFor(agent.agentId, { expiresAt: new Date(Date.now() + 5 * 86400_000).toISOString() });
+    const wExpired = await whoami(expiredTok);
+    const wRevoked = await whoami(revokedTok);
+    const wLive = await whoami(liveTok);
+    check(
+      "F-14 whoami: an expired token → 401 naming expiry; a revoked one → 401 naming revocation",
+      wExpired.status === 401 && /expired/i.test(wExpired.error ?? "") &&
+        wRevoked.status === 401 && /revoked/i.test(wRevoked.error ?? ""),
+      `expired → ${wExpired.status} ${wExpired.error}; revoked → ${wRevoked.status} ${wRevoked.error}`,
+    );
+    check(
+      "F-14 whoami: a live research token → 200 with its kind, may_propose=true and its expiry",
+      wLive.status === 200 && wLive.data?.kind === "research" && wLive.data?.may_propose === true &&
+        typeof wLive.data?.expires_at === "string" && wLive.data?.expires_in_days === 4,
+      JSON.stringify(wLive.data ?? wLive.error),
+    );
+
+    // The stub model. Generation and skeptic are told apart by the system prompt.
+    let calls = 0;
+    let onCall = null;
+    const stub = createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", async () => {
+        calls++;
+        if (onCall) await onCall(calls);
+        let system = "";
+        try { system = JSON.parse(body).messages.find((m) => m.role === "system")?.content ?? ""; } catch { /* */ }
+        const content = /You are the Skeptic/.test(system)
+          ? JSON.stringify({ verdict: "sound", body: "Attacked the assumption; it held for this stub.", findings: [] })
+          : JSON.stringify({
+              title: `F-14 stub hypothesis ${calls} ${randomUUID().slice(0, 8)}`,
+              slug: `${SLUG_PREFIX}f14-${calls}-${randomUUID().slice(0, 8)}`,
+              description: "A stub hypothesis produced by verify-agents to exercise the runner's credential handling.",
+              status: "plausible", confidence: 40, confidence_rationale: "stub",
+              assumptions: [{ text: "The stub is a stub.", justified: true }],
+              open_questions: [], falsification_criteria: "Any real observation.", reviewer_note: "verify-agents F-14", evidence: [],
+            });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ choices: [{ message: { content } }], usage: {} }));
+      });
+    });
+    await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+    const stubUrl = `http://127.0.0.1:${stub.address().port}/v1`;
+
+    const runResearch = (token) =>
+      new Promise((resolve) => {
+        execFile(
+          process.execPath,
+          ["scripts/run-research-agent.mjs", "--domain", "physics", "--count", "3", "--max-model-calls", "20", "--base-url", BASE],
+          {
+            env: {
+              ...process.env,
+              VERITAS_AGENT_TOKEN: token,
+              VERITAS_LLM_PROVIDER: "openai-compatible",
+              VERITAS_LLM_BASE_URL: stubUrl,
+              VERITAS_LLM_MODEL: "verify-stub",
+            },
+            timeout: 180_000,
+          },
+          (err, stdout, stderr) => resolve({ code: err ? (err.code ?? 1) : 0, out: `${stdout}\n${stderr}` }),
+        );
+      });
+
+    // (2) PREFLIGHT. An expired token must end the run before a single model
+    // call, non-zero, and say "expired". Zero is the whole point of the fix.
+    calls = 0;
+    const pre = await runResearch(expiredTok);
+    check(
+      "F-14 preflight: an EXPIRED token aborts the research run before ANY model call — exit ≠ 0, 0 model calls, names expiry",
+      pre.code !== 0 && calls === 0 && /preflight: token refused \(401\): Agent token expired/.test(pre.out),
+      `exit ${pre.code}, ${calls} model call(s) — ${pre.out.split("\n").filter(Boolean).slice(-2).join(" | ")}`,
+    );
+
+    // (3) MID-RUN. The token passes preflight and is revoked during the first
+    // model call — the situation preflight cannot see. The first propose then
+    // gets 401, and the run must STOP: one generation + one skeptic call, not
+    // three of each. The old per-item `continue` made 6 calls and exited 0.
+    const midTok = await mintTokenFor(agent.agentId, { expiresAt: new Date(Date.now() + 86400_000).toISOString() });
+    calls = 0;
+    onCall = async (n) => {
+      if (n === 1) await service.from("agent_tokens").update({ revoked_at: new Date().toISOString() }).eq("token_hash", hashOf(midTok));
+    };
+    const mid = await runResearch(midTok);
+    onCall = null;
+    check(
+      "F-14 mid-run: a 401 STOPS the run (not skip-and-continue) — exit ≠ 0, 2 model calls not 6, 'stopped early: token revoked'",
+      mid.code !== 0 && calls === 2 && /stopped early: token revoked \(401\)/.test(mid.out),
+      `exit ${mid.code}, ${calls} model call(s) — ${mid.out.split("\n").filter((l) => /stopped|✗|Done/.test(l)).join(" | ")}`,
+    );
+    // …and it is distinguishable from a cap: there IS a stop reason, it names
+    // the credential, and it is not the 429 string. (Checked against the pre-fix
+    // runner: a form that only asserted the cap string's absence passed there
+    // too, vacuously — the old runner printed no stop reason at all.)
+    check(
+      "F-14 mid-run: the stop reason names the credential and is not the cap's reason",
+      /stopped early: token revoked/.test(mid.out) && !/stopped early: server queue cap/.test(mid.out),
+      mid.out.split("\n").filter((l) => /stopped|Done/.test(l)).join(" | "),
+    );
+
+    // (4) BOTH SIDES. A live token must still get through preflight and post.
+    // A preflight that refused everything would pass (2) and (3).
+    const liveRunTok = await mintTokenFor(agent.agentId, { expiresAt: new Date(Date.now() + 86400_000).toISOString() });
+    calls = 0;
+    const live = await runResearch(liveRunTok);
+    check(
+      "F-14 permitted case: a LIVE token passes preflight and the run proposes — exit 0, ≥1 hypothesis posted",
+      live.code === 0 && /Done — [1-9]\d* hypothesis/.test(live.out) && calls >= 2,
+      `exit ${live.code}, ${calls} call(s) — ${live.out.split("\n").filter((l) => /Done|preflight|✗/.test(l)).join(" | ")}`,
+    );
+
+    await new Promise((r) => stub.close(r));
+  }
+
  } catch (e) {
   check(`harness error: ${e.message}`, false);
  } finally {

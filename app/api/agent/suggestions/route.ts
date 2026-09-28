@@ -3,11 +3,11 @@ import {
   apiData,
   apiError,
   apiZodError,
+  MAY_PROPOSE,
   requireAgent,
   translateDbError,
 } from "@/lib/api";
 import type { z } from "zod";
-import type { AgentKind } from "@/types/domain";
 import {
   agentCritiqueSchema,
   SUGGESTION_PAYLOAD_SCHEMAS,
@@ -75,8 +75,10 @@ import {
  *
  * 403, not 401: the token is valid and the agent is real. The capability is
  * absent, not the credential.
+ *
+ * `MAY_PROPOSE` itself is defined in lib/api.ts, so that GET /api/agent/whoami
+ * reports this same list to a runner's preflight rather than a copy of it.
  */
-const MAY_PROPOSE: ReadonlySet<AgentKind> = new Set<AgentKind>(["research", "council"]);
 
 export async function POST(request: NextRequest) {
   const auth = await requireAgent(request);

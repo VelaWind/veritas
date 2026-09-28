@@ -113,6 +113,14 @@ export async function requireContributor() {
  * at approval still bind. An agent can never approve (apply_suggestion requires
  * is_admin()).
  */
+/**
+ * Which agent lanes may propose. The reasoning lives at the gate that applies it,
+ * app/api/agent/suggestions/route.ts (§D.4 / AUDIT F-13). It is defined HERE only
+ * so GET /api/agent/whoami can report the same list instead of restating it: a
+ * runner's preflight must be told what the propose route will actually do.
+ */
+export const MAY_PROPOSE: ReadonlySet<AgentKind> = new Set<AgentKind>(["research", "council"]);
+
 export async function requireAgent(request: Request) {
   const header = request.headers.get("authorization") ?? "";
   const match = header.match(/^Bearer\s+(.+)$/i);
@@ -175,7 +183,8 @@ export async function requireAgent(request: Request) {
     .update({ last_used_at: new Date().toISOString() })
     .eq("id", token.id);
 
-  return { ok: true as const, supabase, agent };
+  // `token` carries expiry so a caller can report it before it bites (AUDIT F-14).
+  return { ok: true as const, supabase, agent, token: { id: token.id, expires_at: token.expires_at as string | null } };
 }
 
 /** Friendly translation of the DB epistemic-guard errors (§2.3/§2.6). */

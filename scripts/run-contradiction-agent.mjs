@@ -24,7 +24,7 @@ import { loadEnv, requireEnv } from "./agent-lib/env.mjs";
 import { parseArgs, intArg } from "./agent-lib/args.mjs";
 import { createLlmProvider } from "./agent-lib/llm.mjs";
 import { capsFromArgs } from "./agent-lib/caps.mjs";
-import { makeAnonClient, propose } from "./agent-lib/agent-client.mjs";
+import { credentialStop, makeAnonClient, preflightToken, propose } from "./agent-lib/agent-client.mjs";
 import { extractJson } from "./agent-lib/util.mjs";
 
 loadEnv();
@@ -38,6 +38,23 @@ const TOKEN = process.env.VERITAS_AGENT_TOKEN;
 if (!TOKEN && !DRY) {
   console.error("Missing VERITAS_AGENT_TOKEN. Mint one with scripts/mint-agent-token.mjs, or use --dry-run.");
   process.exit(2);
+}
+
+// ── AUDIT F-14 — PREFLIGHT, before ANY model work ─────────────────────────────
+// Resolve the token against the server first. A dead credential used to be
+// discovered only at the first propose — after the model had already run — and
+// then skipped item by item to a clean-looking exit 0. The 401 is where that
+// failure surfaced; the waste was everything before it. So a token that cannot
+// post stops the run here, non-zero, naming the cause.
+let preflightAgent = null;
+if (!DRY) {
+  const pf = await preflightToken(BASE, TOKEN);
+  if (!pf.ok) {
+    console.error(`✗ preflight: ${pf.reason}`);
+    process.exit(1);
+  }
+  if (pf.warning) console.warn(`⚠ preflight: ${pf.warning}`);
+  preflightAgent = pf.agent;
 }
 
 const llm = createLlmProvider();
@@ -69,6 +86,9 @@ const list = hyps ?? [];
 
 console.log(`\nContradiction Agent — ${DRY ? "DRY RUN (no writes)" : "proposing into the queue"}`);
 console.log(`  model    : ${llm.describe()}`);
+if (preflightAgent) {
+  console.log(`  agent    : ${preflightAgent.name} (${preflightAgent.kind}, ${preflightAgent.status}) — token expires ${preflightAgent.expires_at ?? "never"}`);
+}
 console.log(`  scope    : ${domainName}`);
 console.log(`  caps     : ${caps.summary()}`);
 console.log(`  scanning : ${list.length} hypotheses\n`);
@@ -131,6 +151,7 @@ async function submit(envelope) {
 
 const seenPairs = new Set();
 const results = { proposed: 0, skipped: 0 };
+let credentialDead = false; // AUDIT F-14 — see run-research-agent.mjs
 const collected = [];
 
 for (const f of findings) {
@@ -197,10 +218,18 @@ for (const f of findings) {
     caps.stoppedReason ??= "server queue cap (429)";
     break;
   } else {
+    const stop = credentialStop(res);
+    if (stop) {
+      console.log(`    ✗ ${stop} — stopping the run`);
+      caps.stoppedReason ??= stop;
+      credentialDead = true;
+      break;
+    }
     console.log(`    ✗ proposal rejected (${res.status}): ${res.error}`);
     results.skipped++;
   }
 }
+if (credentialDead) process.exitCode = 1;
 
 if (args.out && args.out !== true) {
   writeFileSync(

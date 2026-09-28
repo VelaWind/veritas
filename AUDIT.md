@@ -1260,6 +1260,144 @@ by that prior measurement rather than assumed.
 
 ---
 
+### F-14 — MEDIUM — **FIXED 2026-09-28** — A dead agent token produced a full research run that looked like a successful one
+
+**Same class as the two-month outage:** a wrong value that yields a
+plausible-looking success, not an error.
+
+**What happened.** `run-research-agent.mjs` found out whether its token worked
+only at the first `propose`. By then it had already made that item's
+generation call and its skeptic call. A 401 then fell into the same `else` as a
+bad payload:
+
+```js
+} else {
+  console.log(`    ✗ proposal rejected (${res.status}): ${res.error}`);
+  results.skipped++;
+  continue;
+}
+```
+
+So the run went on to the next item and did the same model work again, up to
+`--count`. It ended `Done — 0 hypothesis + 0 evidence proposal(s), N skipped.`,
+with no `stopped early` line and **exit 0**. A scheduled run would have looked
+like a quiet day. The server was never the problem: `requireAgent()` returns a
+specific `"Agent token expired."`, and the runner printed it once per item and
+carried on. The evidence loop was worse. It ignored every non-201, non-429
+answer without printing anything.
+
+**Measured against the pre-fix runner, not reasoned.** In verify-agents, an
+expired token ran `--count 3` to **6 model calls, exit 0, "3 skipped"**, and a
+token revoked mid-run did the same. Locally that is a generation plus a skeptic
+pass per item. At real-model speeds (30–40s per call, see the IA report pass),
+a default run is tens of minutes of inference against a credential that cannot
+post.
+
+**Live exposure.** All six seeded tokens (five researchers and
+`internal-affairs`) expired on 2026-09-10 and stayed expired for 18 days.
+`last_used_at` was NULL on all six, so no run was actually misled. The exposure
+was real and unexercised.
+
+**Which runners share it:**
+
+| Runner | Token? | Shares it? |
+|---|---|---|
+| `run-research-agent.mjs` | yes | **Yes**, worst case: model work happens *per item*, so every skipped 401 costs a generation and a skeptic call. |
+| `run-contradiction-agent.mjs` | yes | **Yes, milder.** Model work happens once, up front, before any proposal, so a dead token wastes that pass rather than one per item. It still ended skip-per-item and exit 0. See also **F-15**, which is worse. |
+| `run-internal-affairs.mjs` | no, service role | No. The sanction route is not wired from the runner. |
+| `run-council.mjs` | no, anon + service role | No. Stops before the queue. |
+
+**The fix, in two parts, and the first matters more.**
+
+1. **Preflight before any model work.** New `GET /api/agent/whoami` runs the
+   same `requireAgent()` as the propose route and returns the caller's name,
+   kind, status, `may_propose` (the route's own `MAY_PROPOSE`, now exported from
+   `lib/api.ts` so it is not restated) and the token's `expires_at`. Both token
+   runners call it immediately after reading `VERITAS_AGENT_TOKEN`, before
+   grounding reads and before the model. Anything but 200 aborts with exit 1:
+   `✗ preflight: token refused (401): Agent token expired.` A token whose lane
+   cannot propose is also refused there, instead of 403 on every item. A
+   passing token that expires within 14 days prints a warning with the re-mint
+   command, so expiry is visible *before* it bites and not only when it does.
+2. **A credential failure stops the run.** `credentialStop()` in
+   `agent-lib/agent-client.mjs` classifies a propose answer:
+   - **401** means the token expired, was revoked or is invalid.
+   - **403 "is disabled"** means the agent was suspended mid-run, which the
+     preflight cannot see.
+   - **Other 403s stay per-item.** Those are the quota trigger's per-proposal
+     scope refusal.
+
+   A credential stop breaks both the hypothesis and evidence loops. It records
+   `stopped early: token revoked (401): …` (or `token expired`, `agent
+   disabled`), which is distinguishable from `server queue cap (429)`, and exits
+   1. The evidence loop now logs every non-201.
+
+**Asserted, from both sides** (verify-agents 82 → 88, run against the real runner
+and a stub model that counts calls):
+
+```
+F-14 whoami: expired → 401 naming expiry; revoked → 401 naming revocation
+F-14 whoami: live research token → 200, kind, may_propose=true, expiry
+F-14 preflight: EXPIRED token aborts before ANY model call — exit ≠ 0, 0 calls
+F-14 mid-run: 401 STOPS the run — exit ≠ 0, 2 model calls not 6, 'stopped early: token revoked'
+F-14 mid-run: the stop reason names the credential and is not the cap's reason
+F-14 permitted case: a LIVE token passes preflight and proposes — exit 0
+```
+
+The mid-run case revokes the token *from inside the stub model's first call*,
+which is the one situation preflight cannot catch. The permitted case exists
+because a preflight that refused everything would pass the other five.
+
+**Discriminating power, checked.** The block was run once against the pre-fix
+runner. Preflight and mid-run went red with exactly the defect (`exit 0, 6 model
+call(s) … 3 skipped`). The fifth assertion *passed* against the old runner,
+because it only checked that the cap's reason was absent, and the old runner
+printed no reason at all. It was rewritten to require the credential reason
+before this was committed.
+
+**Not fixed by this, stated rather than implied.** A per-item failure that is
+*systematically* per-item, meaning the same 422 on every item, still skips to
+exit 0. That is F-15.
+
+---
+
+### F-15 — MEDIUM — OPEN — The contradiction runner cannot post with any token that exists
+
+Found while checking the other runners for F-14.
+
+**Measured through the code path, not run live.** `run-contradiction-agent.mjs`
+proposes hypothesis *edits* with no `critique` field. Since the D.2 skeptic lane
+and F-13's allow-list:
+
+- **With a `research` token:** passes the gate, then fails with **422 on every
+  item**: *"A research proposal must carry a skeptic critique."* That is
+  per-item by status code, so F-14's `credentialStop` correctly does not stop
+  on it. The run ends `N skipped`, exit 0: the F-14 shape, with a payload cause
+  instead of a credential cause.
+- **With a `contradiction`-kind token:** refused by `MAY_PROPOSE` (403). As of
+  F-14 that is caught by the preflight before the model runs, which is an
+  improvement, but it still means the runner cannot post.
+- **With a `council` token:** would pass. No council identity is seeded, and
+  using one would credit contradiction findings to the council. That is wrong.
+
+So there is no token today that lets this lane post a proposal.
+
+**Why this is not fixed here.** Every fix is a lane decision, not a bug fix:
+- put `contradiction` on `MAY_PROPOSE` and decide whether its findings need a
+  skeptic pass;
+- give the runner a skeptic pass and have it post under a research identity;
+- or retire the runner.
+
+The allow-list comment in the propose route already calls `contradiction` "a
+live decision rather than a moot point". This finding is that decision coming
+due. **Owner's call.**
+
+**Interim.** Do not schedule `run-contradiction-agent.mjs`. With a research
+token it will now pass preflight and then produce a clean-looking run that
+posts nothing.
+
+---
+
 ### F-08 — LOW (environment, not code) — Eight orphaned `next` processes were holding file locks
 
 `npm ci` could not run until these were terminated. They are leftovers from
