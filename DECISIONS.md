@@ -1187,6 +1187,113 @@ included in its own roster sweep. It *may* sanction itself — self-suspension i
 fail-safe and therefore allowed — and it cannot un-suspend itself, because
 reinstatement is admin-only. That asymmetry is the point.
 
+### The report (stage 4, second pass — 2026-09-28)
+
+**The ordering is enforced by the table, not by the runner.** 0011's two CHECK
+constraints — a report has a `report_at`, and `report_at >= run_at` — are
+satisfied by a runner that computes findings, asks the model, and INSERTs the
+whole row at once: `report_at = run_at = now()`. That runner would have had the
+model's output in hand while writing findings and severity, and nothing would
+show it. So **0013** makes the §D.4 ordering a table property:
+
+- **An INSERT may not carry `report`, `report_at` or `report_error`** (trigger,
+  23514). A report exists only as an UPDATE of a row that committed without one.
+- **After INSERT, `findings`, `severity`, `public_summary`, `run_at`,
+  `agent_name` and `actions_taken` are frozen**, by a trigger that binds
+  `service_role` too, because RLS does not. `agent_id` may only go to NULL, which
+  is 0011's `on delete set null`.
+- **The report outcome is write-once**, and `report_at` is stamped by the
+  database, overwriting whatever the caller sent.
+- **`severity = audit_findings_severity(findings)` is a CHECK constraint.** The
+  one exemption is a sanction row (`findings = '[]'` with a non-empty
+  `actions_taken`), which `ia_apply_sanction` writes with the grade of the
+  action.
+
+On the runner's side, `agent-lib/ia-report.mjs` is handed an audit **ID**, not
+findings. It reads the row back and builds the prompt from what is stored.
+verify-agents proves that from outside. The stub model queries the table at the
+moment it is called and finds the row already committed with `report` NULL. The
+prompt carries the findings in jsonb's key order, which differs from the
+runner's in-memory order, so it can only have come from the read-back.
+
+**Severity is derived from findings, never from the report.** It is computed
+before the model is called, frozen at INSERT, and re-checked by the constraint.
+Asserted directly: the same probe agent is audited twice with the same data.
+One stub report says "CRITICAL, suspend immediately" and the other says "OK,
+exemplary". The two rows have identical findings, different reports, the same
+severity, and that severity equals the derived grade. At least one of the two
+reports contradicts it.
+
+**`public_summary`: mechanical.** Three options were weighed:
+
+1. *Model-written and accepted.* Rejected. §D.7 makes `public_summary` one of
+   three columns meant for a public surface. The site would publish unreviewed
+   model prose about a named agent's conduct the day that surface is built.
+2. *Model-written, admin-gated before it can surface.* Rejected **for now**. It
+   needs a review state, an approval route and an `/admin/audits` UI, and none of
+   them exist. Until someone builds and operates them, the gate holds back every
+   summary, so the public surface would carry nothing or fall back to a
+   mechanical line anyway. Revisit when `/admin/audits` exists. It would be a new
+   column (`public_summary_draft` + `approved_at`) beside the mechanical one, not
+   a change to it.
+3. **Mechanical — chosen.** Written from the findings at INSERT, before any
+   model call, frozen by 0013. It cannot disagree with `severity`, because both
+   come from the same six grades in the same function. It states what the run
+   did: *"Mechanical audit of X: 6/6 checks ran, severity concern (#4 concern)."*
+   It says nothing about the report. Whether a report gets written is decided
+   after this string is frozen, so any claim about it would be a guess.
+
+The case for this is not hypothetical. The first real local-model report
+(`qwen3:8b`, 2026-09-28, on `physics-researcher`'s real findings, not stored)
+correctly called check #1 "an absence of input, not a clean result" and said
+check #5 "lacked sufficient data". It then concluded **"All checks ran without
+exceptions"**, which its own findings contradict: two of the six have
+`status ≠ ran`. The prompt forbids exactly that and the model said it anyway.
+`report` is admin-only (§D.7) and is commentary *on* findings that sit next to
+it, so an admin can see the contradiction. A public summary would carry it with
+nothing beside it to contradict it.
+
+**A NULL report now says why.** Under 0011, NULL meant "the model did not
+run". Once a model is wired, NULL also means "it ran and returned nothing
+usable", which is a different fact. The new `report_error` column records the
+reason, and it is mutually exclusive with `report`. A row with neither set is
+one whose report stage never completed: the runner died between the two
+statements, or it was a `--dry-run`, which stores nothing and so calls no model.
+`report` may no longer be `''`. Empty output is recorded as a `report_error`
+that says so.
+
+**Failure paths, each asserted every run:**
+
+| Model does | Outcome | Row |
+|---|---|---|
+| refuses the connection | `call_failed` | 6 findings, derived severity, `report` NULL, `report_error` "model call failed" |
+| answers HTTP 500 | `call_failed` | same, "LLM HTTP 500" |
+| answers a non-JSON body | `call_failed` | same, "non-JSON" |
+| returns `""` | `rejected` | same, "empty output" |
+| returns only a cut-off `<think>` block | `rejected` | same, "only a reasoning block" |
+
+None of these rolls the findings back. The findings committed in a separate
+statement before the model was called, and the report stage has no DELETE in it.
+
+**The NULL branch is exercised on purpose, from now on (the M2 shape).** Before
+this pass, a NULL report was the *only* outcome. With a local model up it
+becomes the branch that never runs in normal operation, and that is how a
+fallback rots unnoticed. So verify-agents does not rely on an outage happening.
+It spawns the real runner against a local stub server and provokes all five
+failure modes on **every** run. It then asserts the count ("5 of 5 failure modes
+reached it"), so a refactor that stopped the stub being reached turns red
+instead of letting five checks silently not execute. `test-ia-report.mjs` pins
+the parser's rules without a database. Both directions are asserted there too:
+`parseReport` accepting prose is tested alongside the nine rejections, so a
+parser that refused everything could not pass.
+
+**What 0013 does not stop, stated rather than implied.** The model can still
+write a report that misreads its findings, as shown above. The table guarantees
+the report cannot *change* anything: not findings, not severity, not the public
+summary. It cannot guarantee the prose is faithful. That is why the report is
+admin-only and sits next to the findings it claims to describe. DELETE is also
+unguarded. Freezing is about what a row *says*; retention is a separate decision.
+
 ## D.5 Site features
 
 **(a) Citation verifier — keyed by citation, not by proposal.** Crossref +

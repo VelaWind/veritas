@@ -1,22 +1,40 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Internal Affairs runner (DECISIONS §D.4) — MECHANICAL HALF ONLY.
+// Internal Affairs runner (DECISIONS §D.4).
 //
-// THERE IS NO MODEL CALL IN THIS FILE, AND ITS ABSENCE IS THE POINT.
+// TWO STAGES, AND THE DATABASE KEEPS THEM IN ORDER.
 //
 // §D.4: "Every check is computed in SQL/JS and stored as structured `findings`
 // BEFORE any model call. The model writes the report FROM those findings and
-// cannot invent one." 0011 makes half of that mechanical — a report cannot exist
-// without a `report_at`, and `report_at` cannot precede `run_at`. But those
-// CHECK constraints cannot tell whether findings were computed from data or
-// written to match a report that already existed. Only the structure of this
-// script can, so the findings path ships and is verified BEFORE any model code
-// exists to contaminate it.
+// cannot invent one."
 //
-// Concretely: this script does not import scripts/agent-lib/llm.mjs, takes no
-// model flags, has no token budget, and writes `report: null` unconditionally.
-// A row it produces is a COMPLETE audit — `findings` populated, `severity`
-// derived from those findings, `report` null meaning "no report was written",
-// which 0011 deliberately distinguishes from an empty string.
+//   1. MECHANICAL. The six checks run, severity is derived from their grades,
+//      public_summary is written from them, and the row is INSERTed with report
+//      NULL. No model code runs before this commits. The first pass shipped this
+//      stage alone, with no model anywhere in the file, so it could be verified
+//      before anything existed that could contaminate it.
+//
+//   2. REPORT. Only after the INSERT returns an id does scripts/agent-lib/
+//      ia-report.mjs run. It is given the ID, not the findings, reads the row
+//      back, prompts from what is stored, and UPDATEs `report` — or, on any
+//      failure, `report_error`. Nothing is rolled back: a model outage leaves a
+//      complete audit with a NULL report and a stated reason.
+//
+// WHY THIS IS STRUCTURAL AND NOT A CONVENTION. 0011's CHECK constraints would
+// have been satisfied by a runner that built the whole row in memory — findings,
+// severity and report together — and INSERTed once. 0013 refuses that shape: an
+// INSERT may not carry a report, and after INSERT the findings, severity and
+// public_summary are frozen by a trigger that binds the service role too. So the
+// model's output arrives at a row where the only writable columns are its own.
+//
+// SEVERITY IS DERIVED, NEVER CHOSEN — and never by the model. It is the worst
+// grade among the six findings, computed here, and 0013 re-derives it as a
+// CHECK constraint, so a row whose severity disagrees with its findings cannot
+// be stored at all. verify-agents asserts the consequence directly: same
+// findings, opposite report text, same severity.
+//
+// public_summary IS MECHANICAL (§D.7 — it is the one prose column meant for a
+// public surface). Written from the findings at INSERT; the model never writes
+// it. Why, and the two alternatives rejected: DECISIONS §D.4, "The report".
 //
 // WHAT IT ALSO DOES NOT DO: it does not sanction. `ia_apply_sanction` is reached
 // only through POST /api/agent/sanction with the internal-affairs token, and
@@ -33,13 +51,20 @@
 // not see (§D.7) — reading it as anon would not be a safer version of this
 // script, it would be a blind one.
 //
+// MODEL. The same provider seam as every lane (agent-lib/llm.mjs): local Ollama
+// by default, $0/call, cloud only if VERITAS_LLM_PROVIDER says so. One call per
+// audit. --dry-run writes nothing and therefore calls no model: the report is
+// written FROM a stored row, and a dry run stores none.
+//
 // Usage:
 //   node scripts/run-internal-affairs.mjs --agent <name> [--dry-run]
 //   node scripts/run-internal-affairs.mjs --all         [--dry-run]
-//     [--window-days 30] [--stale-days 14] [--json]
+//     [--window-days 30] [--stale-days 14] [--max-report-tokens 1200] [--json]
 // ─────────────────────────────────────────────────────────────────────────────
 import { loadEnv, requireEnv } from "./agent-lib/env.mjs";
 import { parseArgs, intArg } from "./agent-lib/args.mjs";
+import { createLlmProvider } from "./agent-lib/llm.mjs";
+import { writeAuditReport } from "./agent-lib/ia-report.mjs";
 
 loadEnv();
 const args = parseArgs();
@@ -47,6 +72,7 @@ const DRY = Boolean(args["dry-run"]);
 const AS_JSON = Boolean(args.json);
 const WINDOW_DAYS = Math.max(1, intArg(args["window-days"], 30));
 const STALE_DAYS = Math.max(1, intArg(args["stale-days"], 14));
+const MAX_REPORT_TOKENS = Math.max(200, intArg(args["max-report-tokens"], 1200));
 
 const only = typeof args.agent === "string" ? args.agent : null;
 const all = Boolean(args.all);
@@ -635,22 +661,24 @@ async function auditAgent(agent) {
   const graded = findings.filter((f) => f.severity !== "ok").map((f) => `#${f.check} ${f.severity}`);
 
   // The public summary states what the run did, not what it thinks. It is the
-  // only column of this row intended ever to reach a public surface (§D.7), and
-  // a mechanical run has no business writing prose there.
+  // only prose column of this row intended ever to reach a public surface
+  // (§D.7), so it is written HERE, from the findings, before any model call —
+  // and 0013 freezes it at INSERT, so the report stage could not rewrite it if
+  // it tried. It says nothing about the report: whether one gets written is
+  // decided after this string is stored, and a summary that claimed either
+  // outcome would be a guess frozen into the record.
   const public_summary =
     `Mechanical audit of ${agent.display_name || agent.name}: ${ran}/6 checks ran, ` +
     `severity ${severity}` +
     (graded.length ? ` (${graded.join(", ")})` : "") +
-    ". No report written.";
+    ".";
 
   const row = {
     agent_id: agent.id,
     agent_name: agent.name,
     findings,
-    // EXPLICIT, not omitted. `report` has no default and is nullable precisely so
-    // that "the model did not run" is a recorded fact rather than an absence, and
-    // 0011's CHECK constraint ties report_at to it. Writing it out states the
-    // intent at the call site.
+    // EXPLICIT, not omitted — and 0013 refuses the INSERT if either is anything
+    // else. The report is written by an UPDATE, after this row has committed.
     report: null,
     report_at: null,
     severity,
@@ -664,21 +692,49 @@ async function auditAgent(agent) {
 
 // ── Run ──────────────────────────────────────────────────────────────────────
 
+// The provider is built once, and only if something is going to be written. A
+// provider that cannot be built (a cloud provider with no key) is not fatal:
+// every audit still commits, and each records why it has no report.
+let llm = null;
+let providerError = null;
+let iaCharter = null;
+if (!DRY && !halted) {
+  try {
+    llm = createLlmProvider({ maxTokens: MAX_REPORT_TOKENS });
+  } catch (err) {
+    providerError = String(err.message ?? err);
+  }
+  // IA's own charter is the report's system prompt: the auditor writes as
+  // itself. Missing is not fatal — ia-report.mjs has a neutral fallback.
+  const { data: ia } = await db.from("agents").select("charter").eq("name", "internal-affairs").maybeSingle();
+  iaCharter = ia?.charter || null;
+}
+
 const results = [];
 for (const agent of halted ? [] : targets) {
   const r = await auditAgent(agent);
   results.push(r);
+  if (DRY) continue;
 
-  if (!DRY) {
-    const { data, error } = await db.from("agent_audits").insert(r.row).select("id, run_at, severity").single();
-    if (error) {
-      console.error(`✗ ${agent.name}: could not write the audit — ${error.message}`);
-      process.exitCode = 1;
-      continue;
-    }
-    r.auditId = data.id;
-    r.runAt = data.run_at;
+  // STAGE 1 — the findings commit. Nothing model-related has run yet.
+  const { data, error } = await db.from("agent_audits").insert(r.row).select("id, run_at, severity").single();
+  if (error) {
+    console.error(`✗ ${agent.name}: could not write the audit — ${error.message}`);
+    process.exitCode = 1;
+    continue;
   }
+  r.auditId = data.id;
+  r.runAt = data.run_at;
+
+  // STAGE 2 — the report, from the stored row. Never throws; never rolls back.
+  r.report = await writeAuditReport({
+    db,
+    llm,
+    providerError,
+    auditId: data.id,
+    system: iaCharter,
+    maxTokens: MAX_REPORT_TOKENS,
+  });
 }
 
 if (halted) {
@@ -690,6 +746,7 @@ if (halted) {
       kind: r.agent.kind,
       severity: r.severity,
       audit_id: r.auditId ?? null,
+      report: r.report ? { outcome: r.report.outcome, detail: r.report.detail } : null,
       findings: r.findings,
     })),
     null,
@@ -707,11 +764,28 @@ if (halted) {
           : `  [${f.status}]`;
       console.log(`  ${mark} #${f.check} ${f.label}: ${f.severity}${note}`);
     }
+    if (r.report) {
+      console.log(
+        r.report.outcome === "written"
+          ? `  report: written (${r.report.detail})`
+          : `  report: NULL [${r.report.outcome}] — ${r.report.detail}`,
+      );
+    }
   }
   const byGrade = results.reduce((acc, r) => ({ ...acc, [r.severity]: (acc[r.severity] ?? 0) + 1 }), {});
+  const nullReports = results.filter((r) => r.report && r.report.outcome !== "written");
   console.log(
     `\n${results.length} audit(s) ${DRY ? "computed" : "written"} — ` +
       Object.entries(byGrade).map(([k, v]) => `${k}: ${v}`).join(", ") +
-      ". report NULL on every row: no model ran, and none can be called from this script.",
+      (DRY
+        ? ". Dry run: nothing stored, so no report was written — a report is written FROM a stored row."
+        : `. Reports: ${results.length - nullReports.length} written, ${nullReports.length} NULL` +
+          (llm ? ` (${llm.describe()})` : ` (no provider: ${providerError})`) + "."),
   );
+  // A NULL report is a complete audit, so it does not fail the run — but it is
+  // never silent. Each one is named with its reason above; this repeats the
+  // count where a skimming reader will see it.
+  if (nullReports.length) {
+    console.log(`  ⚠ ${nullReports.length} audit(s) have findings and severity but NO report — see report_error on each row.`);
+  }
 }

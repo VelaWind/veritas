@@ -22,7 +22,7 @@ Stage 3 is `0010` and stage 4 is `0011`, not the `0009`/`0010` the D.10 order
 originally named: 0009 went to the F-07 default-privileges fix. DECISIONS §D.6 is
 corrected.
 
-**Applied to the linked project** (`supabase db push`): 0007, 0008, 0010, 0011,
+**Applied to the linked project** (`supabase db push`): 0007, 0008, 0010, 0011, 0013,
 plus 0009 and 0012 from outside the Phase D sequence, which close the two open
 default privileges — 0009 for future tables, 0012 for future functions. 0012 also
 revoked the over-grants the old default had already handed out, taking
@@ -30,15 +30,15 @@ PUBLIC-executable functions in `public` from 22 to 4 and closing a live
 security-definer RLS bypass. Why, and the per-function surface: `AUDIT.md` F-07,
 F-11 and §11.
 
-### Gates — all green against the live database, last run 2026-09-05 (after 0012)
+### Gates — all green against the live database, last run 2026-09-28 (after 0013)
 
 | Gate | Result |
 |---|---|
-| `node scripts/verify-agents.mjs` | ✅ ALL GREEN — **65**, live-verified 2026-09-27 (19 at Phase B, 38 at stage 2, 43 with the D.9 council assertions, 47 with the F-07a/F-12 default-ACL block, 61 with the D.4 sanction route and D.9 #3/#9, 65 with D.9 #4 asserted from both sides) |
-| `node scripts/verify-suggestions.mjs` | ✅ ALL GREEN — **25** (the human contributor path, unaffected by 0012) |
+| `node scripts/verify-agents.mjs` | ✅ ALL GREEN — **82**, live-verified 2026-09-28 (19 at Phase B, 38 at stage 2, 43 with the D.9 council assertions, 47 with the F-07a/F-12 default-ACL block, 61 with the D.4 sanction route and D.9 #3/#9, 65 with D.9 #4 asserted from both sides, 82 with the IA report stage and 0013) |
+| `node scripts/verify-suggestions.mjs` | ✅ ALL GREEN — **25** (the human contributor path, unaffected by 0012 and 0013) |
 | `npm run smoke` (against production) | ✅ ALL GREEN — **95** (87 → 93 with `/council/[id]`, 93 → 95 with the truncation marker) |
-| `npm run test:unit` | ✅ **56** across two files — 25 `test-sanitize`, 31 `test-council-budget` |
-| `npm run validate:sql` (**13** files) | ✅ green |
+| `npm run test:unit` | ✅ **73** across three files — 25 `test-sanitize`, 31 `test-council-budget`, 17 `test-ia-report` |
+| `npm run validate:sql` (**14** files) | ✅ green |
 | `npm run build` (live credentials) | ✅ green, **128/128** pages (127 → 128 with `/api/agent/sanction`) |
 | `tsc --noEmit` · `contrast.mjs` | ✅ clean · ALL PASS |
 
@@ -86,6 +86,35 @@ report. Only the runner's structure can.
 token from another lane is refused for the right reason and reaches no database
 call — asserted, including that no status changed and no audit row appeared.
 
+**Second pass shipped 2026-09-28 — the model writes the report FROM the stored
+findings, and the table enforces the order.** The runner INSERTs the findings row
+with `report` NULL; only then does `agent-lib/ia-report.mjs` run, given the audit
+ID rather than the findings, reading the row back and UPDATEing `report` — or
+`report_error` on any failure. **0013** (applied 2026-09-28) makes that a table
+property: an INSERT may not carry a report; findings, severity and
+`public_summary` are frozen after INSERT, for `service_role` too; the report
+outcome is write-once with `report_at` stamped by the database; and `severity`
+must equal the worst grade in `findings` as a CHECK constraint.
+
+- **Severity cannot be moved by the report.** Asserted: same findings, one stub
+  report shouting CRITICAL and one saying OK → identical severity, equal to the
+  derived grade.
+- **`public_summary` is mechanical**, written from the findings at INSERT and
+  frozen. Model-written (accepted, or admin-gated) was rejected; why:
+  DECISIONS §D.4 → *The report*.
+- **Failure never loses the audit.** Unreachable, HTTP 500, non-JSON, empty, and
+  reasoning-only output each leave six findings, the derived severity, `report`
+  NULL and a `report_error` saying which — nothing rolled back.
+- **The NULL branch runs on every verify-agents run**, against a stub model,
+  five ways, with the count asserted — so it cannot become the fallback nobody
+  has exercised since it was written.
+
+Default model is local Ollama, $0/call, one call per audit. Both local models
+tried (`qwen2.5:14b`, `qwen3:8b`) produce reports the parser accepts, in 30–40s.
+No live audit rows have been written: `agent_audits` is still empty in the live
+database, and the first real run is an operator decision, not a side effect of
+this pass.
+
 It does not sanction yet: `ia_apply_sanction` is reached only through that route,
 and wiring the runner to it is the next step, held back for the same reason
 `run-council.mjs` does not propose. `actions_taken` is `[]` on every row the
@@ -112,9 +141,11 @@ stage 3 — at the schema level only; see below.
   omission — but it also blocks **D.9 #5** (that a verdict lands `pending` only,
   credited to `council`, changing no hypothesis row), which cannot be asserted
   until the wiring exists.
-- **Stage 4's model half — the report.** The findings path is live and verified;
-  nothing yet writes `report` / `report_at`. That is the deliberate stop-point of
-  the first pass, not an omission.
+- ~~**Stage 4's model half — the report.**~~ **Shipped 2026-09-28** (0013 +
+  `agent-lib/ia-report.mjs`). Known limit, not fixed by it: the table stops the
+  report changing anything, but not the report misreading its findings — the
+  first real `qwen3:8b` report said "all checks ran" when two had not. That is
+  why the report is admin-only and `public_summary` is mechanical.
 - **Wire the runner to the sanction route.** The route exists and is asserted;
   `run-internal-affairs.mjs` writes audits and applies nothing. Until they are
   connected, a finding graded `concern` or `critical` has no consequence.

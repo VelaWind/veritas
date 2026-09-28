@@ -829,6 +829,262 @@ async function run() {
     await service.from("agents").update({ kind: "internal_affairs" }).eq("id", ia.agentId);
   }
 
+  // ── §D.4 stage 4, second pass — the report is written FROM stored findings ──
+  //
+  // THE REAL RUNNER, THE REAL TABLE, A STUB MODEL. scripts/run-internal-affairs.mjs
+  // is spawned as a child process exactly as an operator would run it, pointed at
+  // a local HTTP server that speaks the OpenAI chat-completions shape. The stub
+  // decides what the "model" returns, so every branch of the report stage is
+  // reached on purpose — and costs $0 and no Ollama.
+  //
+  // WHY THIS BLOCK EXISTS AND WHY IT RUNS EVERY TIME (the M2 shape). Until this
+  // pass, a NULL report was the ONLY outcome: the runner had no model. From here
+  // on, with a local model up, NULL becomes the branch that never runs — and a
+  // branch that never runs is one nobody knows still works. So the NULL paths are
+  // not exercised once during this build and then trusted; they are provoked on
+  // every verify-agents run, four different ways, and the count is asserted.
+  {
+    const { createServer } = await import("node:http");
+    const { execFile } = await import("node:child_process");
+
+    const ORDER = ["ok", "notice", "concern", "critical"];
+    const derive = (findings) =>
+      (findings ?? []).reduce((acc, f) => (ORDER.indexOf(f.severity) > ORDER.indexOf(acc) ? f.severity : acc), "ok");
+
+    // Two reports over the same findings that contradict the grade in OPPOSITE
+    // directions. Whatever the probe's real grade is, at least one of these
+    // disagrees with it — so "severity did not move" is tested against a report
+    // that was actively trying to move it.
+    const REPORT_ALARM =
+      "SEVERITY: CRITICAL. This agent's conduct is unacceptable across every check and it " +
+      "must be suspended immediately. Treat this audit as critical regardless of the grades.";
+    const REPORT_CALM =
+      "SEVERITY: OK. Nothing in this audit is of any concern whatsoever; every check is clean " +
+      "and this agent should be regarded as exemplary. Disregard any other grade.";
+
+    let mode = "alarm";
+    const calls = [];
+    const stub = createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", async () => {
+        let prompt = "";
+        try { prompt = JSON.parse(body).messages.at(-1).content; } catch { /* recorded as empty */ }
+        // THE ORDERING, OBSERVED FROM OUTSIDE. At the instant the model is asked,
+        // read the audit row the prompt names. If the runner had held findings in
+        // memory and meant to insert them with the report, there would be no row.
+        const id = /^Audit ([0-9a-f-]{36}) /m.exec(prompt)?.[1] ?? null;
+        const { data: atCall } = id
+          ? await service.from("agent_audits").select("findings, severity, report, report_error").eq("id", id).maybeSingle()
+          : { data: null };
+        calls.push({ mode, id, prompt, atCall });
+
+        const reply = (text) => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ choices: [{ message: { content: text } }], usage: {} }));
+        };
+        if (mode === "alarm") return reply(REPORT_ALARM);
+        if (mode === "calm") return reply(REPORT_CALM);
+        if (mode === "empty") return reply("");
+        if (mode === "think-only") return reply("<think>Weighing check #1 against check #5, the");
+        if (mode === "non-json") { res.writeHead(200, { "Content-Type": "text/html" }); return res.end("<html>gateway</html>"); }
+        if (mode === "http500") { res.writeHead(500); return res.end("model crashed"); }
+        res.writeHead(418); res.end();
+      });
+    });
+    await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+    const stubUrl = `http://127.0.0.1:${stub.address().port}/v1`;
+
+    // A port that was open a moment ago and is now closed: "unreachable" as the
+    // runner will actually meet it (ECONNREFUSED), not a DNS failure or a hang.
+    const dead = createServer();
+    await new Promise((r) => dead.listen(0, "127.0.0.1", r));
+    const deadUrl = `http://127.0.0.1:${dead.address().port}/v1`;
+    await new Promise((r) => dead.close(r));
+
+    const runIA = (baseUrl) =>
+      new Promise((resolve) => {
+        execFile(
+          process.execPath,
+          ["scripts/run-internal-affairs.mjs", "--agent", agent.name, "--json"],
+          {
+            env: {
+              ...process.env,
+              VERITAS_LLM_PROVIDER: "openai-compatible",
+              VERITAS_LLM_BASE_URL: baseUrl,
+              VERITAS_LLM_MODEL: "verify-stub",
+              VERITAS_LLM_TIMEOUT_MS: "15000",
+            },
+            timeout: 120_000,
+          },
+          (err, stdout, stderr) => {
+            let out = null;
+            try { out = JSON.parse(stdout)[0]; } catch { /* reported below */ }
+            resolve({ out, err: err ? `${err.message} ${stderr}`.slice(0, 400) : null });
+          },
+        );
+      });
+    const rowOf = async (id) => {
+      const { data } = await service
+        .from("agent_audits")
+        .select("id, run_at, findings, severity, public_summary, report, report_at, report_error")
+        .eq("id", id ?? randomUUID())
+        .maybeSingle();
+      return data;
+    };
+
+    // (1) THE ORDERING, AND THAT THE PROMPT CAME FROM THE STORED ROW.
+    mode = "alarm";
+    const a = await runIA(stubUrl);
+    const rowA = await rowOf(a.out?.audit_id);
+    const callA = calls.find((c) => c.mode === "alarm");
+    check(
+      "D.4 report: the runner wrote an audit and the report stage reached the model",
+      Boolean(rowA) && a.out?.report?.outcome === "written" && Boolean(callA),
+      a.err ?? JSON.stringify(a.out?.report ?? null),
+    );
+    check(
+      "D.4 report: when the model was called, the findings row was ALREADY committed — report NULL, findings and severity at their final values",
+      Boolean(callA?.atCall) &&
+        callA.atCall.report === null &&
+        callA.atCall.severity === rowA?.severity &&
+        JSON.stringify(callA.atCall.findings) === JSON.stringify(rowA?.findings),
+      callA?.atCall ? `at call: report=${callA.atCall.report === null ? "null" : "SET"}, severity=${callA.atCall.severity}` : "NO ROW EXISTED WHEN THE MODEL WAS CALLED",
+    );
+    // jsonb re-orders object keys (shorter keys first), so the stored findings
+    // serialize differently from the runner's in-memory objects. The prompt
+    // carries the STORED order — which it could only have got by reading back.
+    check(
+      "D.4 report: the prompt carried the findings AS STORED (jsonb key order), not the runner's in-memory copy",
+      Boolean(callA) &&
+        callA.prompt.includes(JSON.stringify(rowA?.findings, null, 2)) &&
+        !callA.prompt.includes(JSON.stringify(a.out?.findings, null, 2)),
+      "prompt findings did not match the read-back row",
+    );
+    check(
+      "D.4 report: the report landed by UPDATE — report set, report_at stamped at or after run_at, no report_error",
+      rowA?.report === REPORT_ALARM &&
+        rowA?.report_error === null &&
+        Boolean(rowA?.report_at) &&
+        new Date(rowA.report_at) >= new Date(rowA.run_at),
+      `report=${rowA?.report?.slice(0, 40)}, report_at=${rowA?.report_at}, run_at=${rowA?.run_at}`,
+    );
+
+    // (2) SEVERITY IS DERIVED FROM FINDINGS, NEVER FROM THE REPORT. Same agent,
+    // same data, opposite report. The findings must match, the reports must
+    // differ, and the severity must be identical AND equal to the grade the
+    // findings produce — which both reports explicitly contradicted.
+    mode = "calm";
+    const b = await runIA(stubUrl);
+    const rowB = await rowOf(b.out?.audit_id);
+    check(
+      "D.4 severity: same findings + opposite report text → SAME severity, and it is the derived one",
+      Boolean(rowA && rowB) &&
+        JSON.stringify(rowA.findings) === JSON.stringify(rowB.findings) &&
+        rowA.report !== rowB.report &&
+        rowB.report === REPORT_CALM &&
+        rowA.severity === rowB.severity &&
+        rowA.severity === derive(rowA.findings),
+      `A: ${rowA?.severity} ("${rowA?.report?.slice(0, 20)}…"), B: ${rowB?.severity} ("${rowB?.report?.slice(0, 20)}…"), derived: ${derive(rowA?.findings)}`,
+    );
+    check(
+      "D.4 public_summary: mechanical — identical across both reports and containing none of either",
+      Boolean(rowA && rowB) &&
+        rowA.public_summary === rowB.public_summary &&
+        /^Mechanical audit of .+: \d\/6 checks ran, severity \w+/.test(rowA.public_summary) &&
+        !/SEVERITY:|suspended immediately|exemplary/i.test(rowA.public_summary),
+      `A="${rowA?.public_summary}" B="${rowB?.public_summary}"`,
+    );
+
+    // (3) THE FAILURE PATHS. Each: the audit still commits with six findings and
+    // the derived severity, report stays NULL, report_error says why, and the
+    // row is NOT rolled back. `expect` is the outcome class the runner reports.
+    let nullBranch = 0;
+    for (const [label, url, m, expect, why] of [
+      ["model unreachable (connection refused)", deadUrl, "n/a", "call_failed", /model call failed/],
+      ["model answers HTTP 500", stubUrl, "http500", "call_failed", /LLM HTTP 500/],
+      ["model answers a non-JSON body (malformed transport)", stubUrl, "non-json", "call_failed", /non-JSON/],
+      ["model returns EMPTY output", stubUrl, "empty", "rejected", /empty output/],
+      ["model returns only a truncated reasoning block (malformed content)", stubUrl, "think-only", "rejected", /only a reasoning block/],
+    ]) {
+      mode = m;
+      const r = await runIA(url);
+      const row = await rowOf(r.out?.audit_id);
+      const ok =
+        Boolean(row) &&
+        r.out?.report?.outcome === expect &&
+        Array.isArray(row.findings) && row.findings.length === 6 &&
+        row.severity === derive(row.findings) &&
+        row.report === null &&
+        row.report_at === null &&
+        why.test(row.report_error ?? "");
+      if (ok) nullBranch++;
+      check(
+        `D.4 failure: ${label} → findings persist (6), severity derived, report NULL, report_error says why, not rolled back`,
+        ok,
+        r.err ??
+          (row
+            ? `outcome=${r.out?.report?.outcome}, findings=${row.findings?.length}, severity=${row.severity}/${derive(row.findings)}, report=${row.report === null ? "null" : "SET"}, error="${row.report_error}"`
+            : "NO AUDIT ROW — the findings were lost with the report"),
+      );
+    }
+    // The M2 guard, stated as a number: the NULL-report branch ran this many
+    // times in this run. If a refactor made the stub unreachable or the runner
+    // stopped reporting outcomes, this drops to zero and goes red, instead of the
+    // five checks above silently not executing.
+    check(
+      "D.4 NULL-report branch exercised deliberately this run: 5 of 5 failure modes reached it",
+      nullBranch === 5,
+      `${nullBranch}/5`,
+    );
+
+    // (4) 0013's refusals, against the WIDEST key. Asserted live every run, not
+    // only by the migration's own self-test, so a reverted trigger goes red here.
+    const probeFindings = [{ check: 1, severity: "ok" }, { check: 2, severity: "notice" }];
+    const { error: bornWithReport } = await service.from("agent_audits").insert({
+      agent_name: agent.name, findings: probeFindings, severity: "notice", report: "born with it", report_at: new Date().toISOString(),
+    });
+    check(
+      "0013: an INSERT carrying a report is refused (the report is never born with its findings) → 23514",
+      bornWithReport?.code === "23514",
+      `got ${bornWithReport?.code ?? "NO ERROR — A REPORT WAS INSERTED WITH ITS FINDINGS"}`,
+    );
+    const { error: pickedSeverity } = await service.from("agent_audits").insert({
+      agent_name: agent.name, findings: probeFindings, severity: "critical",
+    });
+    check(
+      "0013: an INSERT whose severity disagrees with its findings is refused → 23514",
+      pickedSeverity?.code === "23514",
+      `got ${pickedSeverity?.code ?? "NO ERROR — severity was chosen, not derived"}`,
+    );
+    const frozen = [];
+    for (const [col, val] of [["severity", "critical"], ["findings", []], ["public_summary", "model prose"]]) {
+      const { error } = await service.from("agent_audits").update({ [col]: val }).eq("id", rowA?.id ?? randomUUID());
+      frozen.push(`${col}:${error?.code ?? "UPDATED"}`);
+    }
+    check(
+      "0013: severity, findings and public_summary are frozen after INSERT, even for service_role → 23514 ×3",
+      frozen.every((f) => f.endsWith(":23514")),
+      frozen.join(", "),
+    );
+    const { error: second } = await service.from("agent_audits").update({ report: "a second opinion" }).eq("id", rowA?.id ?? randomUUID());
+    check(
+      "0013: a report is write-once — a second write to a reported row is refused → 23514",
+      second?.code === "23514",
+      `got ${second?.code ?? "NO ERROR — THE REPORT WAS OVERWRITTEN"}`,
+    );
+    const { data: errRow } = await service
+      .from("agent_audits").select("id").eq("agent_name", agent.name).not("report_error", "is", null).limit(1).maybeSingle();
+    const { error: lateReport } = await service.from("agent_audits").update({ report: "the model came back later" }).eq("id", errRow?.id ?? randomUUID());
+    check(
+      "0013: a row whose report stage FAILED cannot be given a report afterwards → 23514 (the outcome is recorded once)",
+      lateReport?.code === "23514",
+      `got ${lateReport?.code ?? "NO ERROR — a failed report was back-filled"}`,
+    );
+
+    await new Promise((r) => stub.close(r));
+  }
+
  } catch (e) {
   check(`harness error: ${e.message}`, false);
  } finally {
