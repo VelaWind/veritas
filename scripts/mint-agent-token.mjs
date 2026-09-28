@@ -15,7 +15,9 @@
 //     [--max-per-run 5] [--expires-days 30] [--label "laptop runner"]
 //
 // Re-running with the same --name reuses the identity and mints a fresh token
-// (old tokens stay valid until they expire or you revoke them).
+// (old tokens stay valid until they expire or you revoke them). On an EXISTING
+// agent it changes nothing but the new token row: scopes are preserved unless a
+// scope flag is passed, and the profile's display_name is left alone.
 // ─────────────────────────────────────────────────────────────────────────────
 import { randomBytes, createHash } from "node:crypto";
 import { loadEnv, requireEnv } from "./agent-lib/env.mjs";
@@ -41,7 +43,21 @@ const emailLocal = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-
 const email = `agent-${emailLocal}@veritas.local`;
 
 // 1. Identity ----------------------------------------------------------------
+// Paged lookup, as in seed-agent-roster.mjs: listUsers() returns ONE page, so an
+// existing identity past it would read as "exists but could not be found".
+async function findUserByEmail(addr) {
+  for (let page = 1; page <= 20; page++) {
+    const { data, error } = await service.auth.admin.listUsers({ page, perPage: 200 });
+    if (error) throw new Error(`listUsers: ${error.message}`);
+    const hit = data.users.find((u) => u.email === addr);
+    if (hit) return hit.id;
+    if (data.users.length < 200) return null;
+  }
+  return null;
+}
+
 let userId;
+let createdIdentity = false;
 {
   const password = "agent-" + randomBytes(18).toString("base64url") + "A1!";
   const { data, error } = await service.auth.admin.createUser({
@@ -51,21 +67,26 @@ let userId;
     user_metadata: { display_name: name },
   });
   if (error && /already.*registered|exists/i.test(error.message)) {
-    const { data: list } = await service.auth.admin.listUsers();
-    userId = list.users.find((u) => u.email === email)?.id;
+    userId = await findUserByEmail(email);
     if (!userId) throw new Error(`Agent user ${email} exists but could not be found.`);
   } else if (error) {
     throw new Error(`createUser(${email}): ${error.message}`);
   } else {
     userId = data.user.id;
+    createdIdentity = true;
   }
 }
 
 // 2. Under-privileged role ---------------------------------------------------
+// display_name is written ONLY for a newly created identity. It used to be
+// rewritten on every run, so rotating a rostered agent's token turned its
+// seeded name ("Physics Researcher") into the slug ("physics-researcher") — the
+// proposer name the queue shows. Same class as the scopes fix below: rotating a
+// credential must not rewrite anything that is not the credential.
 {
   const { error } = await service
     .from("profiles")
-    .update({ role: "agent", display_name: name })
+    .update(createdIdentity ? { role: "agent", display_name: name } : { role: "agent" })
     .eq("id", userId);
   if (error) throw new Error(`set role=agent: ${error.message}`);
 }
