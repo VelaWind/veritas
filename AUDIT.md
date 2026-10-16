@@ -1398,7 +1398,7 @@ posts nothing.
 
 ---
 
-### F-16 — LOW — OPEN — `dashboard_stats` has not been refreshed since 2026-06-11, and no assertion can see it
+### F-16 — LOW — **FIXED 2026-10-16** — `dashboard_stats` had not been refreshed since 2026-06-11, and no assertion could see it
 
 Found during the 2026-10-16 Advisor sweep (§12). The materialized view behind
 `/dashboard` and `/api/stats` was last refreshed `2026-06-11 20:18:02 UTC`. The
@@ -1442,7 +1442,7 @@ reads the same stale relation. The page does print `refreshed <date>`
 (`app/(public)/dashboard/page.tsx:50`), so a careful human reader could see it.
 No assertion reads that line.
 
-**Proposed detection (not built).**
+**Proposed detection, as filed. Superseded by the resolution below.**
 
 1. **A correctness assertion in smoke**, not just an age check. As anon,
    `count=exact` on `hypotheses`, `evidence`, `questions` (`status=unknown`),
@@ -1475,6 +1475,61 @@ enabling an extension. Refreshing from `apply_suggestion` alone is not enough,
 because the admin routes write the same tables directly without passing
 through it (`app/api/hypotheses/route.ts:48`, `app/api/evidence/route.ts:60`,
 `app/api/questions/route.ts:42`, `app/api/contradictions/[id]/route.ts:30`). **Owner's call.**
+
+**Resolution, 2026-10-16: converted, nothing else built.** The owner chose the
+conversion, and only the conversion. `0015_dashboard_stats_view.sql` replaces
+the matview with a plain view, `security_invoker = on`. Its definition is
+unchanged except for one column: `refreshed_at` is dropped, because on a plain
+view it would be `now()` at read time, a timestamp for a refresh that never
+happened. The refresh path goes with it:
+
+- `refresh_dashboard_stats()` is dropped, because `refresh materialized view` on
+  a plain view is an error;
+- `POST /api/stats` and the admin "Refresh dashboard stats" button are removed;
+- `seed.sql` no longer refreshes it;
+- `/dashboard` no longer prints `refreshed <date>`.
+
+**Order.** The live page read `refreshed_at`, so the app change shipped first
+(`2950321`). It works against both shapes: a local production build passed smoke
+95/0 against the matview. 0015 was applied only after production stopped
+printing the line.
+
+**Rehearsed under `begin; ... rollback;` against live, then applied.** Run as
+anon:
+
+```
+before (matview, as anon) = {"total_hypotheses":15,"total_evidence":31,"open_questions":15,"total_simulation_runs":3,"open_contradictions":5,"confidence_distribution":{"1": 1, "2": 10, "3": 4},"activity_by_domain":[...10 domains...]}
+after  (view, as anon)    = identical, byte for byte
+open_contradictions after resolving one (live, no refresh) = 4
+relkind / options = v security_invoker=on
+refresh_dashboard_stats exists = false
+acl = {..., anon=r/postgres}
+```
+
+After the push:
+
+- the guard NOTICE printed (`anon reads 1 row; refresh function dropped`);
+- smoke passed 95/0 against production and against a local build;
+- production `/api/stats` serves the same figures;
+- the Advisor no longer reports `materialized_view_in_api`, nor
+  `refresh_dashboard_stats` under `authenticated_security_definer_function_executable`
+  (§12).
+
+One semantic change, stated in 0015's header: `activity_by_domain` now counts
+under the reader's RLS, so for anon it excludes drafts, where the owner-run
+matview counted them. There are 0 drafts live, so today's figures are unchanged.
+
+**Considered and rejected: the smoke "stats vs live counts" assertion
+(detection item 1 above).** Do not rebuild it as an apparent gap. Once
+`dashboard_stats` is a plain view, that check compares the view with its own
+source tables, read the same way, as the same role. It cannot fail, so it would
+add a green line that measures nothing. That is the same problem as the
+agreement checks this finding started from. The age assertion (item 2) is moot,
+because there is no refresh to age. Smoke stays at **95**. The `/dashboard`
+page↔API assertion needed no edit, because it never read `refreshed_at`. The one
+smoke change is the detail string of the existing `/api/stats` check, from
+`dashboard_stats never refreshed` to `dashboard_stats returned no row`. That
+changes a message, not a check.
 
 ---
 
@@ -1744,7 +1799,7 @@ Two views also exist:
 | View | Definition | anon |
 |---|---|---|
 | `graph_nodes` | `0001:656` — `with (security_invoker = on)` | SELECT `0001:820` |
-| `dashboard_stats` | matview | SELECT `0001:819` |
+| `dashboard_stats` | matview until 2026-10-16; plain view `with (security_invoker = on)` since `0015` (F-16) | SELECT `0015` |
 | `agent_public` | `0007` — `security_invoker` **not set** (defaults to off) | SELECT `0007:268` |
 | `agent_public_stats` | `0007` — `security_invoker` **not set** | SELECT `0007:269` |
 
@@ -2781,8 +2836,10 @@ Before this sweep, the Advisor reported 2 ERROR and 20 WARN:
 - 6 × `authenticated_security_definer_function_executable`
 - 1 × `auth_leaked_password_protection`
 
-After 0014, it reports 2 ERROR and 10 WARN. Every remaining item except the last
-is accepted in 12.2.
+After 0014, it reports 2 ERROR and 10 WARN. After 0015 (F-16, the same day), it
+reports 2 ERROR and 8 WARN: `materialized_view_in_api` is gone, and so is
+`refresh_dashboard_stats` from the authenticated-executable list. Every remaining
+item except the last is accepted in 12.2.
 
 ### 12.1 Fixed: the nine `function_search_path_mutable` warnings (0014)
 
@@ -2846,7 +2903,9 @@ lint does not look.
 
 **Read this before applying any Advisor "fix" to these objects.** The
 consequence is measured, not assumed. Each suggested fix was applied under
-`begin; ... rollback;` as anon:
+`begin; ... rollback;` as anon. The `dashboard_stats` lines were measured on the
+matview, before 0015 replaced it. Revoking anon SELECT on today's plain view
+fails the same way.
 
 ```
 as-is   anon agent_public rows = 8
@@ -2915,7 +2974,13 @@ Either way the suggested fix removes a public page. It does not harden one.
   would pass. `agent_public_stats` is not asserted at all. The fix is an exact
   column-list assertion for both. Proposed, not built.
 
-#### `dashboard_stats`: WARN `materialized_view_in_api`
+#### `dashboard_stats`: WARN `materialized_view_in_api`, RESOLVED by 0015, no longer reported
+
+**Resolved 2026-10-16 by removing the condition, not by accepting it.** 0015
+made `dashboard_stats` a plain `security_invoker` view (F-16), so the Advisor no
+longer reports it. The reasoning below is kept because it still says why the
+*revoke* must never be applied: anon must keep SELECT on the plain view for the
+same reason.
 
 - **Mechanism (correct).** A materialized view has no RLS, so whatever it holds
   is readable by anyone granted SELECT.
@@ -2926,9 +2991,8 @@ Either way the suggested fix removes a public page. It does not harden one.
 - **Suggested fix refused.** Revoking anon SELECT removes `/dashboard` (measured
   above) and turns smoke's page↔API dashboard assertions red. This is the same
   shape as the views: the Advisor's fix is the 0002 outage.
-- **See F-16.** This relation has not been refreshed since 2026-06-11. The
-  recommended resolution there, a plain `security_invoker` view, would clear
-  this WARN by removing the condition rather than accepting it.
+- **See F-16.** This relation had not been refreshed since 2026-06-11. The
+  conversion that fixed F-16 is what cleared this WARN.
 
 #### `is_admin()`: WARN anon and authenticated SECURITY DEFINER executable
 
@@ -2975,6 +3039,10 @@ evaluates it as the caller, so `authenticated` must keep it. anon was revoked in
 
 #### `scan_contradictions()`, `refresh_dashboard_stats()`: WARN authenticated SECURITY DEFINER executable
 
+**`refresh_dashboard_stats()` was dropped by 0015** (F-16: nothing is left to
+refresh), so this entry now applies to `scan_contradictions()` alone. The probe
+below predates the drop and is kept as recorded.
+
 - **Instance.** The admin routes call both as `authenticated`
   (`app/api/contradictions/scan/route.ts:13`, `app/api/stats/route.ts:52`).
   Probed live on 2026-10-16 over PostgREST, with fresh accounts cleaned up
@@ -3001,8 +3069,8 @@ evaluates it as the caller, so `authenticated` must keep it. anon was revoked in
   revoked at 0001:824-825 and again at 0002:55-56 and 0002:112). **No
   migration guard or harness asserts that anon lacks it.** 0012's guard only
   checks that `authenticated` keeps it. Adding that assertion is recommended,
-  because this revoke is the only defence against anon. A later grant tidy-up must not read "it
-  checks for admin" and conclude the revoke is redundant. Granting anon EXECUTE
+  because this revoke is the only defence against anon. A later grant tidy-up
+  must not read "it checks for admin" and conclude the revoke is redundant. Granting anon EXECUTE
   on `scan_contradictions` would let any visitor write `contradictions` rows into
   the public map. §11.4 recorded this as "guard fails open".
 
