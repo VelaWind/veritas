@@ -1398,6 +1398,86 @@ posts nothing.
 
 ---
 
+### F-16 — LOW — OPEN — `dashboard_stats` has not been refreshed since 2026-06-11, and no assertion can see it
+
+Found during the 2026-10-16 Advisor sweep (§12). The materialized view behind
+`/dashboard` and `/api/stats` was last refreshed `2026-06-11 20:18:02 UTC`. The
+only thing that refreshes it is an admin `POST /api/stats`
+(`app/api/stats/route.ts:52`), and nobody makes that call.
+
+**Severity is set by measurement: nothing is misreported today.** The stored
+matview was compared against its own definition, re-run live in the same query
+(`pg_get_viewdef('dashboard_stats')` as a CTE):
+
+| Field | Stored (2026-06-11) | Live (2026-10-16) |
+|---|---|---|
+| `total_hypotheses` | 15 | 15 |
+| `total_evidence` | 31 | 31 |
+| `open_questions` | 15 | 15 |
+| `open_contradictions` | 5 | 5 |
+| `total_simulation_runs` | 3 | 3 |
+| `confidence_distribution` | `{"1":1,"2":10,"3":4}` | identical |
+| `activity_by_domain` | 10 domains | identical |
+
+They match because the map has not changed. Every row in the five source tables
+was created on 2026-06-11, which was the seed. One hypothesis was edited on
+2026-08-09 without moving its confidence bucket. No agent proposal has ever been
+approved (`suggestions` is empty), which is the two-month token outage (F-14)
+seen from the other side. The mechanism has been broken for four months. It went
+unnoticed because nothing it would have misreported has happened. **The first
+approved suggestion makes `/dashboard` wrong**, and nothing that runs today would
+say so.
+
+**The point is the detection gap, not the staleness.** Smoke has two dashboard
+assertions:
+
+- "`/dashboard` page and `/api/stats` agree on hypothesis count".
+- "`/api/stats` is not an empty payload" (`scripts/smoke.ts:497-522`).
+
+Both sides of the first one read the same matview. So they agree while being
+wrong together, and the second only checks that the number is greater than 0.
+Agreement was standing in for correctness. That is F-09b one layer down. There,
+a page agreed with its own stale cache. Here, a page agrees with an API that
+reads the same stale relation. The page does print `refreshed <date>`
+(`app/(public)/dashboard/page.tsx:50`), so a careful human reader could see it.
+No assertion reads that line.
+
+**Proposed detection (not built).**
+
+1. **A correctness assertion in smoke**, not just an age check. As anon,
+   `count=exact` on `hypotheses`, `evidence`, `questions` (`status=unknown`),
+   `contradictions` (`resolved=false`) and `simulation_runs`, compared field by
+   field with `/api/stats`. All five are anon-readable, and anon RLS already
+   hides drafts, which is the same filter the matview applies. This detects
+   staleness only when it matters, so it does not go red during a quiet period.
+   `production-smoke.yml` already runs smoke against production every 30
+   minutes, so it would catch a divergence within half an hour of the first
+   approval.
+2. **An age assertion, `refreshed_at` within N days, only once something
+   refreshes on a schedule.** With no scheduled refresher it would be red
+   permanently from today, and on its own it measures age, not wrongness.
+   **Recommended N = 2** against a daily refresh, which tolerates one missed run
+   and still fires before a week of drift.
+
+**What should refresh it. Recommendation: stop materializing it.** The view is
+seven subqueries over tens of rows. Materializing it buys nothing measurable at
+this scale, and it creates the refresh obligation that has been silently unmet
+since June. As a plain view it cannot go stale. It also clears the Advisor's
+`materialized_view_in_api` WARN (§12.2) by removing the condition, not by
+accepting it. The view would have to be `security_invoker = on`, like
+`graph_nodes`. Anon can read every source table, and the draft filter is already
+in the definition, so anon would see the same numbers. That needs a rehearsal
+like 0014's, showing `/dashboard` renders the same figures as anon before and
+after. If it stays materialized, the alternative is a daily `pg_cron` job
+(`refresh materialized view dashboard_stats`) plus the N = 2 age assertion.
+`pg_cron` is not installed today (`pg_extension`, 2026-10-16), so that means
+enabling an extension. Refreshing from `apply_suggestion` alone is not enough,
+because the admin routes write the same tables directly without passing
+through it (`app/api/hypotheses/route.ts:48`, `app/api/evidence/route.ts:60`,
+`app/api/questions/route.ts:42`, `app/api/contradictions/[id]/route.ts:30`). **Owner's call.**
+
+---
+
 ### F-08 — LOW (environment, not code) — Eight orphaned `next` processes were holding file locks
 
 `npm ci` could not run until these were terminated. They are leftovers from
@@ -2682,3 +2762,282 @@ applies; it should point forward to 0012 rather than state an open condition as
 permanent. That is a comment edit, not a behaviour change, and 0011's
 verification block already asserts its revoke took effect regardless of what the
 default does.
+
+---
+
+## 12. Supabase Advisor sweep (2026-10-16)
+
+§11 asked who holds EXECUTE. The Advisor asks what a holder can do. This section
+reconciles the two. Its findings were read from the Management API
+(`/v1/projects/{ref}/advisors/security`) and checked against the live catalog,
+not the migration files.
+
+Before this sweep, the Advisor reported 2 ERROR and 20 WARN:
+
+- 2 × `security_definer_view`
+- 9 × `function_search_path_mutable`
+- 1 × `materialized_view_in_api`
+- 2 × `anon_security_definer_function_executable`
+- 6 × `authenticated_security_definer_function_executable`
+- 1 × `auth_leaked_password_protection`
+
+After 0014, it reports 2 ERROR and 10 WARN. Every remaining item except the last
+is accepted in 12.2.
+
+### 12.1 Fixed: the nine `function_search_path_mutable` warnings (0014)
+
+`0014_function_search_path.sql` pins `search_path = public` on all nine. That is
+the setting `ia_apply_sanction` and every security-definer function since 0001
+already declare. It uses `ALTER FUNCTION ... SET`, so bodies and ACLs are
+untouched.
+
+**Each body was read for unqualified cross-schema calls first.** None calls an
+extension function. pgcrypto and uuid-ossp live in `extensions`, and no body
+references either. Every call is a `pg_catalog` builtin (searched implicitly
+whatever `search_path` says) or a public table or type. No function needed
+`public, extensions`.
+
+**Rehearsed against the live database under `begin; ... rollback;`, then
+pushed.** The full migration ran with its verification block, followed by
+behavioural checks, before and after:
+
+```
+before anon global_search(universe) rows = 19
+before anon suggested_confidence = 62
+after  anon global_search(universe) rows = 19
+after  anon suggested_confidence = 62
+ACL/privilege changes on any public function = 0      (exact proacl text + anon/authenticated/service_role matrix, every function in public)
+functions in public still lacking pinned search_path = none
+touch_updated_at stamps now() = true
+enforce_active_rationale raises = Hypotheses cannot be active without a confidence rationale.
+derive_agent_enabled: suspended -> enabled = false
+agent_audits valid insert (CHECK passes) = ok
+CHECK severity mismatch raises = 23514 ... violates check constraint      (audit_findings_severity inside agent_audits_severity_derived)
+guard_insert raises = 23514 agent_audits: a row is INSERTed without a report ...
+guard_update freeze raises = 23514 agent_audits: findings, severity, ... are frozen at INSERT
+guard_update stamps report_at = now() (not caller value) = true
+```
+
+**Negative control.** The same migration was run after
+`revoke execute on function global_search(text,integer) from anon, public`, and
+it refused:
+`0014 guard: anon LOST EXECUTE on public.global_search(text,integer); Refusing to apply.`
+
+After the push:
+
+- The NOTICE `0014: search_path pinned on 9 functions; grants intact.` printed.
+- The Advisor shows 0 `function_search_path_mutable`.
+- `BASE_URL=https://veritas-delta-pearl.vercel.app npm run smoke` passed 95/0.
+  That run includes `/search?q=consciousness`, `/api/search` and a hypothesis
+  detail page, which are the anon callers of `global_search` and
+  `suggested_confidence`.
+
+**Accepted side effect.** A SQL function with a `SET` clause is never inlined.
+That affects `global_search`, `suggested_confidence`, `agent_status_rank` and
+`audit_findings_severity`. It is not measurable at tens of rows.
+
+### 12.2 ACCEPTED WITH REASONING: right mechanism, wrong instance
+
+**For every item below, the Advisor is correct about the mechanism and wrong
+about this instance.** Each lint describes a real hazard class. In each case
+here, the flagged property is what makes a public page work. The suggested fix
+removes that page, and the guard it would add is already present somewhere the
+lint does not look.
+
+**Read this before applying any Advisor "fix" to these objects.** The
+consequence is measured, not assumed. Each suggested fix was applied under
+`begin; ... rollback;` as anon:
+
+```
+as-is   anon agent_public rows = 8
+as-is   anon agent_public_stats rows = 8
+as-is   anon dashboard_stats rows = 1
+invoker anon agent_public        = 42501 permission denied for table agents
+invoker anon agent_public_stats  = 42501 permission denied for table agents
+revoked anon dashboard_stats     = 42501 permission denied for materialized view dashboard_stats
+```
+
+The page result depends on where it is rendered:
+
+- **With live credentials,** `logQueryError` throws (`lib/queries/log.ts`), so
+  `/agents` and `/dashboard` render the error boundary. smoke's
+  `anon can read agent_public / agent_public_stats / dashboard_stats` checks go
+  red at once.
+- **On the credential-free path,** the same failure returns the safe-empty
+  fallback, and the pages render "No agents yet" or "No statistics yet" with
+  HTTP 200. That is the 0002 outage, and the shape F-09 exists to stop being
+  cached.
+
+Either way the suggested fix removes a public page. It does not harden one.
+
+#### `agent_public`, `agent_public_stats`: ERROR `security_definer_view`
+
+- **Mechanism (correct).** A view without `security_invoker` runs as its owner
+  (`postgres`) and bypasses the caller's RLS on the base tables.
+- **Instance (intended).** Here, bypassing the caller's RLS is the design.
+  `agents` and `suggestions` are admin-only. RLS cannot restrict columns, so the
+  view's **column list is the security boundary** (`0007_agent_roster.sql`, D.1
+  comment). `graph_nodes` is the deliberate inverse, `security_invoker = on`,
+  because there the row filter is the boundary.
+- **Live checks (2026-10-16):**
+  - **Columns.** `agent_public` exposes `name, display_name, kind, charter,
+    status, domain_slug, domain_name, created_at`. `agent_public_stats` exposes
+    `name, proposed, approved, rejected, pending, approval_rate`. Neither
+    exposes `trust`, `scopes`, `profile_id` or any token column.
+  - **No caller-dependent predicate in either definition.** That means no
+    `auth.uid()`, `current_user`, `request.jwt` setting or `is_admin()`. Neither
+    has a WHERE clause or calls any function. A filter meant to show "your own
+    rows" would evaluate as the owner and show everyone's. That is the
+    genuinely dangerous definer pattern, and it is absent.
+  - **What `agent_public_stats` discloses.** It counts `suggestions` by status,
+    joined on agent `profile_id` only, so human contributors' suggestions are
+    never counted. It has no min/max, timestamps, targets or payloads. **It does
+    disclose something a per-row read would not:** how many pending and rejected
+    proposals each agent has, from a table anon cannot read. That is the
+    intended track-record surface (0007: "Counts only — never payloads"), stated
+    here so it is a known disclosure rather than an unexamined one.
+  - **Every view in `public`:**
+    - `agent_public` and `agent_public_stats`: owner-run.
+    - `graph_nodes`: `security_invoker=on`.
+    - `dashboard_stats`: materialized view, below.
+
+    Nothing else has drifted to owner-run. Outside `public`, the only owner-run
+    views are platform ones: `extensions.pg_stat_statements(_info)` and
+    `vault.decrypted_secrets`.
+  - **Writes are inert.** `authenticated` holds `arwd` on both views through the
+    blanket grant (F-12), but both are not updatable (join and GROUP BY), with
+    no rules or INSTEAD OF triggers.
+- **Not a regression.** Neither view has been redefined since 0007 (2026-08-10).
+  The lint fires on any such view, so it has fired since 0007 was applied, about
+  two months before this sweep.
+- **Coverage gap, open.** `verify-agents.mjs` asserts `agent_public` with a
+  denylist (`trust / scopes / profile_id`), so a newly added sensitive column
+  would pass. `agent_public_stats` is not asserted at all. The fix is an exact
+  column-list assertion for both. Proposed, not built.
+
+#### `dashboard_stats`: WARN `materialized_view_in_api`
+
+- **Mechanism (correct).** A materialized view has no RLS, so whatever it holds
+  is readable by anyone granted SELECT.
+- **Instance.** It holds five counts and two distributions. Every one is
+  derivable from tables anon can already read, and the only filter (non-draft
+  hypotheses) is the same one anon RLS applies. It exposes nothing a per-row
+  read would not.
+- **Suggested fix refused.** Revoking anon SELECT removes `/dashboard` (measured
+  above) and turns smoke's page↔API dashboard assertions red. This is the same
+  shape as the views: the Advisor's fix is the 0002 outage.
+- **See F-16.** This relation has not been refreshed since 2026-06-11. The
+  recommended resolution there, a plain `security_invoker` view, would clear
+  this WARN by removing the condition rather than accepting it.
+
+#### `is_admin()`: WARN anon and authenticated SECURITY DEFINER executable
+
+- **Mechanism (correct).** Any role with EXECUTE can call a definer function
+  over `/rest/v1/rpc`.
+- **Instance.** It is load-bearing. RLS policies on **15** anon-readable
+  relations evaluate it as the caller (§11.8). Recounted live on 2026-10-16:
+  `citation_checks, contradictions, council_turns, councils, domains, evidence,
+  graph_edges, hypotheses, hypothesis_evidence, profiles, questions,
+  research_notes, simulation_runs, simulations, sources`. §11.5's "16" most
+  likely counted `graph_nodes`, which inherits the check through `hypotheses`
+  rather than carrying a policy.
+- **Suggested fix refused.** §11.5 measured what a revoke does:
+  `hypotheses`, `graph_nodes`, `profiles` and `research_notes` fail with
+  `permission denied for function is_admin`, which takes out `/`, `/hypotheses`,
+  `/graph` and `/notes`. The other relations surviving is a planner
+  short-circuit, not a guarantee.
+- **What a holder can do.** It returns `false` for anon and reads nothing the
+  caller could not otherwise reach.
+
+#### `is_contributor()`: WARN authenticated SECURITY DEFINER executable
+
+As analysed in §11.4. The `suggestions."contributor insert own"` WITH CHECK
+evaluates it as the caller, so `authenticated` must keep it. anon was revoked in
+0012, which is why the Advisor now lists only `authenticated`.
+
+#### `apply_suggestion()`: WARN authenticated SECURITY DEFINER executable
+
+- **Instance.** The admin approve route calls it as `authenticated`
+  (`requireAdmin()` → `createClient()`; §11.8). Its first statement is
+  `if not is_admin() then raise ... using errcode = '42501'`. That guard
+  **fails closed** with no user id, because `is_admin()` is false there, unlike
+  the guard on the two functions below.
+- **Coverage, corrected.** The verify-suggestions assertion
+  `rls: researcher cannot self-approve via PostgREST` covers the **table** path
+  (a PostgREST `UPDATE` on `suggestions`), not this function. No harness calls
+  `rpc('apply_suggestion')` directly. The direct-RPC path was probed live on
+  2026-10-16 with fresh accounts, cleaned up afterwards:
+  - anon: `42501 permission denied for function apply_suggestion`
+  - `public` role: `42501 Only admins may approve suggestions.`
+  - `researcher` role: `42501 Only admins may approve suggestions.`
+
+  Adding this as an assertion to verify-suggestions is recommended.
+
+#### `scan_contradictions()`, `refresh_dashboard_stats()`: WARN authenticated SECURITY DEFINER executable
+
+- **Instance.** The admin routes call both as `authenticated`
+  (`app/api/contradictions/scan/route.ts:13`, `app/api/stats/route.ts:52`).
+  Probed live on 2026-10-16 over PostgREST, with fresh accounts cleaned up
+  afterwards:
+
+  ```
+  anon        scan_contradictions      → 42501 permission denied for function scan_contradictions
+  anon        refresh_dashboard_stats  → 42501 permission denied for function refresh_dashboard_stats
+  public      scan_contradictions      → P0001 Only admins may run the contradiction scan.
+  public      refresh_dashboard_stats  → P0001 Only admins may refresh dashboard stats.
+  researcher  scan_contradictions      → P0001 Only admins may run the contradiction scan.
+  researcher  refresh_dashboard_stats  → P0001 Only admins may refresh dashboard stats.
+  contradictions rows: 5 → 5;  dashboard_stats.refreshed_at unchanged
+  ```
+
+  P0001 with the guard's own message proves the signed-in callers got through
+  EXECUTE and were refused **by the function body**. Signed-in EXECUTE is not a
+  write path into the map.
+- **THE GRANT IS THE BARRIER AGAINST ANON, NOT THE GUARD.** Both guards read
+  `if auth.uid() is not null and not is_admin() then raise`. A caller with
+  **no user id passes by design**, so `service_role` can run the scan. anon also
+  has no user id, so **the guard does not protect against anon. Only anon's
+  lack of EXECUTE does** (no `anon=` and no PUBLIC entry in either ACL, live 2026-10-16;
+  revoked at 0001:824-825 and again at 0002:55-56 and 0002:112). **No
+  migration guard or harness asserts that anon lacks it.** 0012's guard only
+  checks that `authenticated` keeps it. Adding that assertion is recommended,
+  because this revoke is the only defence against anon. A later grant tidy-up must not read "it
+  checks for admin" and conclude the revoke is redundant. Granting anon EXECUTE
+  on `scan_contradictions` would let any visitor write `contradictions` rows into
+  the public map. §11.4 recorded this as "guard fails open".
+
+#### `increment_popularity()`: WARN anon and authenticated SECURITY DEFINER executable
+
+- **Mechanism (correct, and real here).** Any anonymous caller can add 1 to
+  `hypotheses.popularity`, with no limit or deduplication
+  (`components/ViewTracker.tsx`, granted at 0001:830).
+- **What popularity drives.** It is not display-only. It feeds:
+  - the "Views" count on the hypothesis page
+    (`app/(public)/hypotheses/[slug]/page.tsx:183`);
+  - the opt-in "Most viewed" sort on `/hypotheses`
+    (`lib/queries/hypotheses.ts:42`, `components/HypothesisFilters.tsx:10`). The
+    default sort is `confidence`.
+
+  It is not read by confidence, the graph, search, the dashboard, agents, or any
+  SQL function or view (live `pg_get_functiondef` / `pg_get_viewdef` search).
+  So anonymous callers *can* decide which hypotheses lead that sort. That is an
+  integrity question for this project, not a security one.
+- **ACCEPTED because the feature is inert today:** 3 of 15 hypotheses have a
+  non-zero count, maximum 2 (2026-10-16). It is not accepted on the grounds that
+  an opt-in label makes manipulable ordering acceptable.
+- **It becomes a decision again on either trigger:**
+  1. **The site takes real traffic.** At that point the counts mean something to
+     readers, and so does inflating them.
+  2. **`popularity` is read by anything beyond the one opt-in sort and the
+     count display.** That includes a default sort, a "trending" or featured
+     surface, the graph, search ranking, the dashboard, or any agent or council
+     input.
+
+  The options at that point: drop it from the sort (display-only), deduplicate
+  per session, or move counting server-side with rate limiting.
+
+### 12.3 Not addressed in this sweep
+
+`auth_leaked_password_protection` (WARN) is an Auth dashboard setting (HaveIBeenPwned
+check on sign-up and password change), not SQL. It is outside this brief and
+recorded so that it does not read as reviewed.
