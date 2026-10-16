@@ -10,7 +10,6 @@ import { EmptyState } from "@/components/ui/EmptyState";
 import { ConfidenceDistribution } from "@/components/charts/ConfidenceDistribution";
 import { DomainActivity } from "@/components/charts/DomainActivity";
 import { TimelineEventRow } from "@/components/TimelineEventRow";
-import { formatDateTime } from "@/lib/utils";
 
 export const revalidate = 900; // §1.3: dashboard ISR 15 min
 
@@ -33,7 +32,7 @@ export default async function DashboardPage() {
         <PageHeader eyebrow="Instrument" title="Reality Dashboard" />
         <EmptyState
           title="No statistics yet"
-          description="The dashboard reads a materialized view. Apply the migration and seed, then refresh stats from the admin panel."
+          description="The dashboard reads the dashboard_stats view. Apply the migrations and the seed."
         />
       </div>
     );
@@ -45,11 +44,6 @@ export default async function DashboardPage() {
         eyebrow="Instrument"
         title="Reality Dashboard"
         description="A summary of what the map currently holds. Uncertainty is a first-class quantity here."
-        actions={
-          <span className="font-mono text-xs text-muted">
-            refreshed {formatDateTime(stats.refreshed_at)}
-          </span>
-        }
       />
 
       <section className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">

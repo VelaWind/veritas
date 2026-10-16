@@ -592,9 +592,6 @@ on conflict (id) do nothing;
 
 commit;
 
--- ─── Populate the dashboard materialized view ────────────────────────────────
-refresh materialized view dashboard_stats;
-
 -- ─── Detect contradictions from the seeded evidence links ────────────────────
 -- Idempotent; run after seeding so the review queue and flags are non-empty.
 select scan_contradictions();

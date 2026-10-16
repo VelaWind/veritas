@@ -1,10 +1,7 @@
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import { listTimeline } from "@/lib/queries/timeline";
-import {
-  RefreshStatsButton,
-  ScanContradictionsButton,
-} from "@/components/admin/ActionButtons";
+import { ScanContradictionsButton } from "@/components/admin/ActionButtons";
 import { formatDateTime } from "@/lib/utils";
 
 export const metadata = { title: "Admin" };
@@ -82,11 +79,10 @@ export default async function AdminOverviewPage() {
         <p className="eyebrow">Maintenance</p>
         <div className="flex flex-wrap gap-4">
           <ScanContradictionsButton />
-          <RefreshStatsButton />
         </div>
         <p className="text-xs text-muted">
-          The scan inserts evidential contradictions (idempotent); stats feed
-          the public Reality Dashboard via the materialized view.
+          The scan inserts evidential contradictions (idempotent). The public
+          Reality Dashboard reads a live view, so it needs no refresh.
         </p>
       </div>
 

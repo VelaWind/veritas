@@ -175,7 +175,8 @@ psql "YOUR-DB-CONNECTION-STRING" -f supabase/seed.sql
 
 The seed loads 10 domains, 20 questions, 15 hypotheses, 31 evidence entries over 31
 sources, 46 evidence links (34 supporting, 12 opposing), 5 simulations, and 3 notes,
-then refreshes `dashboard_stats` and runs the contradiction scan.
+then runs the contradiction scan. `dashboard_stats` is a live view (0015) and needs
+no refresh.
 
 For the first admin, add a user in Supabase Dashboard, Authentication, Users with
 Auto Confirm on (the `on_auth_user_created` trigger makes the `profiles` row at role

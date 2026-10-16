@@ -517,7 +517,6 @@ export interface DashboardStats {
   open_contradictions: number;
   confidence_distribution: Record<string, number> | null;
   activity_by_domain: Array<{ name: string; n: number }> | null;
-  refreshed_at: string;
 }
 
 export interface ApiEnvelope<T> {

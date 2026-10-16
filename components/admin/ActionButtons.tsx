@@ -37,30 +37,6 @@ export function ScanContradictionsButton() {
   );
 }
 
-export function RefreshStatsButton() {
-  const router = useRouter();
-  const [pending, setPending] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-
-  async function run() {
-    setPending(true);
-    setMessage(null);
-    const res = await api.post("/api/stats");
-    setPending(false);
-    setMessage(res.error ?? "Dashboard stats refreshed.");
-    router.refresh();
-  }
-
-  return (
-    <span className="inline-flex items-center gap-3">
-      <Button onClick={run} disabled={pending}>
-        {pending ? "Refreshing…" : "Refresh dashboard stats"}
-      </Button>
-      {message && <span className="text-xs text-muted">{message}</span>}
-    </span>
-  );
-}
-
 export function RetireHypothesisButton({ id }: { id: string }) {
   const router = useRouter();
   const [pending, setPending] = useState(false);

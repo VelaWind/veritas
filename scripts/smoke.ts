@@ -303,7 +303,7 @@ const APIS: ApiSpec[] = [
       if (!env) return { ok: false, detail: "not a { data, error } envelope" };
       if (env.error !== null) return { ok: false, detail: `error=${JSON.stringify(env.error)}` };
       const s = env.data as Record<string, unknown> | null;
-      if (!s) return { ok: false, detail: "data is null — dashboard_stats never refreshed" };
+      if (!s) return { ok: false, detail: "data is null — dashboard_stats returned no row" };
       const n = s.total_hypotheses;
       if (typeof n !== "number") return { ok: false, detail: "total_hypotheses is not a number" };
       if (n <= 0) return { ok: false, detail: `total_hypotheses = ${n}, expected > 0` };

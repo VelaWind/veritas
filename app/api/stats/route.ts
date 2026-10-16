@@ -1,6 +1,5 @@
 import { unstable_cache } from "next/cache";
-import { revalidateTag } from "next/cache";
-import { apiData, apiError, EmptyPayloadError, requireAdmin } from "@/lib/api";
+import { apiData, EmptyPayloadError } from "@/lib/api";
 import { publicClient } from "@/lib/supabase/public";
 import { HAS_LIVE_SUPABASE } from "@/lib/supabase/env";
 import { getDashboardStats } from "@/lib/queries/stats";
@@ -11,10 +10,11 @@ const getCachedStats = unstable_cache(
   async () => {
     const stats = await readStats();
     // ── AUDIT.md F-09, M2 ────────────────────────────────────────────────────
-    // `null` is exactly the payload the poisoning wrote. It also means "the
-    // materialized view has never been refreshed", which is a state worth
-    // re-checking rather than pinning for 15 minutes. Throwing is the only way
-    // to stop unstable_cache storing it; the caller serves it uncached.
+    // `null` is exactly the payload the poisoning wrote. dashboard_stats is a
+    // plain view (0015) and always returns one row against a live database, so
+    // null here means no row came back at all — worth re-checking rather than
+    // pinning for 15 minutes. Throwing is the only way to stop unstable_cache
+    // storing it; the caller serves it uncached.
     if (stats === null) throw new EmptyPayloadError("dashboard stats");
     return stats;
   },
@@ -33,26 +33,11 @@ export async function GET() {
   try {
     return apiData(await getCachedStats());
   } catch (err) {
-    // Empty is served, just never cached — a fresh database whose matview has
-    // not been refreshed still renders its empty state rather than erroring.
+    // Empty is served, just never cached, so the page renders its empty state
+    // rather than erroring.
     // Any other error (e.g. QueryFailedError) propagates and stays loud.
     if (err instanceof EmptyPayloadError) return apiData(await readStats());
     throw err;
   }
 }
 
-/**
- * Admin-only refresh of the §2.10 materialized view ("route handler calls
- * rpc"). Not in the §6 table, but required by §2.10's refresh strategy.
- */
-export async function POST() {
-  const auth = await requireAdmin();
-  if (!auth.ok) return auth.response;
-
-  const { error } = await auth.supabase.rpc("refresh_dashboard_stats");
-  if (error) return apiError(error.message, 500);
-
-  revalidateTag("stats");
-  const stats = await readStats();
-  return apiData(stats);
-}
