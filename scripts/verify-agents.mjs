@@ -423,19 +423,75 @@ async function run() {
   }
 
   // ── Phase D: the public projection is the security boundary (§D.7) ──────────
-  // RLS cannot restrict columns, so agent_public's column LIST is what keeps
+  // RLS cannot restrict columns, so each view's column LIST is what keeps
   // trust and scopes private. Assert the list, and assert the base tables stay
   // unreachable to anon.
+  //
+  // An ALLOW-list, exact in both directions (AUDIT.md §12.2). This used to be a
+  // deny-list naming trust / scopes / profile_id, which passed for any column
+  // added later — a token hash included. Same reasoning as F-13's kind gate: a
+  // deny-list closes the hole that was found and admits the next one. A column
+  // DROPPED from the expected set fails too, because a page reading it would
+  // otherwise break with HTTP 200. Widening a view means editing this list in
+  // the same commit, which is the point.
   {
+    const PUBLIC_VIEW_COLUMNS = {
+      agent_public: ["name", "display_name", "kind", "charter", "status", "domain_slug", "domain_name", "created_at"],
+      agent_public_stats: ["name", "proposed", "approved", "rejected", "pending", "approval_rate"],
+    };
+    /** "" when `got` is exactly `want` as a set; otherwise what differs. */
+    const columnDiff = (got, want) => {
+      const extra = got.filter((c) => !want.includes(c));
+      const missing = want.filter((c) => !got.includes(c));
+      return [
+        extra.length ? `EXPOSES unlisted ${extra.join(",")}` : "",
+        missing.length ? `lost ${missing.join(",")}` : "",
+      ].filter(Boolean).join("; ");
+    };
+
+    // Negative control on the comparator, synthetic, like F-12's: it must
+    // accept the exact set in any order and reject each mutation that matters.
+    // A comparator that passes `trust` would pass the live check by being blind.
+    {
+      const want = PUBLIC_VIEW_COLUMNS.agent_public;
+      const blind = [];
+      if (columnDiff([...want].reverse(), want) !== "") blind.push("rejects the exact set reordered");
+      for (const [what, got] of [
+        ["an added sensitive column", [...want, "trust"]],
+        ["an added token column", [...want, "token_hash"]],
+        ["a dropped column", want.slice(1)],
+        ["a renamed column", [...want.slice(1), "agent_name"]],
+      ]) {
+        if (columnDiff(got, want) === "") blind.push(`accepts ${what}`);
+      }
+      check(
+        "public: column allow-list self-test — exact set passes, every mutation fails",
+        blind.length === 0,
+        `comparator ${blind.join("; ")} — the two assertions below would pass by being blind`,
+      );
+    }
+
     const anonC = createClient(URL_, ANON, { auth: { persistSession: false, autoRefreshToken: false } });
-    const { data: pub, error: pubErr } = await anonC.from("agent_public").select("*").limit(1);
-    check("public: anon can read agent_public", !pubErr && Array.isArray(pub), pubErr?.message ?? "");
-    const cols = pub?.[0] ? Object.keys(pub[0]) : [];
-    check(
-      "public: agent_public leaks no trust / scopes / profile_id",
-      cols.length > 0 && !["trust", "scopes", "profile_id"].some((c) => cols.includes(c)),
-      cols.join(",") || "(no rows to inspect)",
-    );
+    for (const [view, want] of Object.entries(PUBLIC_VIEW_COLUMNS)) {
+      const { data: pub, error: pubErr } = await anonC.from(view).select("*").limit(1);
+      if (view === "agent_public") {
+        check("public: anon can read agent_public", !pubErr && Array.isArray(pub), pubErr?.message ?? "");
+      }
+      // No rows means no keys to compare, which is not a pass: an empty
+      // projection would otherwise satisfy any allow-list. The roster has been
+      // seeded since 2026-08-11, so 0 rows is itself a fault.
+      const cols = pub?.[0] ? Object.keys(pub[0]) : null;
+      const diff = cols === null ? null : columnDiff(cols, want);
+      check(
+        `public: ${view} exposes exactly its allow-listed columns`,
+        !pubErr && diff === "",
+        pubErr
+          ? `read failed: ${pubErr.code ?? ""} ${pubErr.message}`
+          : diff === null
+            ? "0 rows as anon — nothing to inspect, so the allow-list is unverified"
+            : `${diff} (got ${cols.join(",")})`,
+      );
+    }
     for (const t of ["agents", "agent_tokens", "suggestions", "agent_incidents"]) {
       const { data, error } = await anonC.from(t).select("*").limit(1);
       check(
@@ -1297,9 +1353,8 @@ async function run() {
 // stay runnable against production on PUBLIC credentials alone, so a check
 // requiring a privileged token belongs in this harness, which already requires
 // SUPABASE_SERVICE_ROLE_KEY.
-async function f07Canary() {
-  console.log("\n── F-07: 0009 default-privilege canary ──");
-
+/** SUPABASE_ACCESS_TOKEN from the environment or .env.supabase.local; "" if neither. */
+function platformToken() {
   let token = process.env.SUPABASE_ACCESS_TOKEN ?? "";
   if (!token) {
     try {
@@ -1310,8 +1365,15 @@ async function f07Canary() {
           token = line.slice(i + 1).trim().replace(/^["']|["']$/g, "");
         }
       }
-    } catch { /* file absent — handled as a failure below, never as a skip */ }
+    } catch { /* file absent — the caller reports it as a failure, never as a skip */ }
   }
+  return token;
+}
+
+async function f07Canary() {
+  console.log("\n── F-07: 0009 default-privilege canary ──");
+
+  const token = platformToken();
   const ref = URL_ ? new URL(URL_).hostname.split(".")[0] : "";
 
   // Missing credentials is a FAILURE, not a skip. A canary that quietly does
@@ -1578,9 +1640,93 @@ function f12Characterization(publicAcl) {
   );
 }
 
+// ── §12.2: two facts about the SECURITY DEFINER functions F-16 touched ──────
+//
+// TWO FACTS, TWO QUERIES, never one. They used to be one line in §12.2
+// ("anon cannot execute scan_contradictions / refresh_dashboard_stats"), and
+// after 0015 dropped refresh_dashboard_stats() a single query over both names
+// would pass for the gone function by not finding it, the vacuous case.
+// So each fact has its own question and its own control:
+//
+//   1. scan_contradictions() EXISTS and anon holds no EXECUTE on it. The grant
+//      is the only barrier against anon: the body's guard is
+//      `if auth.uid() is not null and not is_admin()`, which a caller with no
+//      user id passes by design. If anon gained EXECUTE, any visitor could
+//      write contradictions rows into the public map. This is asserted from
+//      the catalog rather than by calling it, because a call that SUCCEEDED
+//      would run the scan, so the probe would itself be the breach.
+//      A missing function is a FAILURE here, not a pass.
+//   2. refresh_dashboard_stats does not exist, under ANY signature. Matching on
+//      the name, not to_regprocedure('...()'), so a re-creation with an
+//      argument would not slip past.
+//
+// Management API, for the same reason as the F-07 canary: pg_proc and
+// has_function_privilege are not reachable over PostgREST.
+async function s12FunctionFacts() {
+  console.log("\n── §12.2: definer-function facts (anon EXECUTE, dropped function) ──");
+
+  const token = platformToken();
+  const ref = URL_ ? new URL(URL_).hostname.split(".")[0] : "";
+  const labels = [
+    "§12.2 control: the privilege detector sees anon's EXECUTE on global_search()",
+    "§12.2: scan_contradictions() exists and anon holds no EXECUTE on it",
+    "§12.2 control: the name detector finds scan_contradictions in public",
+    "§12.2: refresh_dashboard_stats does not exist in public, under any signature",
+  ];
+  if (!token || !ref) {
+    for (const l of labels) check(l, false, "not run — no platform credentials (SUPABASE_ACCESS_TOKEN); cannot be skipped silently");
+    return;
+  }
+  const sql = async (query) => {
+    try {
+      const res = await fetch(`https://api.supabase.com/v1/projects/${ref}/database/query`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+      });
+      if (!res.ok) return { error: `HTTP ${res.status} ${(await res.text()).slice(0, 200)}` };
+      const rows = await res.json();
+      return { row: Array.isArray(rows) ? rows[0] ?? {} : {} };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
+  };
+
+  // Fact 1. The control is global_search, which anon MUST hold (0012 guard 1,
+  // /search). If the detector cannot see that grant, its `false` below means
+  // nothing.
+  const f1 = await sql(
+    "select has_function_privilege('anon', 'public.global_search(text,integer)', 'EXECUTE') as control, " +
+    "       to_regprocedure('public.scan_contradictions()') is not null as present, " +
+    "       case when to_regprocedure('public.scan_contradictions()') is null then null " +
+    "            else has_function_privilege('anon', to_regprocedure('public.scan_contradictions()'), 'EXECUTE') end as anon_exec",
+  );
+  check(labels[0], f1.row?.control === true,
+    f1.error ?? `has_function_privilege returned ${f1.row?.control} for a grant that exists — the assertion below is NOT trustworthy`);
+  check(labels[1], f1.row?.present === true && f1.row?.anon_exec === false,
+    f1.error ??
+      (f1.row?.present !== true
+        ? "scan_contradictions() is MISSING — an absent function is not 'anon cannot execute it'; the admin scan route is dead"
+        : "anon HOLDS EXECUTE — the body's guard does not stop a caller with no user id; any visitor can write contradictions"));
+
+  // Fact 2. Its own query. The control is the same name lookup aimed at a
+  // function that does exist, so a 0 below is absence and not a broken filter.
+  const f2 = await sql(
+    "select count(*) filter (where proname = 'scan_contradictions')     as control_n, " +
+    "       count(*) filter (where proname = 'refresh_dashboard_stats') as gone_n, " +
+    "       coalesce(string_agg(oid::regprocedure::text, ', ') filter (where proname = 'refresh_dashboard_stats'), '') as gone_sigs " +
+    "  from pg_proc where pronamespace = 'public'::regnamespace",
+  );
+  check(labels[2], Number(f2.row?.control_n) === 1,
+    f2.error ?? `found ${f2.row?.control_n} — the name detector is blind; the assertion below is NOT trustworthy`);
+  check(labels[3], f2.row !== undefined && Number(f2.row?.gone_n) === 0,
+    f2.error ?? `found ${f2.row?.gone_sigs} — 0015 dropped it because 'refresh materialized view' on a plain view errors; a re-created one is a broken admin action and a new definer surface`);
+}
+
 if (ready) {
   await run();
   await f07Canary();
+  await s12FunctionFacts();
   console.log(`\n${fail === 0 ? "ALL GREEN" : `${fail} FAILURE(S)`} — ${pass} passed, ${fail} failed`);
   process.exitCode = fail === 0 ? 0 : 1;
 }

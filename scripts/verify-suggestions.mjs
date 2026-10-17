@@ -171,6 +171,42 @@ async function run() {
     (selfApprove.error !== null) || (selfApprove.data?.length ?? 0) === 0,
     selfApprove.error?.message);
 
+  // ── apply_suggestion() called directly, not through the route (AUDIT.md §12.2)
+  // The check above covers the TABLE path. This covers the FUNCTION, which is
+  // SECURITY DEFINER and which `authenticated` must keep EXECUTE on because the
+  // admin route calls it as the signed-in user. So for a signed-in non-admin
+  // the GRANT lets the call through and only the body's first line,
+  // `if not is_admin() then raise ... 42501`, stands between them and an
+  // approval. For anon it is the reverse: no EXECUTE (0003:255).
+  //
+  // Two barriers, so two kinds of refusal, asserted apart: the guard's own
+  // message proves a signed-in caller reached the body and was refused there.
+  // A bare "an error came back" would also pass on a typo'd argument name.
+  const GUARD = /Only admins may approve suggestions/;
+  for (const [who, client] of [["researcher", researcher.client], ["public-role user", publicUser.client]]) {
+    const { error } = await client.rpc("apply_suggestion", { p_suggestion_id: suggestionId, p_notes: "probe" });
+    check(`rpc: ${who} calling apply_suggestion() directly is refused by its is_admin() guard`,
+      error?.code === "42501" && GUARD.test(error?.message ?? ""),
+      error ? `${error.code} ${error.message}` : "NO ERROR — the call returned normally");
+  }
+  {
+    const anonC = createClient(URL_, ANON, { auth: { persistSession: false, autoRefreshToken: false } });
+    const { error } = await anonC.rpc("apply_suggestion", { p_suggestion_id: suggestionId, p_notes: "probe" });
+    check("rpc: anon calling apply_suggestion() is refused by the missing GRANT",
+      error?.code === "42501" && /permission denied for function apply_suggestion/.test(error?.message ?? ""),
+      error ? `${error.code} ${error.message}` : "NO ERROR — anon holds EXECUTE");
+  }
+  // The outcome, not just the error: an error raised AFTER the write would pass
+  // the three checks above. Nothing may have moved.
+  {
+    const { data: still } = await service.from("suggestions")
+      .select("status, reviewed_by, applied_id").eq("id", suggestionId).single();
+    const { data: leaked } = await service.from("hypotheses").select("id").eq("slug", createSlug).maybeSingle();
+    check("rpc: after the direct calls the suggestion is still pending and nothing was applied",
+      still?.status === "pending" && still?.reviewed_by === null && still?.applied_id === null && !leaked,
+      `status=${still?.status} reviewed_by=${still?.reviewed_by} applied_id=${still?.applied_id} hypothesis=${leaked?.id ?? "none"}`);
+  }
+
   // ── Admin approves ──────────────────────────────────────────────────────────
   const approve = await call(admin.cookie, "POST", `/api/suggestions/${suggestionId}/approve`, {});
   const appliedId = approve.data?.applied_id;

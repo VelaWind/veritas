@@ -1531,6 +1531,41 @@ smoke change is the detail string of the existing `/api/stats` check, from
 `dashboard_stats never refreshed` to `dashboard_stats returned no row`. That
 changes a message, not a check.
 
+**Re-measured 2026-10-17, as anon, against the June baseline.** Smoke's
+page↔API check cannot settle this, because both sides read the same view: the
+F-16 blind spot again, inside F-16's own fix. So the view was read as anon over
+PostgREST, and every figure was recomputed independently from the base tables
+as anon (`count=exact`, and the buckets and per-domain counts rebuilt
+client-side from `hypotheses` and `domains`):
+
+| Field | June baseline | View, as anon | Base tables, as anon |
+|---|---|---|---|
+| `total_hypotheses` | 15 | 15 | 15 (`state=neq.draft`; also 15 unfiltered) |
+| `total_evidence` | 31 | 31 | 31 |
+| `open_questions` | 15 | 15 | 15 (`status=unknown`, of 20) |
+| `open_contradictions` | 5 | 5 | 5 (`resolved=false`, of 5) |
+| `total_simulation_runs` | 3 | 3 | 3 |
+| `confidence_distribution` | `{"1":1,"2":10,"3":4}` | identical | identical |
+| `activity_by_domain` | 10 domains | identical counts | identical counts |
+
+Nothing moved. `activity_by_domain` lists tied domains in a different order,
+because the view's `order by n desc` has no tie-break. That is ordering, not a
+count.
+
+**Which filter is in force.** For `total_hypotheses` and
+`confidence_distribution`, both are: the view's explicit `state <> 'draft'` and
+anon's policy `"public read non-draft"` (`using (state <> 'draft')`, 0002:72)
+are the same predicate, so for anon the explicit one is now redundant. For
+`activity_by_domain`, only the RLS predicate applies, because that subquery
+never had the explicit filter (0015 header). The other three tables have
+`using (true)` read policies, so neither predicate touches them. Every caller
+reads through `publicClient` (`app/(public)/dashboard/page.tsx:24`,
+`app/(public)/page.tsx:20`, `app/api/stats/route.ts:7`), so no admin-session
+read can see drafts in the per-domain counts. **Limit of the measurement:** anon
+cannot see drafts, so "0 drafts" is not observable from here. Anon reports 15
+non-draft and 15 visible, which says nothing about hidden rows. The owner-side
+count of 0 drafts is the 2026-10-16 rehearsal's. An owner read was not repeated.
+
 ---
 
 ### F-08 — LOW (environment, not code) — Eight orphaned `next` processes were holding file locks
@@ -2958,7 +2993,8 @@ Either way the suggested fix removes a public page. It does not harden one.
   - **Every view in `public`:**
     - `agent_public` and `agent_public_stats`: owner-run.
     - `graph_nodes`: `security_invoker=on`.
-    - `dashboard_stats`: materialized view, below.
+    - `dashboard_stats`: `security_invoker=on` since 0015. It was a
+      materialized view when this list was taken (see below).
 
     Nothing else has drifted to owner-run. Outside `public`, the only owner-run
     views are platform ones: `extensions.pg_stat_statements(_info)` and
@@ -2969,10 +3005,14 @@ Either way the suggested fix removes a public page. It does not harden one.
 - **Not a regression.** Neither view has been redefined since 0007 (2026-08-10).
   The lint fires on any such view, so it has fired since 0007 was applied, about
   two months before this sweep.
-- **Coverage gap, open.** `verify-agents.mjs` asserts `agent_public` with a
-  denylist (`trust / scopes / profile_id`), so a newly added sensitive column
-  would pass. `agent_public_stats` is not asserted at all. The fix is an exact
-  column-list assertion for both. Proposed, not built.
+- **Coverage gap, closed 2026-10-17.** `verify-agents.mjs` used to assert
+  `agent_public` with a denylist (`trust / scopes / profile_id`), so a newly
+  added sensitive column would pass, and it did not assert
+  `agent_public_stats` at all. Both are now asserted with an exact **allow-list**
+  of the columns listed above. An added column fails, and so does a dropped
+  one. Zero rows also fails, because an empty projection would satisfy any
+  allow-list. A synthetic self-test proves the comparator rejects an added
+  `trust`, an added `token_hash`, a dropped column and a renamed one.
 
 #### `dashboard_stats`: WARN `materialized_view_in_api`, RESOLVED by 0015, no longer reported
 
@@ -3035,13 +3075,42 @@ evaluates it as the caller, so `authenticated` must keep it. anon was revoked in
   - `public` role: `42501 Only admins may approve suggestions.`
   - `researcher` role: `42501 Only admins may approve suggestions.`
 
-  Adding this as an assertion to verify-suggestions is recommended.
+  **Built 2026-10-17** in `verify-suggestions.mjs`: researcher and public-role
+  `rpc('apply_suggestion')` must fail with `42501` **and** the guard's own
+  message, anon must fail with `permission denied for function`, and the
+  suggestion must still be `pending`, unreviewed and unapplied afterwards. The
+  outcome is asserted, not just the error.
 
 #### `scan_contradictions()`, `refresh_dashboard_stats()`: WARN authenticated SECURITY DEFINER executable
 
 **`refresh_dashboard_stats()` was dropped by 0015** (F-16: nothing is left to
 refresh), so this entry now applies to `scan_contradictions()` alone. The probe
 below predates the drop and is kept as recorded.
+
+**Sweep after the drop (2026-10-17): which checks name it, and do they still
+fail when they should?**
+
+- **0012 guard** lists `public.refresh_dashboard_stats()` in `auth_keep` and
+  `svc_keep`. It is **not vacuous**: `has_function_privilege` on a missing
+  function raises `42883` and does not return false. On a fresh database 0012
+  runs before 0015, so it passes. But 0012's header says "Idempotent", and
+  **re-running 0012 after 0015 now aborts** with `function ... does not exist`.
+  That fails loudly, for a reason that is not a regression. Left as is, because
+  0012 is applied and immutable. Do not re-run it against live.
+- **0014 guard** asserts its nine functions by name, not by count.
+  `refresh_dashboard_stats` was never one of them, because it already pinned
+  `search_path` as SECURITY DEFINER. Each name still fails if it goes missing
+  (`::regprocedure` raises). The NOTICE's `9` is `array_length` of the literal,
+  a message rather than an assertion. Unaffected.
+- **POST `/api/stats`.** No harness ever asserted on it, so no check was
+  edited. With the handler removed, it now returns **405** (probed against
+  production on 2026-10-17); GET is still 200.
+- **smoke `anon can read dashboard_stats`** and **0009's relation list** still
+  test something real: the grant on the plain view, which 0015 re-issues
+  explicitly.
+
+Result: no executable check passes vacuously. The one mismatch is the 0012
+re-run above, which errs toward failing.
 
 - **Instance.** The admin routes call both as `authenticated`
   (`app/api/contradictions/scan/route.ts:13`, `app/api/stats/route.ts:52`).
@@ -3066,10 +3135,21 @@ below predates the drop and is kept as recorded.
   **no user id passes by design**, so `service_role` can run the scan. anon also
   has no user id, so **the guard does not protect against anon. Only anon's
   lack of EXECUTE does** (no `anon=` and no PUBLIC entry in either ACL, live 2026-10-16;
-  revoked at 0001:824-825 and again at 0002:55-56 and 0002:112). **No
-  migration guard or harness asserts that anon lacks it.** 0012's guard only
-  checks that `authenticated` keeps it. Adding that assertion is recommended,
-  because this revoke is the only defence against anon. A later grant tidy-up
+  revoked at 0001:824-825 and again at 0002:55-56 and 0002:112). 0012's guard
+  only checks that `authenticated` keeps it. **Asserted since 2026-10-17**
+  (`verify-agents.mjs`, `s12FunctionFacts`), as two separate facts with their
+  own queries and controls:
+  1. `scan_contradictions()` exists and anon holds no EXECUTE on it. A missing
+     function fails; it is not read as "anon cannot execute it". This is checked
+     from the catalog, not by calling it, because a call that succeeded would
+     run the scan. The control: the detector must see anon's EXECUTE on
+     `global_search`.
+  2. `refresh_dashboard_stats` does not exist in `public` under any signature.
+     The control: the same name lookup must find `scan_contradictions`.
+
+  One query over both names would have passed for the dropped function by not
+  finding it. That is why they are split. This revoke is the only defence
+  against anon. A later grant tidy-up
   must not read "it checks for admin" and conclude the revoke is redundant. Granting anon EXECUTE
   on `scan_contradictions` would let any visitor write `contradictions` rows into
   the public map. §11.4 recorded this as "guard fails open".
