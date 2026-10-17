@@ -126,7 +126,7 @@ jobs:
   # TIER 2 — public values only, as repository VARIABLES. Builds, serves, smokes.
   # ───────────────────────────────────────────────────────────────────────────
   smoke:
-    name: Tier 2 — build, serve, smoke (87 checks)
+    name: Tier 2 — build, serve, smoke
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Tier 1 is the cheap filter. Gating on it keeps a structurally broken PR

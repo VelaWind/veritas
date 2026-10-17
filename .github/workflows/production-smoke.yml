@@ -64,7 +64,7 @@ env:
 
 jobs:
   smoke:
-    name: Smoke production (87 checks)
+    name: Smoke production
     runs-on: ubuntu-latest
     timeout-minutes: 10
 

@@ -1561,10 +1561,54 @@ never had the explicit filter (0015 header). The other three tables have
 `using (true)` read policies, so neither predicate touches them. Every caller
 reads through `publicClient` (`app/(public)/dashboard/page.tsx:24`,
 `app/(public)/page.tsx:20`, `app/api/stats/route.ts:7`), so no admin-session
-read can see drafts in the per-domain counts. **Limit of the measurement:** anon
-cannot see drafts, so "0 drafts" is not observable from here. Anon reports 15
-non-draft and 15 visible, which says nothing about hidden rows. The owner-side
-count of 0 drafts is the 2026-10-16 rehearsal's. An owner read was not repeated.
+read can see drafts in the per-domain counts. Anon cannot see drafts, so
+agreeing counts alone could not tell "RLS excludes drafts" from "there were no
+drafts". The negative control below separates them.
+
+**Negative control, 2026-10-17, one transaction, rolled back.** It ran as a
+single `DO` block ending in `raise exception`, so no path commits. One
+`established` / 90 draft was inserted into Fundamental Physics, which already
+has 3 rows. Bucket 5 is empty live, so a leak into the distribution could not
+hide there. The view was read before and after, as anon and as the owner
+(`postgres`, table owner, `relforcerowsecurity = false`, so RLS is bypassed):
+
+| Reader | `total_hypotheses` | buckets | Fundamental Physics |
+|---|---|---|---|
+| anon, before | 15 | `{1:1, 2:10, 3:4}` | 3 |
+| anon, after | 15 | `{1:1, 2:10, 3:4}` | 3 |
+| owner, before | 15 | `{1:1, 2:10, 3:4}` | 3 |
+| owner, after | 15 | `{1:1, 2:10, 3:4}` | **4** |
+
+Owner draft count went 0 → 1. Anon could not see the draft row (0 rows by
+slug), and the anon payload was byte-identical before and after. The owner row
+separates the two filters:
+
+- `total_hypotheses` and the buckets did not move **even for the owner**, so
+  the view's explicit filter is doing that work.
+- Fundamental Physics moved to 4 for the owner, so `activity_by_domain` has
+  **no filter of its own**. Only RLS keeps drafts out of it.
+
+After the rollback: 0 drafts (owner read), no rehearsal row left, stats
+unchanged.
+
+**"Redundant" rests on text, not on agreeing counts.** The predicates were
+compared as catalog text, after stripping the table qualifier and outer
+parentheses:
+
+- both `WHERE` clauses on `hypotheses` in `pg_get_viewdef('dashboard_stats')`:
+  `hypotheses.state <> 'draft'::hypothesis_state`
+- `pg_policies.qual` for `"public read non-draft"`:
+  `(state <> 'draft'::hypothesis_state)`
+
+They are equal. Text equality alone is not enough, because permissive policies
+OR together. The only other policy on `hypotheses` is `"admin all"`
+(`is_admin()`), which is false for anon. So **for anon** the explicit filter is
+redundant. **It is not redundant in general:** the owner row above shows it is
+the only thing keeping drafts out of the totals for any reader that bypasses
+RLS. Keep it. The per-domain count has no such backstop, so a future
+RLS-bypassing reader (service role, an owner-run view) would show per-domain
+totals that disagree with `total_hypotheses`. No such reader exists today:
+every caller uses `publicClient`.
 
 ---
 
@@ -3110,7 +3154,45 @@ fail when they should?**
   explicitly.
 
 Result: no executable check passes vacuously. The one mismatch is the 0012
-re-run above, which errs toward failing.
+re-run above, which errs toward failing. 0012's header now says so (it said
+"Idempotent").
+
+**Real-failure rehearsals for the three new assertions (2026-10-17).** The
+self-tests prove the detectors are not blind. These prove the live query
+shape goes red on a real change. Each ran against live in one transaction,
+rolled back by `raise exception` at the end of a single `DO` block, and was
+scored with the harness's **own predicates, copied verbatim**:
+
+| Assertion | Change made inside the transaction | Before | After |
+|---|---|---|---|
+| `scan_contradictions()` exists, anon has no EXECUTE | `grant execute ... to anon` | GREEN `{present:true, anon_exec:false}` | **RED** `{anon_exec:true}` |
+| `agent_public` exact allow-list | `create or replace view` with `a.trust` appended | GREEN | **RED** `EXPOSES unlisted trust` |
+| direct `apply_suggestion()` refused by the guard | guard lines removed via `pg_get_functiondef` + `regexp_replace`, re-executed | GREEN `42501 Only admins may approve suggestions.` | **RED** `NO ERROR` |
+| …and nothing applied | (same) | GREEN `pending` | **RED** `approved`, `applied_id` set |
+
+After the rollbacks: anon EXECUTE on `scan_contradictions` is false;
+`agent_public` has its 8 columns; the guard text is back in `apply_suggestion`;
+the suggestion is still `pending`.
+
+**What the rehearsal shape differs on, stated:**
+
+- **Allow-list.** The harness reads over PostgREST. An uncommitted view change
+  is invisible to PostgREST, so the rehearsal ran the same `select *` as anon in
+  SQL. Same projection, different transport. On a committed change, Supabase's
+  DDL event trigger reloads the PostgREST schema cache, so the harness would see
+  the column too.
+- **apply_suggestion.** The rehearsal caller was the `physics-researcher` agent
+  identity (profile role `agent`, non-admin), signed in as `authenticated` via
+  `request.jwt.claims`. The harness uses temporary `researcher` and `public`
+  users, which a SQL transaction cannot create without writing `auth.users`. The
+  guard is `is_admin()`, which is false for every non-admin role alike.
+- **The dropped-function fact was rehearsed too:** `refresh_dashboard_stats(boolean)`
+  was created, deliberately with an argument, so a `to_regprocedure('...()')`
+  check would have missed it. The assertion went GREEN `gone_n:0` → **RED**
+  `gone_n:1, refresh_dashboard_stats(boolean)`; after the rollback,
+  `gone_n:0`.
+- **Not rehearsed:** the anon half of the apply_suggestion check (missing
+  GRANT).
 
 - **Instance.** The admin routes call both as `authenticated`
   (`app/api/contradictions/scan/route.ts:13`, `app/api/stats/route.ts:52`).

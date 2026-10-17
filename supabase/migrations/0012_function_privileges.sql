@@ -39,7 +39,23 @@
 -- (assert_council_verdict_shape, already closed there), 0011 (which closes its
 -- own function explicitly, and must — see §11.10 and 0011's grants note: this
 -- file applies AFTER 0011, so 0011 still creates ia_apply_sanction while the
--- default is open). Idempotent.
+-- default is open).
+--
+-- NOT RE-RUNNABLE STANDALONE SINCE 0015 (corrected 2026-10-17; this header
+-- said "Idempotent" until then). 0015 dropped refresh_dashboard_stats(), and
+-- the verification block below still names it in auth_keep and svc_keep.
+-- has_function_privilege() on a function that does not exist RAISES 42883
+-- rather than returning false, so running this file against a database that
+-- has 0015 applied aborts with "function ... does not exist".
+--
+-- IT IS STILL SAFE ON A FRESH REPLAY, BY SEQUENCE: migrations apply in order,
+-- 0012 runs while 0001's refresh_dashboard_stats() still exists, and 0015
+-- drops it afterwards. Do not "fix" the guard by deleting those two entries.
+-- They assert what was true when this file applied, and at that point the
+-- admin "Refresh dashboard stats" button called the function as
+-- `authenticated`. Removing them would make 0012 stop checking a grant its
+-- own era depended on. That the function no longer exists is asserted where
+-- it belongs: 0015's guard, and verify-agents.mjs (s12FunctionFacts).
 -- ═══════════════════════════════════════════════════════════════════════════
 
 
