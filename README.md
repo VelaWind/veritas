@@ -217,8 +217,8 @@ statements, and every table has row-level security enabled. The first migration,
   `on conflict do nothing` something to conflict with.
 - **Agents get no new write path.** Migrations 0006 to 0011 add agent identities,
   scoped tokens, critiques, citation checks, councils and audits. None of them grants
-  an agent admin rights or a route to the knowledge tables; the agent rules are
-  listed near the top of this README.
+  an agent admin rights or a route to the knowledge tables; the rules the database
+  enforces on agents are listed in the README section on the research agents.
 
 **Migration 0002 is a postmortem.** Public reads came back empty against a live
 database. `scripts/diagnose-rls.mjs` showed SQL state 42501, "permission denied for
