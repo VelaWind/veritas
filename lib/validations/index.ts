@@ -60,6 +60,36 @@ const slugSchema = z
 
 const pct = z.coerce.number().int().min(0).max(100);
 
+// Record ids. zod 4's .uuid() enforces the RFC 9562 version and variant bits,
+// which zod 3's .uuid() did not; .guid() is zod 4's name for the zod 3 check, so
+// what the API accepts is unchanged by the upgrade. Postgres stores any of them.
+const idSchema = z.string().guid();
+
+/**
+ * Makes every field of `base` optional for a PATCH, WITHOUT its default.
+ *
+ * zod 4 applies a field's .default() even when the field is optional, so a
+ * plain `base.partial()` turns an absent key into its default value: an edit
+ * that sends only `title` would come back with `assumptions: []` and wipe the
+ * stored list, and an empty note update would set `published: false`. zod 3
+ * left absent keys absent. Removing the default first restores that: a key the
+ * caller did not send stays out of the update.
+ */
+type WithoutDefault<S> = S extends z.ZodDefault<infer Inner> ? Inner : S;
+type PartialShape<T extends z.ZodRawShape> = {
+  [K in keyof T]: z.ZodOptional<WithoutDefault<T[K]>>;
+};
+function partialWithoutDefaults<T extends z.ZodRawShape>(
+  base: z.ZodObject<T>,
+): z.ZodObject<PartialShape<T>> {
+  const shape: Record<string, z.ZodType> = {};
+  for (const [key, field] of Object.entries(base.shape) as [string, z.ZodType][]) {
+    const inner = field instanceof z.ZodDefault ? (field.removeDefault() as z.ZodType) : field;
+    shape[key] = inner.optional();
+  }
+  return z.object(shape) as unknown as z.ZodObject<PartialShape<T>>;
+}
+
 export const assumptionSchema = z.object({
   text: z.string().min(1),
   justified: z.boolean(),
@@ -72,8 +102,8 @@ export const openQuestionItemSchema = z.object({ text: z.string().min(1) });
 
 const hypothesisBase = z.object({
   slug: slugSchema,
-  domain_id: z.string().uuid(),
-  question_id: z.string().uuid().nullable().optional(),
+  domain_id: idSchema,
+  question_id: idSchema.nullable().optional(),
   title: z.string().min(3).max(300),
   description: z.string().min(1),
   status: epistemicStatusSchema,
@@ -119,8 +149,7 @@ export const hypothesisCreateSchema = hypothesisBase
   .superRefine(checkEpistemics)
   .superRefine(checkActiveRationale);
 
-export const hypothesisUpdateSchema = hypothesisBase
-  .partial()
+export const hypothesisUpdateSchema = partialWithoutDefaults(hypothesisBase)
   .superRefine(checkEpistemics)
   .superRefine(checkActiveRationale);
 
@@ -130,14 +159,14 @@ export const confidenceUpdateSchema = z.object({
 });
 
 export const evidenceLinkSchema = z.object({
-  evidenceId: z.string().uuid(),
+  evidenceId: idSchema,
   relation: evidenceRelationSchema,
   weight: pct.default(50),
   notes: z.string().default(""),
 });
 
 export const evidenceUnlinkSchema = z.object({
-  evidenceId: z.string().uuid(),
+  evidenceId: idSchema,
 });
 
 // ── Evidence & sources ──────────────────────────────────────────────────────
@@ -157,20 +186,20 @@ const evidenceBase = z.object({
   title: z.string().min(3).max(300),
   summary: z.string().min(1),
   strength: pct.default(50),
-  domain_id: z.string().uuid().nullable().optional(),
-  source_id: z.string().uuid().nullable().optional(),
+  domain_id: idSchema.nullable().optional(),
+  source_id: idSchema.nullable().optional(),
   /** Provide instead of source_id to create the source inline. */
   new_source: sourceCreateSchema.nullable().optional(),
 });
 
 export const evidenceCreateSchema = evidenceBase;
-export const evidenceUpdateSchema = evidenceBase.partial();
+export const evidenceUpdateSchema = partialWithoutDefaults(evidenceBase);
 
 // ── Questions ───────────────────────────────────────────────────────────────
 
 const questionBase = z.object({
   slug: slugSchema,
-  domain_id: z.string().uuid(),
+  domain_id: idSchema,
   title: z.string().min(3).max(300),
   description: z.string().default(""),
   importance: pct.default(50),
@@ -180,7 +209,7 @@ const questionBase = z.object({
 });
 
 export const questionCreateSchema = questionBase;
-export const questionUpdateSchema = questionBase.partial();
+export const questionUpdateSchema = partialWithoutDefaults(questionBase);
 
 // ── Domains ─────────────────────────────────────────────────────────────────
 
@@ -194,11 +223,11 @@ const domainBase = z.object({
 });
 
 export const domainCreateSchema = domainBase;
-export const domainUpdateSchema = domainBase.partial();
+export const domainUpdateSchema = partialWithoutDefaults(domainBase);
 
 // ── Simulations ─────────────────────────────────────────────────────────────
 
-const jsonRecord = z.record(z.unknown());
+const jsonRecord = z.record(z.string(), z.unknown());
 
 const simulationBase = z.object({
   slug: slugSchema,
@@ -210,7 +239,7 @@ const simulationBase = z.object({
 });
 
 export const simulationCreateSchema = simulationBase;
-export const simulationUpdateSchema = simulationBase.partial();
+export const simulationUpdateSchema = partialWithoutDefaults(simulationBase);
 
 export const simulationRunCreateSchema = z.object({
   parameters: jsonRecord.default({}),
@@ -231,7 +260,7 @@ const noteBase = z.object({
 });
 
 export const noteCreateSchema = noteBase;
-export const noteUpdateSchema = noteBase.partial();
+export const noteUpdateSchema = partialWithoutDefaults(noteBase);
 
 // ── Contradictions ──────────────────────────────────────────────────────────
 
@@ -271,8 +300,8 @@ export const suggestionEnvelopeSchema = z
   .object({
     target_type: suggestionTargetSchema,
     operation: suggestionOperationSchema,
-    target_id: z.string().uuid().nullable().optional(),
-    payload: z.record(z.unknown()),
+    target_id: idSchema.nullable().optional(),
+    payload: z.record(z.string(), z.unknown()),
     rationale: z.string().trim().max(2000).default(""),
   })
   .superRefine((data, ctx) => {

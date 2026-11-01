@@ -74,7 +74,7 @@ What the database enforces on agents:
 | Framework | Next.js 15 (App Router, RSC, ISR), React 19, TypeScript 5 |
 | Styling | Tailwind CSS 3.4 with CSS-variable design tokens |
 | Data | Supabase: PostgreSQL (RLS, triggers, full-text search, views) and Auth |
-| Validation | Zod 3, shared by the API routes and the hypothesis form |
+| Validation | Zod 4, shared by the API routes and the hypothesis form |
 | Charts, graph | Recharts 2; `d3-force` on `<canvas>` |
 | SQL checking | `pg-query-emscripten`, the PostgreSQL parser compiled to WASM |
 | Agent models | Ollama (local, default); Anthropic or OpenAI when selected |
@@ -237,7 +237,7 @@ gated on whether credentials are live at all.
 
 ### Application layering
 
-About 15,500 lines of TypeScript and TSX across 188 files, with no `any` in a type
+About 15,800 lines of TypeScript and TSX across 188 files, with no `any` in a type
 position.
 
 - **Route handlers** (31 under `app/api/`) parse with a Zod schema from
@@ -269,11 +269,14 @@ position.
 
 The front end is Tailwind with CSS-variable tokens and a signal palette reserved for
 epistemic state (unknown is grey, never red). `components/graph/ResearchGraph.tsx`
-(469 lines) runs d3-force and paints to canvas: device-pixel-ratio scaling,
+(691 lines) runs d3-force and paints to canvas: device-pixel-ratio scaling,
 cursor-anchored zoom on a non-passive wheel listener so the page cannot scroll
-underneath it, its own hit testing, an inspector on hover and select,
-`role="img"` with node and edge counts in the `aria-label`, and a synchronous settle
-under `prefers-reduced-motion`. Dialogs and the command palette use a focus trap;
+underneath it, its own hit testing, an inspector on hover and select, and a
+synchronous settle under `prefers-reduced-motion`. It is keyboard-operable: Tab
+focuses it, arrow keys move along connections to the node lying most nearly in that
+direction, Enter opens the inspector and Escape clears it. The focused node gets a
+dashed ring, and the canvas (`role="application"`) carries node and edge counts plus
+the focused node's type, label and connection count in its `aria-label`. Dialogs and the command palette use a focus trap;
 `Tabs` implements the roving-tabindex keyboard pattern.
 
 ## Verification
@@ -298,9 +301,11 @@ deployed site every 30 minutes, read-only and under the anon role.
 ```bash
 npm run typecheck      # tsc --noEmit
 npm run lint           # eslint .
-npm run test:unit      # 73 checks in three files: 25 for sanitizeHeadline (the
+npm run test:unit      # 88 checks in four files: 25 for sanitizeHeadline (the
                        # search-snippet XSS guard), 31 for the council context
-                       # budget, 17 for the Internal Affairs report parser
+                       # budget, 17 for the Internal Affairs report parser, 15
+                       # for the validation schemas (an edit keeps fields it did
+                       # not send)
 npm run validate:sql   # parses the 15 migrations and the seed with the PostgreSQL
                        # grammar: 413 statements across 16 files
 node scripts/contrast.mjs  # 8 palette pairs, two surfaces, both themes, against
@@ -333,11 +338,16 @@ it. They are run by hand, and `STATUS.md` records the results.
 
 ## Known limits
 
-- Unit tests cover three modules. They are plain Node scripts with their own
-  assertion helper; there is no test framework and no component or browser tests.
+- Unit tests cover four modules. They are plain Node scripts with their own
+  assertion helper; there is no test framework and no component or browser tests in
+  the repository.
 - ESLint has no stylistic rules and there is no Prettier config, so formatting is
-  not tool-enforced. `npm run lint` passes with one `react-hooks/exhaustive-deps`
-  warning in `ResearchGraph.tsx`.
+  not tool-enforced. `npm run lint` passes with no warnings.
+- `npm audit` reports one moderate advisory, in `minimatch`, flagged against 14 packages
+  of the ESLint toolchain. The fixed release (11.0.1 and later) exports a different
+  shape from the 3.x line ESLint 9 and its plugins call, so it cannot be forced in;
+  ESLint 10 is not an option while `eslint-plugin-react` supports only up to ESLint
+  9. It is a development dependency: `npm audit --omit=dev` reports 0.
 - The query layer casts PostgREST results with `as unknown as T` in 13 places, and
   the runtime clients are not generic over a generated `Database` type, so a select
   whose shape stops matching `types/domain.ts` will not fail `tsc`. This is a
@@ -350,7 +360,14 @@ it. They are run by hand, and `STATUS.md` records the results.
 - CI tier 2 and the production smoke read the production database. Tier 2 fails by
   design on pull requests from forks, because GitHub withholds repository variables
   from them.
-- The research graph is pointer-only. There is no keyboard navigation between nodes.
+- Graph keyboard navigation picks one neighbour per arrow key, so from a node with
+  more than four connections some neighbours take more than one key press to reach.
+  Where no connected node lies in a direction, the arrow moves to the nearest node of
+  any kind in that direction and says so.
+- The graph's announcements have been tested through the `aria-label` in Chromium,
+  not with a screen reader.
+- At narrow widths the inspector sits below the graph, so pressing Enter opens it out
+  of view; Tab reaches its controls and scrolls them into view.
 - The `/api/search` rate limiter is an in-memory token bucket, so it is per-instance
   and does not hold across serverless instances.
 - Agent runs are manual and need a local Ollama server or a cloud API key.
