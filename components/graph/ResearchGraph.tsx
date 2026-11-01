@@ -54,6 +54,46 @@ const PATH: Partial<Record<NodeType, string>> = {
   domain: "/domains",
 };
 
+const ARROWS: Record<string, { dx: number; dy: number; word: string }> = {
+  ArrowUp: { dx: 0, dy: -1, word: "above" },
+  ArrowDown: { dx: 0, dy: 1, word: "below" },
+  ArrowLeft: { dx: -1, dy: 0, word: "to the left" },
+  ArrowRight: { dx: 1, dy: 0, word: "to the right" },
+};
+
+/**
+ * The candidate that lies most nearly in direction (dx, dy) from `from`, or
+ * null. A candidate counts only if it is within `maxAngle` of the arrow; among
+ * those, distance is weighted up the further off-axis it sits, so a node
+ * straight ahead beats a slightly closer one at 80 degrees.
+ */
+function pickInDirection(
+  from: SimNode,
+  candidates: SimNode[],
+  dx: number,
+  dy: number,
+  maxAngleDeg: number,
+): SimNode | null {
+  const minCos = Math.cos((maxAngleDeg * Math.PI) / 180);
+  let best: SimNode | null = null;
+  let bestScore = Infinity;
+  for (const c of candidates) {
+    if (c.id === from.id || c.x == null || c.y == null) continue;
+    const vx = c.x - from.x!;
+    const vy = c.y - from.y!;
+    const dist = Math.hypot(vx, vy);
+    if (dist < 1e-6) continue;
+    const cos = (vx * dx + vy * dy) / dist;
+    if (cos < minCos) continue;
+    const score = dist * (1 + 2 * (1 - cos));
+    if (score < bestScore) {
+      best = c;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
 export function ResearchGraph({
   payload,
   focusSlug,
@@ -98,6 +138,30 @@ export function ResearchGraph({
     const edges = payload.edges.filter((e) => ids.has(e.from) && ids.has(e.to));
     return { nodes, edges };
   }, [payload, typeFilter, domainFilter]);
+
+  // Keyboard navigation (see onKeyDown below). Built from the filtered view, so
+  // a key only ever moves along edges the reader can see.
+  const nodeById = useMemo(() => new Map(view.nodes.map((n) => [n.id, n])), [view.nodes]);
+  const neighbours = useMemo(() => {
+    const m = new Map<string, Set<string>>();
+    for (const e of view.edges) {
+      if (e.from === e.to) continue;
+      if (!m.has(e.from)) m.set(e.from, new Set());
+      if (!m.has(e.to)) m.set(e.to, new Set());
+      m.get(e.from)!.add(e.to);
+      m.get(e.to)!.add(e.from);
+    }
+    return m;
+  }, [view.edges]);
+  const [focusedIdState, setFocusedId] = useState<string | null>(null);
+  // A focused node that a filter has since removed is no focus at all.
+  const focusedId = focusedIdState && nodeById.has(focusedIdState) ? focusedIdState : null;
+  // The focus ring is for keyboard users: shown after a key press while the
+  // canvas has focus, hidden again on pointer use or blur.
+  const [showFocus, setShowFocus] = useState(false);
+  // Spoken through the canvas aria-label: what the last key press did when the
+  // focused node alone does not say it (no node that way, inspector closed).
+  const [navNote, setNavNote] = useState("");
 
   // Resize observer.
   useEffect(() => {
@@ -145,7 +209,9 @@ export function ResearchGraph({
       sim.stop();
       draw();
     } else {
-      sim.on("tick", draw);
+      // Through drawRef, so a tick paints the current selection and keyboard
+      // focus rather than those of the render that built the simulation.
+      sim.on("tick", () => drawRef.current());
     }
 
     // Center on the focused node if requested.
@@ -204,6 +270,7 @@ export function ResearchGraph({
       const shape = NODE_SHAPE[n.type];
       const selectedThis = selected?.id === n.id;
       const hovered = hoverRef.current?.id === n.id;
+      const keyboardFocused = showFocus && focusedId === n.id;
       ctx.fillStyle = color;
       ctx.strokeStyle = color;
       ctx.lineWidth = 1.5 / t.k;
@@ -241,8 +308,21 @@ export function ResearchGraph({
         ctx.stroke();
       }
 
+      // Keyboard focus: a thick dashed ring outside the selection ring. Dashed
+      // and in the text colour, because domain nodes are themselves drawn as
+      // solid accent rings and an accent focus ring read as one more domain.
+      if (keyboardFocused) {
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.r + 8 / t.k, 0, Math.PI * 2);
+        ctx.setLineDash([4 / t.k, 3 / t.k]);
+        ctx.strokeStyle = cssVar("--text-primary");
+        ctx.lineWidth = 2.5 / t.k;
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
       // Labels for focused/hovered nodes and all domains.
-      if (selectedThis || hovered || n.type === "domain") {
+      if (selectedThis || hovered || keyboardFocused || n.type === "domain") {
         ctx.fillStyle = cssVar("--text-primary");
         ctx.font = `${12 / t.k}px var(--font-inter), sans-serif`;
         ctx.fillText(
@@ -260,11 +340,11 @@ export function ResearchGraph({
   const drawRef = useRef(draw);
   drawRef.current = draw;
 
-  // Redraw on selection/theme change without restarting the sim.
+  // Redraw on selection/focus/theme change without restarting the sim.
   useEffect(() => {
     draw();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected, size]);
+  }, [selected, size, focusedId, showFocus]);
 
   // The canvas is absent while "no nodes match" is shown, and a new canvas
   // element mounts when nodes return; the wheel listener re-binds on that edge.
@@ -339,6 +419,106 @@ export function ResearchGraph({
     { panning: false, lastX: 0, lastY: 0 },
   );
 
+  // ── Keyboard ──────────────────────────────────────────────────────────────
+  // Tab focuses the canvas and puts the keyboard cursor on a start node. Arrow
+  // keys move it to the connected node lying most nearly in that direction;
+  // when no connected node lies that way, to the nearest node of any kind that
+  // way, so isolated nodes and separate clusters stay reachable (the label says
+  // so). Enter opens the inspector on it; Escape clears the inspector.
+
+  /** The selected node if visible, else the most-connected node (ties by label). */
+  function startNodeId(): string | null {
+    if (selected && nodeById.has(selected.id)) return selected.id;
+    let best: string | null = null;
+    let bestDeg = -1;
+    for (const n of view.nodes) {
+      const deg = neighbours.get(n.id)?.size ?? 0;
+      if (deg > bestDeg || (deg === bestDeg && best && n.label < nodeById.get(best)!.label)) {
+        best = n.id;
+        bestDeg = deg;
+      }
+    }
+    return best;
+  }
+
+  /** Pans so a node the keyboard moved to is not left off-screen. */
+  function keepInView(n: SimNode) {
+    if (n.x == null || n.y == null) return;
+    const t = transformRef.current;
+    const sx = n.x * t.k + t.x;
+    const sy = n.y * t.k + t.y;
+    const margin = 48;
+    if (sx < margin || sx > size.w - margin || sy < margin || sy > size.h - margin) {
+      t.x = size.w / 2 - n.x * t.k;
+      t.y = size.h / 2 - n.y * t.k;
+    }
+  }
+
+  function onKeyDown(e: React.KeyboardEvent<HTMLCanvasElement>) {
+    const arrow = ARROWS[e.key];
+    if (!arrow && e.key !== "Enter" && e.key !== "Escape") return;
+    setShowFocus(true);
+    const sims = new Map(nodesRef.current.map((n) => [n.id, n]));
+    const current = focusedId ?? startNodeId();
+    if (!current) return;
+
+    if (arrow) {
+      e.preventDefault(); // the page must not scroll under the graph
+      if (!focusedId) {
+        setFocusedId(current);
+        setNavNote("");
+        return;
+      }
+      const from = sims.get(current);
+      if (!from) return;
+      const connected = [...(neighbours.get(current) ?? [])]
+        .map((id) => sims.get(id))
+        .filter((n): n is SimNode => !!n);
+      let next = pickInDirection(from, connected, arrow.dx, arrow.dy, 90);
+      let note = "";
+      if (!next) {
+        next = pickInDirection(from, nodesRef.current, arrow.dx, arrow.dy, 60);
+        note = next ? "Moved to the nearest node, not along a connection." : `No node ${arrow.word}.`;
+      }
+      if (next) {
+        keepInView(next);
+        setFocusedId(next.id);
+      }
+      setNavNote(note);
+      drawRef.current();
+      return;
+    }
+
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const node = sims.get(current);
+      if (node) {
+        setFocusedId(current);
+        setSelected(node);
+        setNavNote("");
+      }
+      return;
+    }
+
+    // Escape: only consumed when there is something to clear.
+    if (selected) {
+      e.preventDefault();
+      setSelected(null);
+      setNavNote("Inspector closed.");
+    }
+  }
+
+  const focusedNode = focusedId ? nodeById.get(focusedId) : undefined;
+  const focusedDegree = focusedId ? neighbours.get(focusedId)?.size ?? 0 : 0;
+  const graphLabel =
+    `Research graph: ${view.nodes.length} nodes, ${view.edges.length} edges.` +
+    (focusedNode
+      ? ` Focused: ${NODE_TYPE_LABEL[focusedNode.type]} ${focusedNode.label}, ` +
+        `${focusedDegree} connected ${focusedDegree === 1 ? "node" : "nodes"}` +
+        (selected?.id === focusedNode.id ? ", open in the inspector." : ".")
+      : "") +
+    (navNote ? ` ${navNote}` : "");
+
   return (
     <div className="flex flex-col gap-4 lg:flex-row">
       <div className="min-w-0 flex-1 space-y-3">
@@ -367,13 +547,42 @@ export function ResearchGraph({
           ) : (
             <canvas
               ref={canvasRef}
-              role="img"
-              aria-label={`Research graph: ${view.nodes.length} nodes, ${view.edges.length} edges`}
+              // `application` rather than `img`: a screen reader in browse mode
+              // takes the arrow keys for itself on an img, so they would never
+              // reach onKeyDown. The label below is what it announces.
+              role="application"
+              aria-roledescription="graph"
+              aria-label={graphLabel}
+              aria-describedby="graph-keys"
+              tabIndex={0}
+              // The global :focus-visible outline sits 2px outside its element,
+              // where this wrapper's overflow-hidden would clip it; draw it inside.
+              // scroll-mt-16 keeps a focus scroll from parking the canvas top
+              // under the sticky h-14 site header.
+              className="scroll-mt-16 focus-visible:[outline-offset:-3px]"
               style={{ width: size.w, height: size.h, cursor: "grab", touchAction: "none" }}
+              onKeyDown={onKeyDown}
+              onFocus={(e) => {
+                const id = focusedId ?? startNodeId();
+                if (!focusedId) setFocusedId(id);
+                // Keyboard arrival (Tab) shows the node ring at once and brings
+                // the node on screen; a mouse click focuses without either.
+                if (e.currentTarget.matches(":focus-visible")) {
+                  setShowFocus(true);
+                  const sim = id ? nodesRef.current.find((n) => n.id === id) : undefined;
+                  if (sim) keepInView(sim);
+                }
+              }}
+              onBlur={() => {
+                setShowFocus(false);
+                setNavNote("");
+              }}
               onPointerDown={(e) => {
+                setShowFocus(false);
                 const hit = nodeAt(e.clientX, e.clientY);
                 if (hit) {
                   setSelected(hit);
+                  setFocusedId(hit.id);
                 } else {
                   dragState.current = {
                     panning: true,
@@ -420,7 +629,10 @@ export function ResearchGraph({
           <span>■ evidence</span>
           <span>◯ domain</span>
           <span>▲ simulation</span>
-          <span className="ml-auto">scroll to zoom · drag to pan · click to inspect</span>
+          <span id="graph-keys" className="ml-auto">
+            scroll to zoom · drag to pan · click to inspect · keyboard: Tab to the graph,
+            arrow keys follow connections, Enter inspects, Esc clears
+          </span>
         </div>
       </div>
 
@@ -468,8 +680,9 @@ export function ResearchGraph({
         ) : (
           <div className="card p-5 text-sm text-muted lg:sticky lg:top-20">
             <p className="eyebrow pb-2">Inspector</p>
-            Click any node to inspect it and jump to its page. Everything in
-            Veritas is a node — questions, hypotheses, evidence, domains.
+            Click any node, or move to it with the arrow keys and press Enter, to
+            inspect it and jump to its page. Everything in Veritas is a node:
+            questions, hypotheses, evidence, domains.
           </div>
         )}
       </aside>
