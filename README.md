@@ -383,9 +383,6 @@ tier 3.
   version, not the hosted platform. Platform-only behaviour, such as default
   privileges the platform re-applies, is checked there only as the local images
   reproduce it.
-- Migration 0016 is not yet applied to the production database. Until it is, the
-  deployed search route uses its per-instance fallback, which is the previous
-  behaviour.
 - CI tier 2 and the production smoke read the production database. Tier 2 fails by
   design on pull requests from forks, because GitHub withholds repository variables
   from them.
