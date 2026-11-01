@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Unit tests for the zod schemas in lib/validations — the PATCH contract.
+ * Unit tests for the zod schemas in lib/validations: the PATCH contract.
  *
  *   npm run test:unit
  *
@@ -119,7 +119,7 @@ for (const [label, id, want] of [
 }
 
 console.log(
-  `\n${fail === 0 ? "ALL GREEN" : `${fail} FAILURE(S)`} — ${pass} passed, ${fail} failed`,
+  `\n${fail === 0 ? "ALL GREEN" : `${fail} FAILURE(S)`}: ${pass} passed, ${fail} failed`,
 );
 if (fail > 0) {
   console.log("\nFailed:");
