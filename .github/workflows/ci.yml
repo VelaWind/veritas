@@ -27,12 +27,17 @@
 # Read the run, then verify the branch locally or from a maintainer-owned
 # branch. Do not relax the guard to make forks green.
 #
-# TIER 3 IS DELIBERATELY ABSENT. `verify-agents`, `verify-suggestions` and
-# `verify-admin` need SUPABASE_SERVICE_ROLE_KEY / SUPABASE_ACCESS_TOKEN. Those
-# must NOT enter this repository in any form — see AUDIT.md §10.3 for the three
-# reasons (the key is the whole database; there is one database and these tests
-# mutate it; they are not concurrency-safe). The precondition for automating
-# them is a disposable database, not a secret.
+# TIER 3 (`write-path`) runs `verify-admin`, `verify-suggestions` and
+# `verify-agents`, which write to the database. They never run against the
+# production project: the production service-role key and access token must
+# NOT enter this repository in any form (AUDIT.md §10.3: the key is the whole
+# database; there is one database and these tests mutate it; they are not
+# concurrency-safe). The precondition was always a disposable database, not a
+# secret, and tier 3 now has one: `supabase start` inside the runner, every
+# migration and the seed applied fresh, and the keys read from that local
+# stack's own `supabase status`. They are the CLI's fixed local demo keys,
+# valid only against 127.0.0.1 in that runner. A guard step refuses to run
+# unless every URL the scripts receive is local.
 #
 # NOTHING IN THIS FILE MAY REFERENCE `secrets.*` EXCEPT THE IMPLICIT
 # GITHUB_TOKEN. If a future edit needs a secret, it belongs in tier 3, which
@@ -244,6 +249,118 @@ jobs:
             echo "::error::smoke ran ${passed:-0} assertions, expected at least 87 — did a check get dropped?"
             exit 1
           fi
+
+      - name: Server log (on failure)
+        if: failure()
+        run: cat server.log || true
+
+      - name: Stop the server
+        if: always()
+        run: |
+          if [ -f server.pid ]; then kill "$(cat server.pid)" 2>/dev/null || true; fi
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # TIER 3: the write-path scripts against a DISPOSABLE database. No secrets,
+  # no repository variables: the stack, its data and its keys exist only inside
+  # this runner and are gone when the job ends. Runs on fork PRs too.
+  # ───────────────────────────────────────────────────────────────────────────
+  write-path:
+    name: "Tier 3: disposable Supabase, write-path scripts"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: checks
+    env:
+      # Pinned: a CLI upgrade changes the local images, which is a change to
+      # what this tier tests against and should arrive as its own commit.
+      SUPABASE_CLI_VERSION: "2.122.0"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # Applies supabase/migrations/* in order, then supabase/seed.sql, to a
+      # fresh Postgres. Services the scripts do not use are excluded; storage
+      # stays, because the F-07 canary's self-test reads the storage schema.
+      - name: Start a disposable Supabase (all migrations + seed)
+        run: |
+          npx --yes "supabase@${SUPABASE_CLI_VERSION}" start \
+            -x realtime,imgproxy,studio,inbucket,edge-runtime,logflare,vector,supavisor,postgres-meta
+
+      # The scripts read .env.local and let it override the environment, so
+      # this file is the single place their targets come from. Every value is
+      # taken from the local stack; NEXT_PUBLIC_SITE_URL is a reserved .invalid
+      # host because a production build refuses a localhost canonical URL, and
+      # it only feeds metadata and the sitemap.
+      - name: Write .env.local from the local stack
+        run: |
+          npx --yes "supabase@${SUPABASE_CLI_VERSION}" status -o env > sb.env
+          set -a; . ./sb.env; set +a
+          {
+            echo "NEXT_PUBLIC_SUPABASE_URL=${API_URL}"
+            echo "NEXT_PUBLIC_SUPABASE_ANON_KEY=${ANON_KEY}"
+            echo "SUPABASE_SERVICE_ROLE_KEY=${SERVICE_ROLE_KEY}"
+            echo "VERIFY_DB_URL=${DB_URL}"
+            echo "NEXT_PUBLIC_SITE_URL=http://veritas-ci.invalid"
+          } > .env.local
+          rm sb.env
+
+      # The production-safety gate for this whole job. If anything above ever
+      # produced a non-local target, stop before a single write is attempted.
+      - name: Refuse any non-local database target
+        run: |
+          url=$(grep '^NEXT_PUBLIC_SUPABASE_URL=' .env.local | cut -d= -f2-)
+          db=$(grep '^VERIFY_DB_URL=' .env.local | cut -d= -f2-)
+          case "$url" in http://127.0.0.1:*) ;; *) echo "::error::Supabase URL is not local: $url"; exit 1;; esac
+          case "$db" in postgresql://*@127.0.0.1:*) ;; *) echo "::error::Database URL is not local"; exit 1;; esac
+          if grep -qi 'supabase\.co' .env.local; then echo "::error::.env.local names a hosted project"; exit 1; fi
+          echo "All targets are local: $url"
+
+      - name: Build against the local stack
+        run: npm run build
+
+      - name: Start the production server
+        run: |
+          npm start > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 60); do
+            if curl -sf -o /dev/null http://localhost:3000/agents; then
+              echo "Server ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Server did not become ready within 60s"
+          cat server.log
+          exit 1
+
+      # Each script prints "N passed" and exits non-zero on any
+      # failure. The floor catches the other direction, as in tier 2: a green
+      # run that quietly checks fewer things than it used to. Raise a floor
+      # when a script gains assertions.
+      - name: verify-admin
+        run: |
+          set -o pipefail
+          BASE_URL=http://localhost:3000 node scripts/verify-admin.mjs 2>&1 | tee verify-admin.out
+          ./.github/scripts/assert-floor.sh verify-admin.out 19
+
+      - name: verify-suggestions
+        run: |
+          set -o pipefail
+          BASE_URL=http://localhost:3000 node scripts/verify-suggestions.mjs 2>&1 | tee verify-suggestions.out
+          ./.github/scripts/assert-floor.sh verify-suggestions.out 29
+
+      - name: verify-agents
+        run: |
+          set -o pipefail
+          BASE_URL=http://localhost:3000 node scripts/verify-agents.mjs 2>&1 | tee verify-agents.out
+          ./.github/scripts/assert-floor.sh verify-agents.out 94
 
       - name: Server log (on failure)
         if: failure()

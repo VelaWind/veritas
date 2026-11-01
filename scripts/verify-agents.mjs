@@ -1353,6 +1353,62 @@ async function run() {
 // stay runnable against production on PUBLIC credentials alone, so a check
 // requiring a privileged token belongs in this harness, which already requires
 // SUPABASE_SERVICE_ROLE_KEY.
+/**
+ * Runs one read-only catalog query and returns { rows } or { error }.
+ *
+ * Two transports for the same SQL. With VERIFY_DB_URL set (a direct Postgres
+ * connection string, which the disposable CI database provides), it runs
+ * through psql, wrapped in json_agg so the rows come back in the shape the
+ * Management API returns. Otherwise it goes to the Management API with
+ * SUPABASE_ACCESS_TOKEN, as before. Returns null when neither is configured:
+ * callers report that as a FAILURE, never as a skip.
+ */
+function platformTransport() {
+  const dbUrl = (process.env.VERIFY_DB_URL ?? "").trim();
+  if (dbUrl) return { kind: "psql", dbUrl };
+  const token = platformToken();
+  const ref = URL_ ? new URL(URL_).hostname.split(".")[0] : "";
+  if (token && ref) return { kind: "api", token, ref };
+  return null;
+}
+
+async function platformQuery(transport, query) {
+  if (transport.kind === "psql") {
+    const { execFile } = await import("node:child_process");
+    const wrapped = `select coalesce(json_agg(t), '[]'::json) from (${query}) t`;
+    return new Promise((resolve) => {
+      execFile(
+        "psql",
+        [transport.dbUrl, "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", wrapped],
+        { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 },
+        (err, stdout, stderr) => {
+          if (err) return resolve({ error: (stderr || err.message).trim().slice(0, 200) });
+          try {
+            resolve({ rows: JSON.parse(stdout.trim()) });
+          } catch {
+            resolve({ error: `psql returned non-JSON: ${stdout.slice(0, 120)}` });
+          }
+        },
+      );
+    });
+  }
+  try {
+    const res = await fetch(`https://api.supabase.com/v1/projects/${transport.ref}/database/query`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${transport.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ query }),
+    });
+    if (!res.ok) return { error: `HTTP ${res.status} ${(await res.text()).slice(0, 200)}` };
+    const rows = await res.json();
+    return { rows: Array.isArray(rows) ? rows : [] };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+const NO_PLATFORM =
+  "set VERIFY_DB_URL (direct database URL) or SUPABASE_ACCESS_TOKEN (or provide .env.supabase.local)";
+
 /** SUPABASE_ACCESS_TOKEN from the environment or .env.supabase.local; "" if neither. */
 function platformToken() {
   let token = process.env.SUPABASE_ACCESS_TOKEN ?? "";
@@ -1373,16 +1429,15 @@ function platformToken() {
 async function f07Canary() {
   console.log("\n── F-07: 0009 default-privilege canary ──");
 
-  const token = platformToken();
-  const ref = URL_ ? new URL(URL_).hostname.split(".")[0] : "";
+  const transport = platformTransport();
 
   // Missing credentials is a FAILURE, not a skip. A canary that quietly does
   // nothing is worse than no canary, because it reads as coverage.
-  if (!token || !ref) {
+  if (!transport) {
     check(
       "F-07 canary: platform credentials available",
       false,
-      "set SUPABASE_ACCESS_TOKEN (or provide .env.supabase.local) — the 0009 canary cannot be skipped silently",
+      `${NO_PLATFORM}; the 0009 canary cannot be skipped silently`,
     );
     check("F-07 canary self-test: detector sees an anon= entry where one exists (storage)", false,
       "not run — no platform credentials");
@@ -1438,13 +1493,9 @@ async function f07Canary() {
       `where n.nspname = '${schema}' and d.defaclobjtype = 'r' ` +
       "and pg_get_userbyid(d.defaclrole) = 'postgres'";
     try {
-      const res = await fetch(`https://api.supabase.com/v1/projects/${ref}/database/query`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ query: sql }),
-      });
-      if (!res.ok) return null;
-      const rows = await res.json();
+      const result = await platformQuery(transport, sql);
+      if (result.error) return null;
+      const rows = result.rows;
       const row = Array.isArray(rows) && rows.length > 0 ? rows[0] : {};
       return {
         acl: row.acl ?? "",
@@ -1665,31 +1716,21 @@ function f12Characterization(publicAcl) {
 async function s12FunctionFacts() {
   console.log("\n── §12.2: definer-function facts (anon EXECUTE, dropped function) ──");
 
-  const token = platformToken();
-  const ref = URL_ ? new URL(URL_).hostname.split(".")[0] : "";
+  const transport = platformTransport();
   const labels = [
     "§12.2 control: the privilege detector sees anon's EXECUTE on global_search()",
     "§12.2: scan_contradictions() exists and anon holds no EXECUTE on it",
     "§12.2 control: the name detector finds scan_contradictions in public",
     "§12.2: refresh_dashboard_stats does not exist in public, under any signature",
   ];
-  if (!token || !ref) {
-    for (const l of labels) check(l, false, "not run — no platform credentials (SUPABASE_ACCESS_TOKEN); cannot be skipped silently");
+  if (!transport) {
+    for (const l of labels) check(l, false, `not run: no platform credentials (${NO_PLATFORM}); cannot be skipped silently`);
     return;
   }
   const sql = async (query) => {
-    try {
-      const res = await fetch(`https://api.supabase.com/v1/projects/${ref}/database/query`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ query }),
-      });
-      if (!res.ok) return { error: `HTTP ${res.status} ${(await res.text()).slice(0, 200)}` };
-      const rows = await res.json();
-      return { row: Array.isArray(rows) ? rows[0] ?? {} : {} };
-    } catch (err) {
-      return { error: err instanceof Error ? err.message : String(err) };
-    }
+    const result = await platformQuery(transport, query);
+    if (result.error) return { error: result.error };
+    return { row: result.rows[0] ?? {} };
   };
 
   // Fact 1. The control is global_search, which anon MUST hold (0012 guard 1,
