@@ -3,9 +3,10 @@ import { SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL } from "./env";
 
 /**
  * Service-role client. SERVER ONLY — never import from client code.
- * Per §4.2 it is used solely for stats refresh, contradiction scans, and
- * seeding; user-initiated mutations must go through the session client so
- * the audit trail carries attribution.
+ * Per §4.2 it is used solely for stats refresh, contradiction scans, seeding,
+ * agent token checks, and the search rate limit (rate_limit_hit(), which only
+ * service_role may execute); user-initiated mutations must go through the
+ * session client so the audit trail carries attribution.
  */
 export function createAdminClient() {
   if (typeof window !== "undefined") {

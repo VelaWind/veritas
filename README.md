@@ -100,7 +100,7 @@ SUPABASE_SERVICE_ROLE_KEY=your-service-role-key   # server only, never exposed
 NEXT_PUBLIC_SITE_URL=http://localhost:3000
 ```
 
-Apply the 15 migrations in `supabase/migrations/` in order, then `supabase/seed.sql`.
+Apply the 16 migrations in `supabase/migrations/` in order, then `supabase/seed.sql`.
 
 ```bash
 supabase start && supabase db reset      # local Postgres via Docker, all migrations
@@ -174,8 +174,8 @@ the agent on the public timeline.
 
 ### The database is the enforcement layer
 
-The schema is 15 migrations under `supabase/migrations/`. Across all of them,
-PostgreSQL parses 23 `CREATE TABLE`, 25 `CREATE TRIGGER` and 45 `CREATE POLICY`
+The schema is 16 migrations under `supabase/migrations/`. Across all of them,
+PostgreSQL parses 24 `CREATE TABLE`, 25 `CREATE TRIGGER` and 45 `CREATE POLICY`
 statements, and every table has row-level security enabled. The first migration,
 `0001_core.sql` (842 lines), defines 14 tables, 9 enums, 20 indexes, 20 functions and
 17 triggers, with 26 policies. The parts that carry the design:
@@ -219,6 +219,13 @@ statements, and every table has row-level security enabled. The first migration,
   scoped tokens, critiques, citation checks, councils and audits. None of them grants
   an agent admin rights or a route to the knowledge tables; the rules the database
   enforces on agents are listed in the README section on the research agents.
+- **The search rate limit is counted in the database.** `rate_limit_hit()` (0016)
+  records a hit and decides in one `insert ... on conflict do update`, so concurrent
+  requests from any number of serverless instances serialize on one row and share
+  one count: 30 searches per client per minute. Only `service_role` may execute it,
+  the route passes a SHA-256 hash of the client address rather than the address, and
+  if the database cannot answer the route falls back to a per-instance count instead
+  of blocking search.
 
 **Migration 0002 is a postmortem.** Public reads came back empty against a live
 database. `scripts/diagnose-rls.mjs` showed SQL state 42501, "permission denied for
@@ -237,7 +244,7 @@ gated on whether credentials are live at all.
 
 ### Application layering
 
-About 15,800 lines of TypeScript and TSX across 188 files, with no `any` in a type
+About 15,900 lines of TypeScript and TSX across 189 files, with no `any` in a type
 position.
 
 - **Route handlers** (31 under `app/api/`) parse with a Zod schema from
@@ -269,20 +276,23 @@ position.
 
 The front end is Tailwind with CSS-variable tokens and a signal palette reserved for
 epistemic state (unknown is grey, never red). `components/graph/ResearchGraph.tsx`
-(691 lines) runs d3-force and paints to canvas: device-pixel-ratio scaling,
+(732 lines) runs d3-force and paints to canvas: device-pixel-ratio scaling,
 cursor-anchored zoom on a non-passive wheel listener so the page cannot scroll
 underneath it, its own hit testing, an inspector on hover and select, and a
 synchronous settle under `prefers-reduced-motion`. It is keyboard-operable: Tab
 focuses it, arrow keys move along connections to the node lying most nearly in that
-direction, Enter opens the inspector and Escape clears it. The focused node gets a
-dashed ring, and the canvas (`role="application"`) carries node and edge counts plus
-the focused node's type, label and connection count in its `aria-label`. Dialogs and the command palette use a focus trap;
-`Tabs` implements the roving-tabindex keyboard pattern.
+direction, Enter opens the inspector and Escape clears it. Below the `lg`
+breakpoint, where the inspector stacks under the graph, Enter scrolls it into view
+and moves focus to it; Escape there, or its Close button, returns focus to the
+graph on the same node. The focused node gets a dashed ring, and the canvas
+(`role="application"`) carries node and edge counts plus the focused node's type,
+label and connection count in its `aria-label`. Dialogs and the command palette use
+a focus trap; `Tabs` implements the roving-tabindex keyboard pattern.
 
 ## Verification
 
 **Continuous integration.** `.github/workflows/ci.yml` runs on every push to `master`
-and every pull request, in two tiers.
+and every pull request, in three tiers.
 
 - Tier 1 uses no credentials. It runs `npm run typecheck` (`tsc --noEmit`),
   `npm run lint` (ESLint with the Next.js core-web-vitals and TypeScript rule sets),
@@ -292,6 +302,14 @@ and every pull request, in two tiers.
   variables, not secrets), starts the production server inside the runner, and runs
   `scripts/smoke.ts` against it. The job fails if the smoke run reports fewer than 87
   passing assertions, so a dropped check cannot pass silently.
+- Tier 3 runs the scripts that write to the database, against a disposable one. It
+  starts a local Supabase in the runner (`supabase start`), which applies every
+  migration and the seed to a fresh Postgres, builds the app against it, serves it on
+  two ports, and runs `verify-admin`, `verify-suggestions`, `verify-agents` and
+  `verify-rate-limit`, each with a floor on its passing checks (19, 29, 94 and 12).
+  It uses no secrets and no repository variables: the keys come from the local stack,
+  and a guard step stops the job unless every target is `127.0.0.1`. Production is
+  never contacted.
 
 `.github/workflows/production-smoke.yml` runs the same smoke script against the
 deployed site every 30 minutes, read-only and under the anon role.
@@ -301,22 +319,23 @@ deployed site every 30 minutes, read-only and under the anon role.
 ```bash
 npm run typecheck      # tsc --noEmit
 npm run lint           # eslint .
-npm run test:unit      # 88 checks in four files: 25 for sanitizeHeadline (the
+npm run test:unit      # 107 checks in five files: 25 for sanitizeHeadline (the
                        # search-snippet XSS guard), 31 for the council context
                        # budget, 17 for the Internal Affairs report parser, 15
                        # for the validation schemas (an edit keeps fields it did
-                       # not send)
-npm run validate:sql   # parses the 15 migrations and the seed with the PostgreSQL
-                       # grammar: 413 statements across 16 files
+                       # not send), 19 for the rate limiter's decision logic
+npm run validate:sql   # parses the 16 migrations and the seed with the PostgreSQL
+                       # grammar: 421 statements across 17 files
 node scripts/contrast.mjs  # 8 palette pairs, two surfaces, both themes, against
                            # WCAG AA thresholds
 npm run build          # succeeds with no environment variables set; next/font/google
                        # needs network access at build time
 ```
 
-**Scripts that need the live database.** Three scripts write to the database with the
-service-role key, so they are not in CI: there is one database and the scripts mutate
-it. They are run by hand, and `STATUS.md` records the results.
+**Scripts that write to a database.** These need the service-role key, so CI runs
+them in tier 3 against the disposable database described above, never against
+production. Run by hand they read their target from `.env.local`. The counts are from
+tier 3.
 
 - `scripts/verify-admin.mjs` (204 lines, 19 checks) provisions a temporary admin,
   forges the chunked `@supabase/ssr` auth cookie, and drives the real HTTP routes:
@@ -324,13 +343,19 @@ it. They are run by hand, and `STATUS.md` records the results.
   negative cases (401 unauthenticated, 422 for a missing or blank rationale,
   out-of-band confidence rejected by the database guard), the trigger side effects,
   and RLS draft invisibility, then removes everything it created.
-- `scripts/verify-suggestions.mjs` drives the contributor queue over HTTP: propose,
-  approve, reject, withdraw, and the RLS and authorization negatives (a contributor
-  sees only their own rows; nobody can approve their own).
-- `scripts/verify-agents.mjs` drives the agent layer end to end: scoped-token
-  authorization, propose to pending to admin approval to credit, the caps enforced in
-  Postgres, the skeptic and citation lanes, the council, and Internal Affairs
-  sanctions.
+- `scripts/verify-suggestions.mjs` (29 checks) drives the contributor queue over
+  HTTP: propose, approve, reject, withdraw, and the RLS and authorization negatives (a
+  contributor sees only their own rows; nobody can approve their own).
+- `scripts/verify-agents.mjs` (94 checks) drives the agent layer end to end:
+  scoped-token authorization, propose to pending to admin approval to credit, the caps
+  enforced in Postgres, the skeptic and citation lanes, the council, and Internal
+  Affairs sanctions. Its catalog checks (default privileges, function grants) read
+  `pg_catalog` through `psql` when `VERIFY_DB_URL` is set, and through the Supabase
+  Management API otherwise.
+- `scripts/verify-rate-limit.mjs` (12 checks) sends 60 concurrent calls to
+  `rate_limit_hit()` with a limit of 30 and expects exactly 30 through, confirms
+  `anon` cannot call it, sends 31 searches alternating between two app servers and
+  expects the 31st refused, and checks the stored bucket is a hash, not the address.
 - `scripts/audit-pages.mjs` runs 21 read probes through the anon client across 15
   routes (18 PostgREST selects copied from the pages and 3 RPC calls) and fails on any
   error or empty result. `scripts/diagnose-rls.mjs` compares `anon` against
@@ -354,9 +379,13 @@ it. They are run by hand, and `STATUS.md` records the results.
   deliberate tradeoff that keeps `types/database.types.ts` non-load-bearing, so
   regenerating it can never break the build; such a mismatch surfaces at runtime
   through the smoke and verify scripts instead.
-- The scripts that mutate the database (`verify-admin`, `verify-suggestions`,
-  `verify-agents`) are not automated, because CI has no disposable database. Their
-  recorded results come from the author's own runs.
+- Tier 3's disposable database runs the Supabase CLI's local images, pinned by CLI
+  version, not the hosted platform. Platform-only behaviour, such as default
+  privileges the platform re-applies, is checked there only as the local images
+  reproduce it.
+- Migration 0016 is not yet applied to the production database. Until it is, the
+  deployed search route uses its per-instance fallback, which is the previous
+  behaviour.
 - CI tier 2 and the production smoke read the production database. Tier 2 fails by
   design on pull requests from forks, because GitHub withholds repository variables
   from them.
@@ -366,10 +395,6 @@ it. They are run by hand, and `STATUS.md` records the results.
   any kind in that direction and says so.
 - The graph's announcements have been tested through the `aria-label` in Chromium,
   not with a screen reader.
-- At narrow widths the inspector sits below the graph, so pressing Enter opens it out
-  of view; Tab reaches its controls and scrolls them into view.
-- The `/api/search` rate limiter is an in-memory token bucket, so it is per-instance
-  and does not hold across serverless instances.
 - Agent runs are manual and need a local Ollama server or a cloud API key.
 
 <!-- site:case-study:end -->

@@ -103,6 +103,10 @@ export function ResearchGraph({
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
+  const inspectorRef = useRef<HTMLDivElement>(null);
+  const inspectorHeadingRef = useRef<HTMLHeadingElement>(null);
+  // Set when Enter opens the inspector, consumed once it has rendered.
+  const inspectorOpenedByKey = useRef(false);
   const simRef = useRef<Simulation<SimNode, SimLink> | null>(null);
   const nodesRef = useRef<SimNode[]>([]);
   const linksRef = useRef<SimLink[]>([]);
@@ -419,6 +423,26 @@ export function ResearchGraph({
     { panning: false, lastX: 0, lastY: 0 },
   );
 
+  // At narrow widths the inspector stacks below the 560px graph, so Enter would
+  // open it out of view. There it is scrolled into view and takes focus (its
+  // heading), so a screen reader reads it and Tab continues to its controls.
+  // At lg and up it sits beside the graph and focus stays on the graph.
+  useEffect(() => {
+    if (!selected || !inspectorOpenedByKey.current) return;
+    inspectorOpenedByKey.current = false;
+    if (window.matchMedia("(min-width: 1024px)").matches) return;
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    inspectorHeadingRef.current?.focus({ preventScroll: true });
+    inspectorRef.current?.scrollIntoView({ block: "nearest", behavior: reduce ? "auto" : "smooth" });
+  }, [selected]);
+
+  /** Closes the inspector and puts focus back on the graph, on the same node. */
+  function closeInspectorToGraph() {
+    setSelected(null);
+    setNavNote("Inspector closed.");
+    canvasRef.current?.focus();
+  }
+
   // ── Keyboard ──────────────────────────────────────────────────────────────
   // Tab focuses the canvas and puts the keyboard cursor on a start node. Arrow
   // keys move it to the connected node lying most nearly in that direction;
@@ -494,6 +518,7 @@ export function ResearchGraph({
       const node = sims.get(current);
       if (node) {
         setFocusedId(current);
+        inspectorOpenedByKey.current = true;
         setSelected(node);
         setNavNote("");
       }
@@ -637,23 +662,39 @@ export function ResearchGraph({
       </div>
 
       {/* Inspector side panel (§7) */}
-      <aside className="w-full shrink-0 lg:w-80">
+      <aside
+        className="w-full shrink-0 lg:w-80"
+        // Escape from anywhere in the inspector closes it and returns to the graph.
+        onKeyDown={(e) => {
+          if (e.key === "Escape" && selected) {
+            e.preventDefault();
+            closeInspectorToGraph();
+          }
+        }}
+      >
         {selected ? (
-          <div className="card space-y-4 p-5 lg:sticky lg:top-20">
+          <div
+            ref={inspectorRef}
+            role="region"
+            aria-label="Inspector"
+            className="card scroll-mt-16 space-y-4 p-5 lg:sticky lg:top-20"
+          >
             <div className="flex items-start justify-between gap-2">
               <span className="font-mono text-xs uppercase text-muted">
                 {NODE_TYPE_LABEL[selected.type]}
               </span>
               <button
                 type="button"
-                onClick={() => setSelected(null)}
+                onClick={closeInspectorToGraph}
                 aria-label="Close inspector"
                 className="rounded p-1 text-muted hover:bg-raised hover:text-ink"
               >
                 <X size={14} aria-hidden />
               </button>
             </div>
-            <h2 className="font-display text-base text-ink">{selected.label}</h2>
+            <h2 ref={inspectorHeadingRef} tabIndex={-1} className="font-display text-base text-ink">
+              {selected.label}
+            </h2>
             {selected.status && (
               <p className="font-mono text-xs text-muted">
                 {STATUS_META[selected.status as never] &&
