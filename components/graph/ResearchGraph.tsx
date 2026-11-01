@@ -254,11 +254,21 @@ export function ResearchGraph({
     }
   }
 
+  // The latest `draw`. It is re-created every render (it closes over `size` and
+  // `selected`), so long-lived listeners call it through this ref instead of
+  // capturing one render's copy.
+  const drawRef = useRef(draw);
+  drawRef.current = draw;
+
   // Redraw on selection/theme change without restarting the sim.
   useEffect(() => {
     draw();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected, size]);
+
+  // The canvas is absent while "no nodes match" is shown, and a new canvas
+  // element mounts when nodes return; the wheel listener re-binds on that edge.
+  const hasCanvas = view.nodes.length > 0;
 
   // Zoom. Attached imperatively rather than through React's `onWheel` because
   // the synthetic wheel listener is registered passively at the root: React
@@ -288,17 +298,16 @@ export function ResearchGraph({
       t.x = mx - ((mx - t.x) * k) / t.k;
       t.y = my - ((my - t.y) * k) / t.k;
       t.k = k;
-      draw();
+      drawRef.current();
     };
 
     // { passive: false } is the whole point — the default is passive for wheel.
     canvas.addEventListener("wheel", onWheel, { passive: false });
     return () => canvas.removeEventListener("wheel", onWheel);
-    // `draw` is re-created each render (it closes over `size`/`selected`), so
-    // this re-binds with it and never calls a stale one. Re-running every
-    // render is also what re-attaches the listener when the canvas mounts after
-    // the "no nodes match" empty state.
-  }, [draw]);
+    // Calls `draw` through drawRef, so it never runs a stale copy without
+    // re-binding on every render. `hasCanvas` re-attaches the listener when the
+    // canvas mounts after the "no nodes match" empty state.
+  }, [hasCanvas]);
 
   // Pointer interactions: pan, click-select, hover.
   function toGraphCoords(clientX: number, clientY: number) {
