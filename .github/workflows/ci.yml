@@ -325,20 +325,26 @@ jobs:
       - name: Build against the local stack
         run: npm run build
 
-      - name: Start the production server
+      # Two servers from the same build, as two serverless instances would be:
+      # verify-rate-limit alternates between them to prove one shared count.
+      - name: Start two production servers (ports 3000 and 3001)
         run: |
-          npm start > server.log 2>&1 &
+          npx next start -p 3000 > server.log 2>&1 &
           echo $! > server.pid
-          for i in $(seq 1 60); do
-            if curl -sf -o /dev/null http://localhost:3000/agents; then
-              echo "Server ready after ${i}s"
-              exit 0
+          npx next start -p 3001 > server2.log 2>&1 &
+          echo $! > server2.pid
+          for port in 3000 3001; do
+            ready=""
+            for i in $(seq 1 60); do
+              if curl -sf -o /dev/null "http://localhost:${port}/agents"; then ready=1; echo "Port ${port} ready after ${i}s"; break; fi
+              sleep 1
+            done
+            if [ -z "$ready" ]; then
+              echo "::error::Server on port ${port} did not become ready within 60s"
+              cat server.log server2.log
+              exit 1
             fi
-            sleep 1
           done
-          echo "::error::Server did not become ready within 60s"
-          cat server.log
-          exit 1
 
       # Each script prints "N passed" and exits non-zero on any
       # failure. The floor catches the other direction, as in tier 2: a green
@@ -362,11 +368,20 @@ jobs:
           BASE_URL=http://localhost:3000 node scripts/verify-agents.mjs 2>&1 | tee verify-agents.out
           ./.github/scripts/assert-floor.sh verify-agents.out 94
 
+      - name: verify-rate-limit
+        run: |
+          set -o pipefail
+          BASE_URL=http://localhost:3000 BASE_URL_2=http://localhost:3001 \
+            node scripts/verify-rate-limit.mjs 2>&1 | tee verify-rate-limit.out
+          ./.github/scripts/assert-floor.sh verify-rate-limit.out 12
+
       - name: Server log (on failure)
         if: failure()
-        run: cat server.log || true
+        run: cat server.log server2.log || true
 
-      - name: Stop the server
+      - name: Stop the servers
         if: always()
         run: |
-          if [ -f server.pid ]; then kill "$(cat server.pid)" 2>/dev/null || true; fi
+          for f in server.pid server2.pid; do
+            if [ -f "$f" ]; then kill "$(cat "$f")" 2>/dev/null || true; fi
+          done
